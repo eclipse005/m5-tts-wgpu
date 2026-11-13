@@ -1198,16 +1198,30 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
         y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
             let window = &window;
             let wrow = &w[co * cin * ks..(co + 1) * cin * ks];
-            for (q, slot) in out[t0..t0 + tn].iter_mut().enumerate() {
-                let mut sum = bias[co];
-                for ci in 0..cin {
-                    let base = ci * len + q * stride;
-                    let wr = &wrow[ci * ks..(ci + 1) * ks];
-                    for (k, wv) in wr.iter().enumerate() {
-                        sum += window[base + k * dilation] * wv;
+            // Tap-outer, time-inner with paired slices: the same shape that lets
+            // `conv1d`'s fallback vectorise on any target.
+            let mut acc = vec![0.0f32; tn];
+            for ci in 0..cin {
+                let base = ci * len;
+                let wr = &wrow[ci * ks..(ci + 1) * ks];
+                for (k, wv) in wr.iter().enumerate() {
+                    let off = base + k * dilation;
+                    if stride == 1 {
+                        let src = &window[off..off + tn];
+                        for (slot, value) in acc.iter_mut().zip(src) {
+                            *slot += value * wv;
+                        }
+                    } else {
+                        let src = &window[off..off + (tn - 1) * stride + 1];
+                        for (slot, value) in acc.iter_mut().zip(src.chunks(stride)) {
+                            *slot += value[0] * wv;
+                        }
                     }
                 }
-                *slot = sum + residual.map(|r| r[co * t_out + t0 + q]).unwrap_or(0.0);
+            }
+            for (q, slot) in out[t0..t0 + tn].iter_mut().enumerate() {
+                *slot = acc[q] + bias[co]
+                    + residual.map(|r| r[co * t_out + t0 + q]).unwrap_or(0.0);
             }
         });
     }
