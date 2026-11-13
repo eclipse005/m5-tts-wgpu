@@ -321,3 +321,72 @@ pub fn gelu(dev: &Device, x: &mut Tensor) -> Result<()> {
     }
     Ok(())
 }
+
+/// Append `rows` rows of `src` into `dst` at row `offset` (KV cache).
+pub fn write_rows(dev: &Device, dst: &mut Tensor, offset: usize, src: &Tensor) -> Result<()> {
+    let [dst_rows, cols] = dst.shape();
+    let [src_rows, src_cols] = src.shape();
+    if src_cols != cols {
+        bail!("write_rows: {src_cols} columns into a {cols}-column cache");
+    }
+    if offset + src_rows > dst_rows {
+        bail!("write_rows: {src_rows} rows at {offset} overflow a {dst_rows}-row cache");
+    }
+    match dev {
+        Device::Gpu(gpu) => gpu_ops::write_rows(gpu, dst.gpu_buffer()?, src.gpu_buffer()?, cols, offset, src_rows),
+        Device::Cpu => cpu_ops::write_rows(dst.cpu_slice_mut()?, src.cpu_slice()?, cols, offset),
+    }
+    Ok(())
+}
+
+/// Attention of one query row over the first `len` rows of a KV cache.
+pub fn attention_decode(dev: &Device, q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor,
+                        len: usize, heads: usize, head_dim: usize) -> Result<()> {
+    let [q_rows, cols] = q.shape();
+    if q_rows != 1 || cols != heads * head_dim {
+        bail!("attention_decode: query must be 1 x {}, got {q_rows} x {cols}", heads * head_dim);
+    }
+    expect("attention_decode k", k.shape(), [k.shape()[0], cols])?;
+    expect("attention_decode v", v.shape(), [v.shape()[0], cols])?;
+    expect("attention_decode output", out.shape(), [1, cols])?;
+    match dev {
+        Device::Gpu(gpu) => gpu_ops::attention_decode(gpu, q.gpu_buffer()?, k.gpu_buffer()?, v.gpu_buffer()?,
+                                                      out.gpu_buffer()?, len, heads, head_dim),
+        Device::Cpu => cpu_ops::attention_decode(q.cpu_slice()?, k.cpu_slice()?, v.cpu_slice()?,
+                                                 out.cpu_slice_mut()?, len, heads, head_dim),
+    }
+    Ok(())
+}
+
+/// Rotary embedding from a cos/sin table (`[T, head_dim]` each), in place.
+pub fn rope_tabled(dev: &Device, x: &mut Tensor, cos: &Tensor, sin: &Tensor,
+                   heads: usize, head_dim: usize) -> Result<()> {
+    let [frames, cols] = x.shape();
+    if cols != heads * head_dim {
+        bail!("rope_tabled: {cols} columns is not {heads} heads x {head_dim}");
+    }
+    expect("rope cos", cos.shape(), [frames, head_dim])?;
+    expect("rope sin", sin.shape(), [frames, head_dim])?;
+    match dev {
+        Device::Gpu(gpu) => gpu_ops::rope_tabled(gpu, x.gpu_buffer()?, cos.gpu_buffer()?, sin.gpu_buffer()?,
+                                                 frames, heads, head_dim),
+        Device::Cpu => cpu_ops::rope_tabled(x.cpu_slice_mut()?, cos.cpu_slice()?, sin.cpu_slice()?,
+                                            frames, heads, head_dim),
+    }
+    Ok(())
+}
+
+/// Grouped-query KV repeat: `[T, kv*D] -> [T, heads*D]`.
+pub fn repeat_kv(dev: &Device, x: &Tensor, y: &mut Tensor, kv_heads: usize, heads: usize,
+                 head_dim: usize) -> Result<()> {
+    let [frames, cols] = x.shape();
+    if cols != kv_heads * head_dim {
+        bail!("repeat_kv: {cols} columns is not {kv_heads} kv heads x {head_dim}");
+    }
+    expect("repeat_kv output", y.shape(), [frames, heads * head_dim])?;
+    match dev {
+        Device::Gpu(gpu) => gpu_ops::repeat_kv(gpu, x.gpu_buffer()?, y.gpu_buffer()?, frames, kv_heads, heads, head_dim),
+        Device::Cpu => cpu_ops::repeat_kv(x.cpu_slice()?, y.cpu_slice_mut()?, frames, kv_heads, heads, head_dim),
+    }
+    Ok(())
+}

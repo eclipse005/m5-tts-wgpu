@@ -178,3 +178,35 @@ pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
     gpu.dispatch("copy_f32", shaders::COPY_F32, "main",
                  &[(0, x), (1, y), (2, &params)], grid(len));
 }
+
+/// Copy `rows` rows of `src` into `dst` at row `offset`.
+pub fn write_rows(gpu: &Gpu, dst: &Buffer, src: &Buffer, cols: usize, offset: usize, rows: usize) {
+    let params = gpu.upload_u32("write_rows.params", &[cols as u32, offset as u32, rows as u32, 0]);
+    gpu.dispatch("write_rows_f32", shaders::WRITE_ROWS_F32, "main",
+                 &[(0, dst), (1, src), (2, &params)], grid(cols * rows));
+}
+
+/// Single-query attention over a KV cache.
+pub fn attention_decode(gpu: &Gpu, q: &Buffer, k: &Buffer, v: &Buffer, out: &Buffer,
+                        len: usize, heads: usize, head_dim: usize) {
+    let params = gpu.upload_u32("attention_decode.params",
+                               &[len as u32, heads as u32, head_dim as u32, 0]);
+    gpu.dispatch("attention_decode_f32", shaders::ATTENTION_DECODE_F32, "main",
+                 &[(0, q), (1, k), (2, v), (3, out), (4, &params)], (heads as u32, 1, 1));
+}
+
+/// Rotary embedding from a cos/sin table.
+pub fn rope_tabled(gpu: &Gpu, x: &Buffer, cos: &Buffer, sin: &Buffer,
+                   frames: usize, heads: usize, head_dim: usize) {
+    let params = gpu.upload_u32("rope_tabled.params", &[frames as u32, heads as u32, head_dim as u32, 0]);
+    let total = frames * heads * (head_dim / 2);
+    gpu.dispatch("rope_tabled_f32", shaders::ROPE_TABLED_F32, "main",
+                 &[(0, x), (1, cos), (2, sin), (3, &params)], grid(total));
+}
+
+/// Grouped-query KV repeat.
+pub fn repeat_kv(gpu: &Gpu, x: &Buffer, y: &Buffer, frames: usize, kv_heads: usize, heads: usize, head_dim: usize) {
+    let params = gpu.upload_u32("repeat_kv.params", &[frames as u32, kv_heads as u32, heads as u32, head_dim as u32]);
+    gpu.dispatch("repeat_kv_f32", shaders::REPEAT_KV_F32, "main",
+                 &[(0, x), (1, y), (2, &params)], grid(frames * heads * head_dim));
+}

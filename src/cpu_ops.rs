@@ -306,3 +306,75 @@ fn erf(v: f32) -> f32 {
             * (-ax * ax).exp();
     sign * y
 }
+
+/// Copy `rows` rows of `src` into `dst` at row `offset`.
+pub fn write_rows(dst: &mut [f32], src: &[f32], cols: usize, offset: usize) {
+    let start = offset * cols;
+    dst[start..start + src.len()].copy_from_slice(src);
+}
+
+/// Single-query attention over a KV cache of `len` rows.
+pub fn attention_decode(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
+                        len: usize, heads: usize, head_dim: usize) {
+    let stride = heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    out.par_chunks_mut(head_dim).enumerate().take(heads).for_each(|(head, dst)| {
+        let qo = head * head_dim;
+        let mut scores = vec![0.0f32; len];
+        let mut maxs = f32::NEG_INFINITY;
+        for (j, score) in scores.iter_mut().enumerate() {
+            let ko = j * stride + qo;
+            let mut acc = 0.0f32;
+            for i in 0..head_dim {
+                acc += q[qo + i] * k[ko + i];
+            }
+            *score = acc * scale;
+            maxs = maxs.max(*score);
+        }
+        let mut sum = 0.0f32;
+        for score in scores.iter_mut() {
+            *score = (*score - maxs).exp();
+            sum += *score;
+        }
+        let inv = 1.0 / sum;
+        for i in 0..head_dim {
+            let mut acc = 0.0f32;
+            for (j, score) in scores.iter().enumerate() {
+                acc += score * v[j * stride + qo + i];
+            }
+            dst[i] = acc * inv;
+        }
+    });
+}
+
+/// Rotary embedding from a cos/sin table, in place.
+pub fn rope_tabled(x: &mut [f32], cos: &[f32], sin: &[f32], frames: usize, heads: usize, head_dim: usize) {
+    let half = head_dim / 2;
+    let stride = heads * head_dim;
+    x.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
+        for h in 0..heads {
+            let base = h * head_dim;
+            for j in 0..half {
+                let c = cos[t * head_dim + j];
+                let s = sin[t * head_dim + j];
+                let a = row[base + j];
+                let b = row[base + j + half];
+                row[base + j] = a * c - b * s;
+                row[base + j + half] = b * c + a * s;
+            }
+        }
+    });
+}
+
+/// Grouped-query KV repeat.
+pub fn repeat_kv(x: &[f32], y: &mut [f32], frames: usize, kv_heads: usize, heads: usize, head_dim: usize) {
+    let rep = heads / kv_heads;
+    let src_stride = kv_heads * head_dim;
+    let dst_stride = heads * head_dim;
+    y.par_chunks_mut(dst_stride).enumerate().take(frames).for_each(|(t, row)| {
+        for h in 0..heads {
+            let src = &x[t * src_stride + (h / rep) * head_dim..][..head_dim];
+            row[h * head_dim..(h + 1) * head_dim].copy_from_slice(src);
+        }
+    });
+}

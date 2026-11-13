@@ -207,6 +207,76 @@
     512
    ]
   },
+  "frame0_embeds": {
+   "file": "frame0_embeds.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer0": {
+   "file": "frame0_layer0.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer1": {
+   "file": "frame0_layer1.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer2": {
+   "file": "frame0_layer2.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer3": {
+   "file": "frame0_layer3.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer4": {
+   "file": "frame0_layer4.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer5": {
+   "file": "frame0_layer5.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer6": {
+   "file": "frame0_layer6.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "frame0_layer7": {
+   "file": "frame0_layer7.bin",
+   "dtype": "float32",
+   "shape": [
+    45568
+   ]
+  },
+  "backbone_inv_freq": {
+   "file": "backbone_inv_freq.bin",
+   "dtype": "float32",
+   "shape": [
+    32
+   ]
+  },
   "frame0_c0_logits": {
    "file": "frame0_c0_logits.bin",
    "dtype": "float32",

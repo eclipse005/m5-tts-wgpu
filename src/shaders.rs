@@ -618,3 +618,123 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
 }
 "#;
+
+/// Copy `rows` rows into `dst` starting at row `offset` (KV-cache append).
+pub const WRITE_ROWS_F32: &str = r#"
+// 0=cols 1=offset 2=rows
+@group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0] * p[2]) { return; }
+    dst[p[1] * p[0] + i] = src[i];
+}
+"#;
+
+/// Attention for a single query row against a KV cache of `len` rows.
+///
+/// No mask: the query is the newest position, so every cached key is in the past.
+/// One workgroup per head; lanes split the keys for the score pass and one lane
+/// writes one output dimension, exactly like [`ATTENTION_F32`].
+pub const ATTENTION_DECODE_F32: &str = r#"
+// 0=len 1=heads 2=head_dim 3=0
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+var<workgroup> scores: array<f32, 256>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let heads = p[1];
+    let d = p[2];
+    let len = p[0];
+    let head = wid.x;
+    let lane = lid.x;
+    let stride = heads * d;
+    let qbase = head * d;
+    let scale = inverseSqrt(f32(d));
+
+    var kk = lane;
+    loop {
+        if (kk >= len) { break; }
+        let kbase = kk * stride + head * d;
+        var acc = 0.0;
+        for (var i = 0u; i < d; i = i + 1u) {
+            acc = acc + q[qbase + i] * k[kbase + i];
+        }
+        scores[kk] = acc * scale;
+        kk = kk + 64u;
+    }
+    workgroupBarrier();
+
+    var maxs = -1e30;
+    for (var i = 0u; i < len; i = i + 1u) { maxs = max(maxs, scores[i]); }
+    var sum = 0.0;
+    for (var i = 0u; i < len; i = i + 1u) { sum = sum + exp(scores[i] - maxs); }
+    let inv_sum = 1.0 / sum;
+
+    if (lane < d) {
+        var acc = 0.0;
+        for (var j = 0u; j < len; j = j + 1u) {
+            acc = acc + exp(scores[j] - maxs) * v[j * stride + head * d + lane];
+        }
+        out[qbase + lane] = acc * inv_sum;
+    }
+}
+"#;
+
+/// Rotary embedding driven by a precomputed cos/sin table (llama-3 scaled freqs
+/// for the LM, plain freqs for the codec). `cos`/`sin` are `[T, head_dim]`.
+pub const ROPE_TABLED_F32: &str = r#"
+// 0=T 1=heads 2=head_dim 3=0
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> cos_t: array<f32>;
+@group(0) @binding(2) var<storage, read> sin_t: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let d = p[2];
+    let h = p[1];
+    let half = d / 2u;
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0] * h * half) { return; }
+    let j = i % half;
+    let t = i / (h * half);
+    let head = (i / half) % h;
+    let base = t * h * d + head * d;
+    let c = cos_t[t * d + j];
+    let s = sin_t[t * d + j];
+    let a = x[base + j];
+    let b = x[base + j + half];
+    x[base + j] = a * c - b * s;
+    x[base + j + half] = b * c + a * s;
+}
+"#;
+
+/// Repeat KV heads for grouped-query attention: `[T, kv*D] -> [T, heads*D]`.
+pub const REPEAT_KV_F32: &str = r#"
+// 0=T 1=kv_heads 2=heads 3=head_dim
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let d = p[3];
+    let heads = p[2];
+    let kv = p[1];
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0] * heads * d) { return; }
+    let t = i / (heads * d);
+    let h = (i / d) % heads;
+    let dd = i % d;
+    let src_head = h / (heads / kv);
+    y[i] = x[t * kv * d + src_head * d + dd];
+}
+"#;

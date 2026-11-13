@@ -34,6 +34,30 @@ def save(name, array, out):
     return {"file": f"{name}.bin", "dtype": str(array.dtype), "shape": list(array.shape)}
 
 
+def _capture_first_embed(store):
+    """Keep the prefill's input embeddings (the first backbone call only)."""
+    def hook(_module, _args, kwargs):
+        store.setdefault("x", kwargs["hidden_states"].detach().clone())
+    return hook
+
+
+def _capture_first_output(store, key):
+    """Keep the first call's output. Must return None: a torch forward hook that
+    returns a value *replaces* the module output, which would pin every decode
+    step to the prefill's tensor and stop the model from ever emitting EOS."""
+    def hook(_module, _args, out):
+        store.setdefault(key, (out[0] if isinstance(out, tuple) else out).detach().clone())
+    return hook
+
+
+def _capture_first_hidden(store, index=0):
+    """Keep the prefill's output of one transformer layer (first call only)."""
+    def hook(_module, _args, out):
+        value = out[0] if isinstance(out, tuple) else out
+        store.setdefault(index, value.detach().clone())
+    return hook
+
+
 def depth_logits(model, last_h, c0, codes):
     """Frame i logits, exactly as `CSM.generate_frame` computes them.
 
@@ -101,16 +125,22 @@ def main():
 
     hidden_capture = {}
     logits_capture = {}
+    embeds_capture = {}
+    layer_capture = {}
     handles = [
-        model.backbone.register_forward_hook(
-            lambda _m, _i, o: hidden_capture.__setitem__("h", (o[0] if isinstance(o, tuple) else o).detach().clone())),
-        model.codebook0_head.register_forward_hook(
-            lambda _m, _i, o: logits_capture.__setitem__("c0", o.detach().clone())),
+        model.backbone.register_forward_hook(_capture_first_output(hidden_capture, "h")),
+        model.codebook0_head.register_forward_hook(_capture_first_output(logits_capture, "c0")),
+        # The backbone is called with kwargs, so the pre-hook needs with_kwargs.
+        model.backbone.register_forward_pre_hook(_capture_first_embed(embeds_capture), with_kwargs=True),
+        *[layer.register_forward_hook(_capture_first_hidden(layer_capture, index))
+          for index, layer in enumerate(model.backbone.layers)],
     ]
     CSM.generate_frame = spy
     try:
         audio = tts.infer(args.text, prompt_wav=args.prompt_wav, prompt_text=args.prompt_text, lang="Chinese")
         h0 = hidden_capture["h"]
+        e0 = embeds_capture["x"]
+        inv_freq = model.backbone.position_embedding.inv_freq.detach().float().clone()
         c0_logits = logits_capture["c0"]
     finally:
         CSM.generate_frame = original
@@ -196,6 +226,10 @@ def main():
             "frame0_tokens": save("frame0_tokens", audit[0]["tokens"].reshape(-1).numpy(), out),
             "frame0_pos": save("frame0_pos", audit[0]["input_pos"].reshape(-1).numpy(), out),
             "frame0_h": save("frame0_h", last_h.reshape(-1).numpy(), out),
+            "frame0_embeds": save("frame0_embeds", e0.reshape(-1).numpy(), out),
+            **{f"frame0_layer{i}": save(f"frame0_layer{i}", layer_capture[i].reshape(-1).numpy(), out)
+               for i in sorted(layer_capture)},
+            "backbone_inv_freq": save("backbone_inv_freq", inv_freq.numpy(), out),
             "frame0_c0_logits": save("frame0_c0_logits", c0_logits.reshape(-1).numpy(), out),
             **{f"frame0_ci{i}_logits": save(f"frame0_ci{i}_logits", ci[i - 1].numpy(), out)
                for i in range(1, len(ci) + 1)},
