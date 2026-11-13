@@ -278,8 +278,11 @@ fn conv_transpose_matches_between_backends() {
     let Some(gpu) = gpu() else { return };
     // SEANet upsamplers use kernel = 2*stride and trim; the ConvNeXt stages use
     // kernel == stride. Both have to agree with the CPU twin.
-    for (cin, cout, rate) in [(4usize, 2usize, 2usize), (6, 3, 8), (8, 4, 5)] {
-        let ks = 2 * rate;
+    for (cin, cout, rate, one_tap) in
+        [(4usize, 2usize, 2usize, false), (6, 3, 8, false), (8, 4, 5, false), (4, 4, 2, true), (6, 6, 3, true)]
+    {
+        // `kernel == stride` is the latent upsampler (one tap per phase).
+        let ks = if one_tap { rate } else { 2 * rate };
         let (t_in, t_out) = (10usize, 10 * rate);
         let cpu = Device::Cpu;
         let x = tensor(&cpu, [cin, t_in], 41);

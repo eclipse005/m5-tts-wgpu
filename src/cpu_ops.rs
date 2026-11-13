@@ -319,8 +319,13 @@ pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
         let mut acc = vec![0.0f32; stride * BLOCK];
         for q0 in (0..t_in).step_by(BLOCK) {
             let len = BLOCK.min(t_in - q0);
-            for slot in acc[..stride * len].iter_mut() {
-                *slot = 0.0;
+            // Each phase owns its own `stride * BLOCK`-slot lane, so zero those
+            // lanes separately: clearing only `[0, stride * len)` leaves stale
+            // values in the r >= 1 lanes whenever a call spans several blocks.
+            for r in 0..stride {
+                for slot in acc[r * BLOCK..r * BLOCK + len].iter_mut() {
+                    *slot = 0.0;
+                }
             }
             for ci in 0..cin {
                 let xrow = &x[ci * t_in..(ci + 1) * t_in];
