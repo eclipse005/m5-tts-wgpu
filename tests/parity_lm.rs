@@ -199,3 +199,45 @@ fn depth_decoder_matches_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// The device depth path must produce the same tokens as the host path with the
+/// same noise — that is the gate before the pipeline uses it.
+#[test]
+fn depth_device_path_matches_host_path() -> Result<()> {
+    let Some(goldens) = Goldens::open() else {
+        eprintln!("skipping: run scripts/dump_acoustic.py");
+        return Ok(());
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("skipping: no M5 bundle (set M5_MODEL)");
+        return Ok(());
+    };
+    let tokens: Vec<u32> = goldens.i64("frame0_tokens").iter().map(|v| *v as u32).collect();
+    let frames = goldens.shape("frame0_tokens")[0] / (CODEBOOKS + 1);
+    let noise: Vec<Vec<f32>> = (0..CODEBOOKS).map(|i| goldens.f32(&format!("frame0_noise{i}"))).collect();
+
+    let cpu = Lm::load(&dir, Device::Cpu)?;
+    let embedded = cpu.embed_frames(&tokens, frames)?;
+    let mut kv = KvCache::new(cpu.device(), 8, frames + 8)?;
+    let h = cpu.backbone_prefill(&embedded, &mut kv)?;
+    let host_last = last_row(cpu.device(), &h, frames)?;
+    let want = cpu.depth_codes(&host_last, 0, &noise, 0.9, 10, false)?;
+
+    let gpu_lm = Lm::load(&dir, Device::open("gpu")?)?;
+    let dev = gpu_lm.device();
+    let embedded = gpu_lm.embed_frames(&tokens, frames)?;
+    let mut kv = KvCache::new(dev, 8, frames + 8)?;
+    let h = gpu_lm.backbone_prefill(&embedded, &mut kv)?;
+    let gpu_last = last_row(dev, &h, frames)?;
+    // Pack the frame's noise as one [16, vocab] tensor.
+    let mut flat = Vec::with_capacity(CODEBOOKS * AUDIO_VOCAB);
+    for row in &noise {
+        flat.extend_from_slice(row);
+    }
+    let noise_tensor = dev.tensor([CODEBOOKS, AUDIO_VOCAB], &flat)?;
+    let got = gpu_lm.depth_codes_device(&gpu_last, &noise_tensor, 0.9, 10, false)?;
+    eprintln!("device depth: {got:?}");
+    eprintln!("host   depth: {want:?}");
+    assert_eq!(got, want, "device and host depth paths disagree");
+    Ok(())
+}

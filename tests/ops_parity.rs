@@ -385,3 +385,31 @@ fn conv1d_matches_at_seanet_prime_shape() {
                 &gpu.tensor([cout, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, &p).unwrap();
     assert_close("conv1d 1024->1536", &want, &gpu.read(&got).unwrap());
 }
+
+#[test]
+fn gpu_sampler_matches_cpu_sampler() {
+    let Some(gpu) = gpu() else { return };
+    use m5_tts_wgpu::device::Tokens;
+    use m5_tts_wgpu::lm::sample::sample_topk;
+    let vocab = 2051usize;
+    let cpu = Device::Cpu;
+    for (seed, topk, temperature, allow_eos) in
+        [(11u64, 10usize, 0.9f32, true), (12, 10, 0.9, false), (13, 1, 1.0, true), (14, 50, 0.7, true)]
+    {
+        let logits = rand_vec(vocab, seed);
+        // Exp(1) noise, the same distribution the reference draws.
+        let noise: Vec<f32> = rand_vec(vocab, seed + 100).iter().map(|v| 0.05 + (v + 0.5)).collect();
+        let want = sample_topk(&logits, temperature, topk, allow_eos, &noise).unwrap();
+
+        let l = gpu.tensor([1, vocab], &logits).unwrap();
+        let n = gpu.tensor([1, vocab], &noise).unwrap();
+        let out = gpu.tokens(&[0u32]).unwrap();
+        let buffer = out.buffer.as_ref().unwrap();
+        m5_tts_wgpu::gpu_ops::sample_topk(gpu.gpu().unwrap(), l.gpu_buffer().unwrap(), n.gpu_buffer().unwrap(),
+                                         buffer, vocab, topk, temperature, allow_eos);
+        gpu.gpu().unwrap().flush();
+        let got = gpu.read_tokens(&Tokens { buffer: Some(buffer.clone()), data: out.data.clone() }).unwrap();
+        eprintln!("sampler seed={seed} topk={topk} temp={temperature}: want {want} got {}", got[0]);
+        assert_eq!(got[0], want, "sampler mismatch (seed {seed})");
+    }
+}

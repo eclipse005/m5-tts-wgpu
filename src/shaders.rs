@@ -799,3 +799,134 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
 }
 "#;
+
+/// Sum of the sixteen audio embedding rows for one frame.
+///
+/// `out[d] = sum_cb table[cb * vocab + token[cb], d]`. Keeping this on the device
+/// is what lets the generation loop sample without a host round-trip.
+pub const EMBED_SUM_F32: &str = r#"
+// 0=hidden 1=cb_offset 2=vocab 3=cb_count
+@group(0) @binding(0) var<storage, read> table: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let hidden = p[0];
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= hidden) { return; }
+    var acc = 0.0;
+    for (var j = 0u; j < p[3]; j = j + 1u) {
+        let cb = p[1] + j;
+        let row = cb * p[2] + tokens[cb];
+        acc = acc + table[row * hidden + i];
+    }
+    out[i] = acc;
+}
+"#;
+
+/// top-k sampler, port of `sample_topk` + `_multinomial_sample_one_no_sync`.
+///
+/// Mask EOS, divide by temperature, keep the top-k, then `argmax(probs / noise)`.
+/// Parallel max/sum over 256 lanes; the final scans are serial in lane 0, which is
+/// a few microseconds and still far cheaper than a host round-trip.
+pub const SAMPLE_TOPK_F32: &str = r#"
+// 0=vocab 1=topk 2=temperature(bits) 3=allow_eos*2 + out_offset
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> noise: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 4>;
+var<workgroup> part: array<f32, 256>;
+
+fn score(i: u32) -> f32 {
+    var v = logits[i] / bitcast<f32>(p[2]);
+    if (i == 0u && (p[3] & 1u) == 0u) { v = -1e5; }
+    return v;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let lane = lid.x;
+    let vocab = p[0];
+    let topk = min(p[1], vocab);
+
+    // Cutoff = k-th largest. Each lane ranks its own strided subset by counting how
+    // many scores beat it (O(vocab) per element, /256 lanes), then the kept scores'
+    // minimum is reduced across the workgroup.
+    var local_min = 1e30;
+    var i = lane;
+    loop {
+        if (i >= vocab) { break; }
+        let vi = score(i);
+        var greater = 0u;
+        for (var j = 0u; j < vocab; j = j + 1u) {
+            let vj = score(j);
+            if (vj > vi || (vj == vi && j < i)) { greater = greater + 1u; }
+        }
+        if (greater < topk) { local_min = min(local_min, vi); }
+        i = i + 256u;
+    }
+    part[lane] = local_min;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var m = 1e30;
+        for (var j = 0u; j < 256u; j = j + 1u) { m = min(m, part[j]); }
+        part[0] = m;
+    }
+    workgroupBarrier();
+    let cutoff = part[0];
+
+    // Parallel max over surviving scores.
+    var local_max = -1e30;
+    i = lane;
+    loop {
+        if (i >= vocab) { break; }
+        let v = score(i);
+        if (v >= cutoff && v > local_max) { local_max = v; }
+        i = i + 256u;
+    }
+    part[lane] = local_max;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var m = -1e30;
+        for (var j = 0u; j < 256u; j = j + 1u) { m = max(m, part[j]); }
+        part[0] = m;
+    }
+    workgroupBarrier();
+    let maxv = part[0];
+
+    // Parallel sum of exp(score - max) over survivors.
+    var local_sum = 0.0;
+    i = lane;
+    loop {
+        if (i >= vocab) { break; }
+        let v = score(i);
+        if (v >= cutoff) { local_sum = local_sum + exp(v - maxv); }
+        i = i + 256u;
+    }
+    part[lane] = local_sum;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var sum = 0.0;
+        for (var j = 0u; j < 256u; j = j + 1u) { sum = sum + part[j]; }
+        part[0] = sum;
+    }
+    workgroupBarrier();
+    let total = part[0];
+
+    // argmax(probs / noise) over survivors.
+    if (lane == 0u) {
+        var best_i = 0u;
+        var best_ratio = -1e30;
+        for (var j = 0u; j < vocab; j = j + 1u) {
+            let v = score(j);
+            if (v >= cutoff) {
+                let ratio = (exp(v - maxv) / total) / noise[j];
+                if (ratio > best_ratio) { best_ratio = ratio; best_i = j; }
+            }
+        }
+        out[p[3] >> 1u] = best_i;
+    }
+}
+"#;

@@ -232,3 +232,25 @@ pub fn elu(gpu: &Gpu, x: &Buffer, len: usize) {
     gpu.dispatch("elu_f32", shaders::ELU_F32, "main",
                  &[(0, x), (1, &params)], grid(len));
 }
+
+/// Sum of the sixteen audio embedding rows for one frame.
+pub fn embed_sum(gpu: &Gpu, table: &Buffer, tokens: &Buffer, out: &Buffer,
+                 hidden: usize, cb_offset: usize, cb_count: usize, vocab: usize) {
+    let params = gpu.upload_u32("embed_sum.params",
+                               &[hidden as u32, cb_offset as u32, vocab as u32, cb_count as u32]);
+    gpu.dispatch("embed_sum_f32", shaders::EMBED_SUM_F32, "main",
+                 &[(0, table), (1, tokens), (2, out), (3, &params)],
+                 (hidden.div_ceil(128) as u32, 1, 1));
+}
+
+/// top-k sample into `out[0]`.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_topk(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buffer,
+                   vocab: usize, topk: usize, temperature: f32, allow_eos: bool,
+                   out_offset: usize) {
+    let params = gpu.upload_u32("sample_topk.params",
+                               &[vocab as u32, topk as u32, temperature.to_bits(),
+                                 ((out_offset as u32) << 1) | allow_eos as u32]);
+    gpu.dispatch("sample_topk_f32", shaders::SAMPLE_TOPK_F32, "main",
+                 &[(0, logits), (1, noise), (2, out), (3, &params)], (1, 1, 1));
+}

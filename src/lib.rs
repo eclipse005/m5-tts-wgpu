@@ -26,7 +26,7 @@ mod cpu_ops;
 pub mod device;
 pub mod gpu;
 pub mod lm;
-mod gpu_ops;
+pub mod gpu_ops;
 pub mod ops;
 pub mod pipeline;
 pub mod shaders;

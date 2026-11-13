@@ -241,6 +241,36 @@ impl Gpu {
         }
     }
 
+    /// Read `len` u32 back from `buffer`.
+    pub fn download_u32(&self, buffer: &Buffer, len: usize) -> Vec<u32> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_u32"),
+            size: (len.max(1) * 4) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, (len * 4) as u64);
+        let mut commands: Vec<wgpu::CommandBuffer> = Vec::new();
+        if let Some(batch) = self.encode_batch() {
+            commands.push(batch);
+        }
+        commands.push(encoder.finish());
+        self.queue.submit(commands);
+        self.stats.borrow_mut().submits += 1;
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+        let out = {
+            let view = staging.slice(..).get_mapped_range().expect("map readback range");
+            bytemuck::cast_slice::<u8, u32>(&view).to_vec()
+        };
+        staging.unmap();
+        self.stats.borrow_mut().bytes_readback += (len * 4) as u64;
+        out
+    }
+
     /// Read `len` f32 back from `buffer`.
     pub fn download(&self, buffer: &Buffer, len: usize) -> Vec<f32> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {

@@ -94,6 +94,28 @@ impl Device {
         }
     }
 
+    /// Token vector: a u32 storage buffer on the GPU, a plain vec on the CPU.
+    pub fn tokens(&self, values: &[u32]) -> Result<Tokens> {
+        Ok(match self {
+            Device::Gpu(gpu) => Tokens {
+                buffer: Some(gpu.upload_u32("tokens", values)),
+                data: values.to_vec(),
+            },
+            Device::Cpu => Tokens { buffer: None, data: values.to_vec() },
+        })
+    }
+
+    /// Read a token vector back (one synchronisation).
+    pub fn read_tokens(&self, tokens: &Tokens) -> Result<Vec<u32>> {
+        match (self, &tokens.buffer) {
+            (Device::Gpu(gpu), Some(buffer)) => {
+                let values = gpu.download_u32(buffer, tokens.data.len());
+                Ok(values)
+            }
+            _ => Ok(tokens.data.clone()),
+        }
+    }
+
     /// Explicit tensor copy (device-to-device on the GPU, `Vec` clone on the CPU).
     pub fn copy(&self, tensor: &Tensor) -> Result<Tensor> {
         let mut out = self.zeros(tensor.shape())?;
@@ -112,6 +134,22 @@ impl Device {
             Device::Gpu(gpu) => Ok(gpu.as_ref()),
             Device::Cpu => bail!("this operation needs the GPU backend"),
         }
+    }
+}
+
+/// Token ids on the device (u32). Kept apart from [`Tensor`] because the
+/// generation loop must sample and embed without a host round-trip.
+pub struct Tokens {
+    pub buffer: Option<wgpu::Buffer>,
+    pub data: Vec<u32>,
+}
+
+impl Tokens {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 

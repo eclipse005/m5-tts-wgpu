@@ -104,6 +104,11 @@ impl Lm {
     }
 
     /// Raw audio embedding table (`[CODEBOOKS * AUDIO_VOCAB, HIDDEN]`), host side.
+    /// Weight cache, exposed so sibling modules can memoise device copies.
+    pub(crate) fn cache_ref(&self) -> &RefCell<HashMap<String, Rc<Tensor>>> {
+        &self.cache
+    }
+
     pub fn audio_embedding_table(&self) -> &[f32] {
         &self.audio_emb
     }
