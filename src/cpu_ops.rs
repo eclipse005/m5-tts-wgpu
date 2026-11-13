@@ -36,11 +36,8 @@ pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, 
                 // SAFETY: guarded by `avx2_available()`.
                 unsafe { dot_avx2(xr, wr, k) }
             } else {
-                let mut acc = 0.0f32;
-                for i in 0..k {
-                    acc += xr[i] * wr[i];
-                }
-                acc
+                // Equal-length zip: vectorises on every target, not just AVX2.
+                xr.iter().zip(wr).map(|(a, b)| a * b).sum()
             };
             *slot = dot + bias.map(|b| b[c]).unwrap_or(0.0);
         };
@@ -144,11 +141,25 @@ pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
                     // SAFETY: guarded by `avx2_available()` above.
                     unsafe { conv_block_avx2(&window[base..base + len], wrow, &mut acc, tn, ks, dilation) };
                 } else {
+                    // Slice-paired loop: equal-length `zip` is what lets the compiler
+                    // vectorise on every target (x86 baseline SSE2, ARM NEON), not
+                    // just where the hand-written AVX2 path is available.
                     for k in 0..ks {
                         let wv = wrow[k];
                         let off = k * dilation;
-                        for (j, slot) in acc.iter_mut().enumerate() {
-                            *slot += window[base + j * stride + off] * wv;
+                        if stride == 1 {
+                            let src = &window[base + off..base + off + tn];
+                            for (slot, value) in acc.iter_mut().zip(src) {
+                                *slot += value * wv;
+                            }
+                        } else {
+                            // Last tapped sample is (tn-1)*stride + off, not tn*stride.
+                            let src = &window[base + off..base + off + (tn - 1) * stride + 1];
+                            // `chunks`, not `chunks_exact`: the tail chunk holds the
+                            // final (partial-stride) sample.
+                            for (slot, value) in acc.iter_mut().zip(src.chunks(stride)) {
+                                *slot += value[0] * wv;
+                            }
                         }
                     }
                 }
@@ -207,7 +218,7 @@ pub fn snake_beta(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize, t
         let b = beta[c].exp() + 1e-9;
         for v in row.iter_mut() {
             let s = (*v * a).sin();
-            *v += s * s / b;
+            *v = *v + s * s / b;
         }
     });
 }
@@ -624,7 +635,14 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32], k: usize) -> f32 {
 }
 
 /// True when the CPU can run the AVX2 + FMA path.
+///
+/// Every kernel has a portable scalar path for CPUs without AVX2 (ARM, older
+/// x86); `M5_NO_SIMD=1` forces it so the fallback stays tested — it is the path a
+/// non-AVX2 machine runs, not dead code.
 fn avx2_available() -> bool {
+    if std::env::var_os("M5_NO_SIMD").is_some() {
+        return false;
+    }
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -761,11 +779,7 @@ pub fn gemv_add(x: &[f32], w: &[f32], residual: &[f32], y: &mut [f32], k: usize,
             // SAFETY: guarded by `avx2_available()`.
             unsafe { dot_avx2(x, row, k) }
         } else {
-            let mut acc = 0.0f32;
-            for i in 0..k {
-                acc += x[i] * row[i];
-            }
-            acc
+            x.iter().zip(row).map(|(a, b)| a * b).sum()
         };
         acc + residual[r]
     };
@@ -787,11 +801,7 @@ pub fn silu_gemv(gate: &[f32], up: &[f32], w: &[f32], residual: &[f32], y: &mut 
             // SAFETY: guarded by `avx2_available()`.
             unsafe { dot_avx2(&act, row, inter) }
         } else {
-            let mut acc = 0.0f32;
-            for i in 0..inter {
-                acc += act[i] * row[i];
-            }
-            acc
+            act.iter().zip(row).map(|(a, b)| a * b).sum()
         };
         acc + residual[r]
     };
@@ -1182,18 +1192,24 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
             });
             continue;
         }
-        // Scalar fallback (strided or unaligned channel counts).
-        for (co, out) in y.chunks_mut(t_out).enumerate().take(cout) {
+        // Scalar fallback (strided, unaligned channel counts, or no AVX2). It must
+        // still parallelise over output channels: forgetting that made the
+        // non-AVX2 path 45x slower than the vector one, not "a bit slower".
+        y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
+            let window = &window;
+            let wrow = &w[co * cin * ks..(co + 1) * cin * ks];
             for (q, slot) in out[t0..t0 + tn].iter_mut().enumerate() {
                 let mut sum = bias[co];
                 for ci in 0..cin {
-                    for k in 0..ks {
-                        sum += window[ci * len + q * stride + k * dilation] * w[(co * cin + ci) * ks + k];
+                    let base = ci * len + q * stride;
+                    let wr = &wrow[ci * ks..(ci + 1) * ks];
+                    for (k, wv) in wr.iter().enumerate() {
+                        sum += window[base + k * dilation] * wv;
                     }
                 }
                 *slot = sum + residual.map(|r| r[co * t_out + t0 + q]).unwrap_or(0.0);
             }
-        }
+        });
     }
 }
 
