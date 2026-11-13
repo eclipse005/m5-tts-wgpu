@@ -22,7 +22,7 @@ pub mod audio;
 pub mod codec;
 pub mod conditioning;
 pub mod config;
-mod cpu_ops;
+pub mod cpu_ops;
 pub mod device;
 pub mod gpu;
 pub mod lm;

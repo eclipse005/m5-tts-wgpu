@@ -8,6 +8,7 @@
 use anyhow::{bail, Result};
 
 use super::*;
+use crate::cpu_ops;
 use crate::ops;
 
 /// Per-layer KV cache, already expanded to `heads` (GQA is resolved on write, so
@@ -209,6 +210,14 @@ impl Lm {
     pub fn llama_layer(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32], sin: &[f32],
                        kv: Option<(&mut KvCache, usize, bool)>) -> Result<Tensor> {
         let dev = self.device();
+        // CPU decode (one row, cache present): the fused path is ~2x faster than
+        // fourteen fork-joins. Prefill and the GPU keep the generic path.
+        let fused = std::env::var("M5_NO_FUSED").is_err();
+        if fused && !dev.is_gpu() && x.shape()[0] == 1 {
+            if let Some((cache, position, false)) = kv {
+                return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position);
+            }
+        }
         let p = format!("{prefix}.layers.{index}");
         let [frames, _] = x.shape();
         let q_dim = HEADS * HEAD_DIM;
@@ -280,5 +289,114 @@ impl Lm {
         let mut out = dev.zeros([frames, HIDDEN])?;
         ops::add(dev, &x1, &mlp, &mut out)?;
         Ok(out)
+    }
+}
+
+impl Lm {
+    /// Concatenated `[q; k; v]` rows, cached — the fusion the reference exporter
+    /// does with `fuse_projections`, so the decode path runs one projection instead
+    /// of three.
+    fn qkv_weight(&self, prefix: &str, index: usize) -> Result<Rc<Tensor>> {
+        let key = format!("{prefix}.layers.{index}.qkv");
+        if let Some(t) = self.cache_ref().borrow().get(&key) {
+            return Ok(t.clone());
+        }
+        let p = format!("{prefix}.layers.{index}");
+        let rows = HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM;
+        let parts = [
+            (format!("{p}.self_attn.q_proj.weight"), HEADS * HEAD_DIM),
+            (format!("{p}.self_attn.k_proj.weight"), KV_HEADS * HEAD_DIM),
+            (format!("{p}.self_attn.v_proj.weight"), KV_HEADS * HEAD_DIM),
+        ];
+        let mut data = Vec::with_capacity(rows * HIDDEN);
+        for (name, out_rows) in parts {
+            let tensor = self.tensor(&name, [out_rows, HIDDEN])?;
+            data.extend_from_slice(&self.device().read(&tensor)?);
+        }
+        let tensor = Rc::new(self.device().tensor([rows, HIDDEN], &data)?);
+        self.cache_ref().borrow_mut().insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
+    /// Concatenated `[gate; up]` rows, cached.
+    fn gate_up_weight(&self, prefix: &str, index: usize) -> Result<Rc<Tensor>> {
+        let key = format!("{prefix}.layers.{index}.gate_up");
+        if let Some(t) = self.cache_ref().borrow().get(&key) {
+            return Ok(t.clone());
+        }
+        let p = format!("{prefix}.layers.{index}");
+        let mut data = Vec::with_capacity(2 * INTERMEDIATE * HIDDEN);
+        for name in [format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")] {
+            let tensor = self.tensor(&name, [INTERMEDIATE, HIDDEN])?;
+            data.extend_from_slice(&self.device().read(&tensor)?);
+        }
+        let tensor = Rc::new(self.device().tensor([2 * INTERMEDIATE, HIDDEN], &data)?);
+        self.cache_ref().borrow_mut().insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
+    /// Fused CPU decode step for one layer.
+    ///
+    /// A layer is fourteen tiny ops of 512-2048 elements; each `par_*` call costs
+    /// more in fork-join than the arithmetic it parallelises. This runs the same
+    /// math in five parallel regions and never materialises the intermediate
+    /// tensors. Verified against the generic path by the LM parity tests.
+    fn llama_layer_cpu_step(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32],
+                            sin: &[f32], cache: &mut KvCache, position: usize) -> Result<Tensor> {
+        let dev = self.device();
+        let p = format!("{prefix}.layers.{index}");
+        let q_dim = HEADS * HEAD_DIM;
+        let kv_dim = KV_HEADS * HEAD_DIM;
+        let row = x.cpu_slice()?.to_vec();
+        let profile = std::env::var("M5_PROFILE_LAYER").is_ok();
+        let mut phase = std::time::Instant::now();
+
+        // 1) norm + [q; k; v]
+        let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+        let qkv_w = self.qkv_weight(prefix, index)?;
+        let mut qkv = vec![0.0f32; q_dim + 2 * kv_dim];
+        cpu_ops::rms_norm_gemv(&row, input_norm.cpu_slice()?, qkv_w.cpu_slice()?, None, &mut qkv,
+                               HIDDEN, q_dim + 2 * kv_dim, 1e-5);
+
+        if profile { eprintln!("      qkv {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        // 2) rope + cache append + attention (one region per head inside each op)
+        let (q, rest) = qkv.split_at_mut(q_dim);
+        let (k, v) = rest.split_at_mut(kv_dim);
+        cpu_ops::rope_tabled(q, cos, sin, 1, HEADS, HEAD_DIM);
+        cpu_ops::rope_tabled(k, cos, sin, 1, KV_HEADS, HEAD_DIM);
+        let mut k_full = vec![0.0f32; q_dim];
+        let mut v_full = vec![0.0f32; q_dim];
+        cpu_ops::repeat_kv(k, &mut k_full, 1, KV_HEADS, HEADS, HEAD_DIM);
+        cpu_ops::repeat_kv(v, &mut v_full, 1, KV_HEADS, HEADS, HEAD_DIM);
+        cpu_ops::write_rows(cache.k[index].cpu_slice_mut()?, &k_full, q_dim, position);
+        cpu_ops::write_rows(cache.v[index].cpu_slice_mut()?, &v_full, q_dim, position);
+        let mut attended = vec![0.0f32; q_dim];
+        cpu_ops::attention_decode(q, cache.k[index].cpu_slice()?, cache.v[index].cpu_slice()?,
+                                 &mut attended, position + 1, HEADS, HEAD_DIM);
+
+        if profile { eprintln!("      attn {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        // 3) o-projection + residual
+        let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
+        let mut x1 = vec![0.0f32; HIDDEN];
+        cpu_ops::gemv_add(&attended, o_w.cpu_slice()?, &row, &mut x1, q_dim, HIDDEN);
+
+        if profile { eprintln!("      o    {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        // 4) norm + [gate; up]
+        let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+        if profile { eprintln!("      .normvec {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        let gate_up_w = self.gate_up_weight(prefix, index)?;
+        if profile { eprintln!("      .gateupw {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        let mut gate_up = vec![0.0f32; 2 * INTERMEDIATE];
+        cpu_ops::rms_norm_gemv(&x1, post_norm.cpu_slice()?, gate_up_w.cpu_slice()?, None, &mut gate_up,
+                               HIDDEN, 2 * INTERMEDIATE, 1e-5);
+
+        if profile { eprintln!("      gateup {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        // 5) silu * up, down projection, residual
+        let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
+        let mut out = vec![0.0f32; HIDDEN];
+        cpu_ops::silu_gemv(&gate_up[..INTERMEDIATE], &gate_up[INTERMEDIATE..], down_w.cpu_slice()?,
+                           &x1, &mut out, INTERMEDIATE, HIDDEN);
+        if profile { eprintln!("      down {:.0}us", phase.elapsed().as_secs_f64() * 1e6); }
+        dev.tensor([1, HIDDEN], &out)
     }
 }

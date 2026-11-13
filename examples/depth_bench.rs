@@ -13,6 +13,23 @@ fn main() -> anyhow::Result<()> {
         flat.extend_from_slice(row);
     }
 
+    // Same-process A/B: cross-run numbers drift on this box.
+    for noset in [false, true] {
+        if noset {
+            std::env::set_var("M5_NO_FUSED", "1");
+        } else {
+            std::env::remove_var("M5_NO_FUSED");
+        }
+        let lm = Lm::load(dir, Device::Cpu)?;
+        let h = lm.device().tensor([1, HIDDEN], &vec![0.02f32; HIDDEN])?;
+        let calls = 30;
+        let _ = lm.depth_codes(&h, 0, &noise, 0.9, 10, true)?;
+        let start = Instant::now();
+        for _ in 0..calls { let _ = lm.depth_codes(&h, 0, &noise, 0.9, 10, true)?; }
+        println!("cpu {}: {:.1} ms/frame", if noset { "generic " } else { "fused   " },
+                 start.elapsed().as_secs_f64() * 1e3 / calls as f64);
+    }
+
     for spec in ["cpu", "gpu"] {
         let lm = Lm::load(dir, Device::open(spec)?)?;
         let dev = lm.device();

@@ -688,3 +688,110 @@ unsafe fn conv_block4_avx2(window: &[f32], w: &[&[f32]; 4], acc: &mut [f32], tn:
         j += 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused decode kernels
+//
+// The LM's per-frame loop is a chain of tiny ops (512-2048 elements each). Every
+// `par_*` call is a fork-join (~10-20 us on this machine) while the arithmetic is
+// 1-5 us, so a layer spent most of its time in the scheduler. These three fuse the
+// layer's op chains into one parallel region each, 14 forks -> 5, and skip the
+// intermediate allocations.
+// ---------------------------------------------------------------------------
+
+/// `y = W @ rms_norm(x) + bias`: norm and the (one or three) projections in one pass.
+///
+/// `x` is a single row (`cols` values); `w` is `[rows, cols]` (several projections
+/// can be concatenated into one weight matrix).
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gemv(x: &[f32], norm_w: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32],
+                     cols: usize, rows: usize, eps: f32) {
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    // Norm preamble: 512 elements, cheaper serial than a fork.
+    let mut normed = vec![0.0f32; cols];
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+    let inv = 1.0 / (mean_sq + eps).sqrt();
+    for c in 0..cols {
+        normed[c] = x[c] * inv * norm_w[c];
+    }
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * cols..(r + 1) * cols];
+        let mut acc = 0.0f32;
+        if avx2_available() {
+            // SAFETY: guarded by `avx2_available()`.
+            acc = unsafe { dot_avx2(&normed, row, cols) };
+        } else {
+            for c in 0..cols {
+                acc += normed[c] * row[c];
+            }
+        }
+        acc + bias.map(|b| b[r]).unwrap_or(0.0)
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+/// `y = W @ x + residual`: projection and residual add in one pass.
+pub fn gemv_add(x: &[f32], w: &[f32], residual: &[f32], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), n);
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * k..(r + 1) * k];
+        let acc = if avx2_available() {
+            // SAFETY: guarded by `avx2_available()`.
+            unsafe { dot_avx2(x, row, k) }
+        } else {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += x[i] * row[i];
+            }
+            acc
+        };
+        acc + residual[r]
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+/// `y = W @ (silu(gate) * up)`: the SwiGLU activation and the down projection fused.
+pub fn silu_gemv(gate: &[f32], up: &[f32], w: &[f32], residual: &[f32], y: &mut [f32],
+                 inter: usize, n: usize) {
+    debug_assert_eq!(y.len(), n);
+    let mut act = vec![0.0f32; inter];
+    for i in 0..inter {
+        let g = gate[i];
+        act[i] = (g / (1.0 + (-g).exp())) * up[i];
+    }
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * inter..(r + 1) * inter];
+        let acc = if avx2_available() {
+            // SAFETY: guarded by `avx2_available()`.
+            unsafe { dot_avx2(&act, row, inter) }
+        } else {
+            let mut acc = 0.0f32;
+            for i in 0..inter {
+                acc += act[i] * row[i];
+            }
+            acc
+        };
+        acc + residual[r]
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+#[cfg(test)]
+mod perf_tests {
+    #[test]
+    fn fused_kernels_have_sane_throughput() {
+        // 4096 x 512 = 2.1M MAC; anything above a millisecond is a scheduling bug.
+        let (hidden, inter) = (512usize, 2048usize);
+        let x = vec![0.1f32; hidden];
+        let norm_w = vec![1.0f32; hidden];
+        let w = vec![0.01f32; 2 * inter * hidden];
+        let mut out = vec![0.0f32; 2 * inter];
+        let start = std::time::Instant::now();
+        super::rms_norm_gemv(&x, &norm_w, &w, None, &mut out, hidden, 2 * inter, 1e-5);
+        let elapsed = start.elapsed().as_secs_f64() * 1e3;
+        eprintln!("rms_norm_gemv 4096x512: {elapsed:.3} ms");
+        assert!(elapsed < 5.0, "fused gemv took {elapsed:.1} ms");
+    }
+}
