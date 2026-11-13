@@ -406,7 +406,7 @@ fn gpu_sampler_matches_cpu_sampler() {
         let out = gpu.tokens(&[0u32]).unwrap();
         let buffer = out.buffer.as_ref().unwrap();
         m5_tts_wgpu::gpu_ops::sample_topk(gpu.gpu().unwrap(), l.gpu_buffer().unwrap(), n.gpu_buffer().unwrap(),
-                                         buffer, vocab, topk, temperature, allow_eos);
+                                         buffer, vocab, topk, temperature, allow_eos, 0);
         gpu.gpu().unwrap().flush();
         let got = gpu.read_tokens(&Tokens { buffer: Some(buffer.clone()), data: out.data.clone() }).unwrap();
         eprintln!("sampler seed={seed} topk={topk} temp={temperature}: want {want} got {}", got[0]);
