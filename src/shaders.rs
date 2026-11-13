@@ -758,3 +758,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 // against 86 for the simple kernel below, and a single 512x512 GEMV already costs
 // 88 us on this card. Kept the simple kernel; revisit on real hardware.
 
+
+/// Single-token GEMV: one warp per output row, lanes stride over K.
+///
+/// The 16x16 tiled kernel computes sixteen rows per tile and the LM's decode step
+/// only ever needs one, so it did 16x the arithmetic in the hot loop. A warp per
+/// row removes the waste: 512 rows become 64 workgroups of 8 warps.
+pub const GEMV_F32: &str = r#"
+// Shared with LINEAR_F32: 0=m 1=n 2=k 3=has_bias
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    let kdim = p[2];
+    var acc = 0.0;
+    if (row < p[1]) {
+        let base = row * kdim;
+        var i = lane;
+        loop {
+            if (i >= kdim) { break; }
+            acc = acc + x[i] * w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p[1]) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        if (p[3] == 1u) { sum = sum + b[row]; }
+        y[row] = sum;
+    }
+}
+"#;

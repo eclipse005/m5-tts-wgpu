@@ -29,6 +29,13 @@ pub fn linear(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: Option<&Buffer>, y: &Buff
     // (44 vs 86 GFLOP/s at 2048^3; see examples/gpu_probe.rs for the card's
     // dispatch and GEMV cost). On this P104-100 a dispatch costs ~20 us and a
     // 512x512 GEMV 88 us, so the kernel schedule is not what limits us.
+    if m == 1 {
+        // One warp per output row: the tiled kernel would compute 16 rows and use 1.
+        gpu.dispatch("gemv_f32", shaders::GEMV_F32, "main",
+                     &[(0, x), (1, w), (2, b), (3, y), (4, &params)],
+                     (n.div_ceil(8) as u32, 1, 1));
+        return;
+    }
     gpu.dispatch("linear_f32", shaders::LINEAR_F32, "main",
                  &[(0, x), (1, w), (2, b), (3, y), (4, &params)],
                  (m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1));

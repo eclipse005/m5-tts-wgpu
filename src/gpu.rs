@@ -16,9 +16,17 @@ use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
 /// wgpu does not keep a bind group's buffers alive for a *recorded* command
 /// buffer, so dropping them before the submit lets Vulkan free them underneath
 /// ("Cannot get non-existent resource"). They are held here until after submit.
+
+/// One recorded dispatch, replayed into a single compute pass at flush time.
+///
+/// Recording a pass (or an encoder) per dispatch makes every kernel pay the full
+/// pipeline-drain latency; on this backend that dominated everything (measured
+/// 20.5 us per trivial dispatch). WebGPU guarantees each dispatch sees the
+/// previous one's writes inside a pass, so a single pass preserves ordering.
 struct Pending {
-    cmd: wgpu::CommandBuffer,
+    pipeline: wgpu::ComputePipeline,
     group: wgpu::BindGroup,
+    workgroups: (u32, u32, u32),
 }
 
 pub struct Gpu {
@@ -194,32 +202,43 @@ impl Gpu {
             layout: &layout,
             entries: &entries,
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(key) });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-        }
         self.stats.borrow_mut().dispatches += 1;
-        self.pending.borrow_mut().push(Pending { cmd: encoder.finish(), group });
+        self.pending.borrow_mut().push(Pending { pipeline, group, workgroups });
         if self.pending.borrow().len() >= self.max_pending {
             self.flush();
         }
     }
 
-    /// Submit everything recorded so far.
-    pub fn flush(&self) {
+
+    /// Record the pending batch into one pass. `None` when nothing is pending.
+    fn encode_batch(&self) -> Option<wgpu::CommandBuffer> {
         let batch = std::mem::take(&mut *self.pending.borrow_mut());
         if batch.is_empty() {
-            return;
+            return None;
         }
-        let (commands, groups): (Vec<_>, Vec<_>) = batch.into_iter().map(|p| (p.cmd, p.group)).unzip();
-        self.queue.submit(commands);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("batch") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            for pending in &batch {
+                pass.set_pipeline(&pending.pipeline);
+                pass.set_bind_group(0, &pending.group, &[]);
+                pass.dispatch_workgroups(pending.workgroups.0, pending.workgroups.1,
+                                         pending.workgroups.2);
+            }
+        }
         self.stats.borrow_mut().submits += 1;
-        drop(groups); // safe: the submission holds its own references now
+        // Keeps the bind groups (and their buffers) alive until the GPU is done.
+        std::mem::forget(batch);
+        Some(encoder.finish())
+    }
+
+    /// Submit everything recorded so far.
+    pub fn flush(&self) {
+        if let Some(batch) = self.encode_batch() {
+            self.queue.submit(std::iter::once(batch));
+        }
     }
 
     /// Read `len` f32 back from `buffer`.
@@ -234,15 +253,12 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, (len * 4) as u64);
-        {
-            let mut pending = self.pending.borrow_mut();
-            let batch: Vec<Pending> = pending.drain(..).collect();
-            let (mut commands, groups): (Vec<_>, Vec<_>) =
-                batch.into_iter().map(|p| (p.cmd, p.group)).unzip();
-            commands.push(encoder.finish());
-            self.queue.submit(commands);
-            drop(groups);
+        let mut commands: Vec<wgpu::CommandBuffer> = Vec::new();
+        if let Some(batch) = self.encode_batch() {
+            commands.push(batch);
         }
+        commands.push(encoder.finish());
+        self.queue.submit(commands);
         self.stats.borrow_mut().submits += 1;
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
