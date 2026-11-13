@@ -102,8 +102,11 @@ struct CodecFile {
 
 impl CodecConfig {
     /// Frames per second of the codec (12.5 Hz for the Qwen 12 Hz tokenizer).
-    pub fn frame_rate(&self, encode_downsample_rate: usize) -> f64 {
-        encode_downsample_rate as f64
+    ///
+    /// `encode_downsample_rate` is *samples per frame* (1920), not frames per
+    /// second — the reference divides the waveform length by 12.5 directly.
+    pub fn frame_rate(&self, sample_rate: usize, encode_downsample_rate: usize) -> f64 {
+        sample_rate as f64 / encode_downsample_rate as f64
     }
 }
 
@@ -128,7 +131,7 @@ impl Codec {
             .with_context(|| format!("read {}/config.json", dir.display()))?;
         let file: CodecFile = serde_json::from_str(&text).context("parse codec config.json")?;
         let weights = Weights::load(&dir.join("model.safetensors"))?;
-        let frame_rate = file.decoder_config.frame_rate(file.encode_downsample_rate);
+        let frame_rate = file.decoder_config.frame_rate(file.input_sample_rate, file.encode_downsample_rate);
         let enc = file.encoder_config.unwrap_or_else(|| {
             serde_json::from_str("{}").expect("encoder defaults")
         });

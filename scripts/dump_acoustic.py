@@ -141,8 +141,7 @@ def main():
     def sample_spy(probs):
         q = torch.empty_like(probs).exponential_(1)
         token = torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
-        if len(noise_log) < 16:
-            noise_log.append((q.detach().reshape(-1).clone(), token.detach().reshape(-1).clone()))
+        noise_log.append((q.detach().reshape(-1).clone(), token.detach().reshape(-1).clone()))
         return token
 
     # Read-only observation: keep every generate_frame call's inputs and result.
@@ -200,8 +199,9 @@ def main():
     # layer (same idea as the decoder's stage captures).
     with torch.inference_mode():
         encoder = gen._audio_tokenizer.model.encoder
-        audio = torch.from_numpy(np.asarray(prompt.numpy(), dtype=np.float32))[None, None, :]
-        seanet = encoder.encoder(audio, padding_cache=None)
+        # NB: do not shadow `audio` (the generated waveform) here.
+        encoder_input = torch.from_numpy(np.asarray(prompt.numpy(), dtype=np.float32))[None, None, :]
+        seanet = encoder.encoder(encoder_input, padding_cache=None)
         transformed = encoder.encoder_transformer(seanet.transpose(1, 2))[0].transpose(1, 2)
         downsampled = encoder.downsample(transformed, padding_cache=None)
         encoded = encoder.quantizer.encode(downsampled, 16).transpose(0, 1)
@@ -289,6 +289,9 @@ def main():
                for i in sorted(depth_captured["layers"])},
             **{f"frame0_noise{i}": save(f"frame0_noise{i}", q.numpy(), out)
                for i, (q, _tok) in enumerate(noise_log[:16])},
+            # The whole utterance's noise draws, in order (frame-major, 16 per frame),
+            # so an entire generation can be replayed deterministically.
+            "noise_all": save("noise_all", np.stack([q.numpy() for q, _ in noise_log]), out),
             "frame0_c0_logits": save("frame0_c0_logits", c0_logits.reshape(-1).numpy(), out),
             **{f"frame0_ci{i}_logits": save(f"frame0_ci{i}_logits", ci[i - 1].numpy(), out)
                for i in range(1, len(ci) + 1)},

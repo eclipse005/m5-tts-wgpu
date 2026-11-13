@@ -94,14 +94,16 @@ impl Lm {
     }
 
     /// Depth decode with the supplied noise vectors (`noise[cb]`, one per codebook).
+    /// `allow_eos` mirrors the reference's `need_finish`: EOS (token 0) is only
+    /// permitted once more than `min_tokens` frames have been generated.
     pub fn depth_codes(&self, last_h: &Tensor, _c0: u32, noise: &[Vec<f32>],
-                       temperature: f32, topk: usize) -> Result<Vec<u32>> {
+                       temperature: f32, topk: usize, allow_eos: bool) -> Result<Vec<u32>> {
         if noise.len() != CODEBOOKS {
             bail!("depth_codes needs {CODEBOOKS} noise vectors, got {}", noise.len());
         }
         let c0_logits = self.codebook0_logits(last_h)?;
         let c0_sampled = super::sample::sample_topk(
-            &self.device().read(&c0_logits)?, temperature, topk, false, &noise[0])?;
+            &self.device().read(&c0_logits)?, temperature, topk, allow_eos, &noise[0])?;
         let (_, mut codes) = self.depth_run(last_h, c0_sampled, |codebook, logits| {
             super::sample::sample_topk(&self.device().read(logits)?, temperature, topk, true,
                                        &noise[codebook])

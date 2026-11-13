@@ -112,6 +112,32 @@ impl Lm {
         self.device().tensor([frames, HIDDEN], &out)
     }
 
+    /// One generated frame's embedding: all sixteen audio slots active plus an
+    /// empty text slot.
+    ///
+    /// A sampled token may legitimately be 0 (only the *all-zero* frame means EOS),
+    /// so this cannot reuse the "non-zero means present" rule that works for the
+    /// prompt.
+    pub fn embed_generated(&self, tokens: &[u32]) -> Result<Tensor> {
+        if tokens.len() != CODEBOOKS {
+            bail!("embed_generated needs {CODEBOOKS} tokens, got {}", tokens.len());
+        }
+        let mut out = vec![0.0f32; HIDDEN];
+        let table = self.audio_embedding_table();
+        for (codebook, token) in tokens.iter().enumerate() {
+            let token = *token as usize;
+            if token >= AUDIO_VOCAB {
+                bail!("audio token {token} outside vocabulary {AUDIO_VOCAB}");
+            }
+            let index = codebook * AUDIO_VOCAB + token;
+            let row = &table[index * HIDDEN..(index + 1) * HIDDEN];
+            for (slot, value) in out.iter_mut().zip(row) {
+                *slot += value;
+            }
+        }
+        self.device().tensor([1, HIDDEN], &out)
+    }
+
     /// Backbone prefill over the whole prompt, filling `kv`.
     pub fn backbone_prefill(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
         let [frames, cols] = x.shape();

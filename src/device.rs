@@ -7,11 +7,14 @@
 use anyhow::{bail, Result};
 
 use crate::gpu::Gpu;
+use std::rc::Rc;
 
 /// Which backend a run uses. `Cpu` is the hand-written f32 path (rayon), `Gpu`
 /// is wgpu. Both are always compiled in so the parity tests can compare them.
 pub enum Device {
-    Gpu(Gpu),
+    /// `Rc` so several models (LM + codec) can share one wgpu device: buffers are
+    /// only valid on the device that created them.
+    Gpu(Rc<Gpu>),
     Cpu,
 }
 
@@ -21,8 +24,16 @@ impl Device {
     pub fn open(spec: &str) -> Result<Self> {
         match spec {
             "cpu" => Ok(Device::Cpu),
-            "gpu" | "cuda" | "vulkan" | "default" => Ok(Device::Gpu(Gpu::new(None)?)),
+            "gpu" | "cuda" | "vulkan" | "default" => Ok(Device::Gpu(Rc::new(Gpu::new(None)?))),
             other => bail!("unknown device {other:?}; use cpu or gpu"),
+        }
+    }
+
+    /// Another handle to the same device (`None`-like for CPU).
+    pub fn shared(&self) -> Self {
+        match self {
+            Device::Gpu(gpu) => Device::Gpu(Rc::clone(gpu)),
+            Device::Cpu => Device::Cpu,
         }
     }
 
@@ -98,7 +109,7 @@ impl Device {
 
     pub fn gpu(&self) -> Result<&Gpu> {
         match self {
-            Device::Gpu(gpu) => Ok(gpu),
+            Device::Gpu(gpu) => Ok(gpu.as_ref()),
             Device::Cpu => bail!("this operation needs the GPU backend"),
         }
     }

@@ -28,6 +28,7 @@ pub mod gpu;
 pub mod lm;
 mod gpu_ops;
 pub mod ops;
+pub mod pipeline;
 pub mod shaders;
 pub mod tn;
 pub mod tok;

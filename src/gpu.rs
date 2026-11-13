@@ -11,13 +11,23 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
 
+/// One recorded dispatch plus everything the command buffer still points at.
+///
+/// wgpu does not keep a bind group's buffers alive for a *recorded* command
+/// buffer, so dropping them before the submit lets Vulkan free them underneath
+/// ("Cannot get non-existent resource"). They are held here until after submit.
+struct Pending {
+    cmd: wgpu::CommandBuffer,
+    group: wgpu::BindGroup,
+}
+
 pub struct Gpu {
     pub device: Device,
     pub queue: Queue,
     pub adapter_name: String,
     pub backend: &'static str,
     max_pending: usize,
-    pending: RefCell<Vec<wgpu::CommandBuffer>>,
+    pending: RefCell<Vec<Pending>>,
     pipelines: RefCell<HashMap<String, wgpu::ComputePipeline>>,
     pub stats: RefCell<Stats>,
 }
@@ -194,7 +204,7 @@ impl Gpu {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         self.stats.borrow_mut().dispatches += 1;
-        self.pending.borrow_mut().push(encoder.finish());
+        self.pending.borrow_mut().push(Pending { cmd: encoder.finish(), group });
         if self.pending.borrow().len() >= self.max_pending {
             self.flush();
         }
@@ -206,8 +216,10 @@ impl Gpu {
         if batch.is_empty() {
             return;
         }
-        self.queue.submit(batch);
+        let (commands, groups): (Vec<_>, Vec<_>) = batch.into_iter().map(|p| (p.cmd, p.group)).unzip();
+        self.queue.submit(commands);
         self.stats.borrow_mut().submits += 1;
+        drop(groups); // safe: the submission holds its own references now
     }
 
     /// Read `len` f32 back from `buffer`.
@@ -222,7 +234,15 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, (len * 4) as u64);
-        self.queue.submit(self.pending.borrow_mut().drain(..).chain(std::iter::once(encoder.finish())));
+        {
+            let mut pending = self.pending.borrow_mut();
+            let batch: Vec<Pending> = pending.drain(..).collect();
+            let (mut commands, groups): (Vec<_>, Vec<_>) =
+                batch.into_iter().map(|p| (p.cmd, p.group)).unzip();
+            commands.push(encoder.finish());
+            self.queue.submit(commands);
+            drop(groups);
+        }
         self.stats.borrow_mut().submits += 1;
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");

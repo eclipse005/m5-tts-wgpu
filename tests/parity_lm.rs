@@ -171,7 +171,7 @@ fn depth_decoder_matches_reference() -> Result<()> {
 
         // 0) sampler replay first: it is the decisive gate (the recorded ci logits
         //    golden turned out to be captured from a different iteration).
-        let sampled = lm.depth_codes(&last, frame0[0], &noise, 0.9, 10)?;
+        let sampled = lm.depth_codes(&last, frame0[0], &noise, 0.9, 10, false)?;
         eprintln!("[{}] depth sample got  {sampled:?}", dev.describe());
         eprintln!("[{}] depth sample want {frame0:?}", dev.describe());
 
@@ -191,7 +191,7 @@ fn depth_decoder_matches_reference() -> Result<()> {
         assert!(worst < 2e-4, "depth logits diff {worst}");
 
         // 2) sampler replay with the recorded noise
-        let codes = lm.depth_codes(&last, frame0[0], &noise, 0.9, 10)?;
+        let codes = lm.depth_codes(&last, frame0[0], &noise, 0.9, 10, false)?;
         let want_codes: Vec<u32> = noise_tokens.iter().map(|v| *v as u32).collect();
         eprintln!("[{}] depth sample: got {codes:?}", dev.describe());
         eprintln!("[{}] depth sample: want {want_codes:?}", dev.describe());

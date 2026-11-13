@@ -183,9 +183,7 @@
    "file": "final_audio.bin",
    "dtype": "float32",
    "shape": [
-    1,
-    1,
-    82211
+    105120
    ]
   },
   "codec_quantized": {
@@ -483,6 +481,14 @@
     2051
    ]
   },
+  "noise_all": {
+   "file": "noise_all.bin",
+   "dtype": "float32",
+   "shape": [
+    912,
+    2051
+   ]
+  },
   "frame0_c0_logits": {
    "file": "frame0_c0_logits.bin",
    "dtype": "float32",
@@ -638,5 +644,5 @@
   872,
   1175
  ],
- "frame0_noise_count": 16
+ "frame0_noise_count": 912
 }
