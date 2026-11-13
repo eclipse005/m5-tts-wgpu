@@ -16,11 +16,19 @@ fn grid(total: usize) -> (u32, u32, u32) {
 
 
 /// `y[m,n] = x[m,k] · w[n,k]^T + bias[n]`.
+///
+/// Small products (the per-frame GEMVs) keep the simple kernel: a 64×64 tile for
+/// m = 1 wastes 63/64 of its rows. Anything with a few dozen rows goes through the
+/// register-blocked tile, which is where the prefill and the codec's projections sit.
 pub fn linear(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: Option<&Buffer>, y: &Buffer,
               m: usize, n: usize, k: usize) {
     let params = gpu.upload_u32("linear.params", &[m as u32, n as u32, k as u32, bias.is_some() as u32]);
     let zero = gpu.empty("linear.no_bias", 1);
     let b = bias.unwrap_or(&zero);
+    // A register-blocked 64x64 tile was implemented and measured *slower* here
+    // (44 vs 86 GFLOP/s at 2048^3; see examples/gpu_probe.rs for the card's
+    // dispatch and GEMV cost). On this P104-100 a dispatch costs ~20 us and a
+    // 512x512 GEMV 88 us, so the kernel schedule is not what limits us.
     gpu.dispatch("linear_f32", shaders::LINEAR_F32, "main",
                  &[(0, x), (1, w), (2, b), (3, y), (4, &params)],
                  (m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1));

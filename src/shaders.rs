@@ -752,3 +752,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     x[i] = select(exp(v) - 1.0, v, v > 0.0);
 }
 "#;
+
+// A register-blocked 64x64 tile (16x16 workgroup, 4x4 per thread, bank-padded
+// shared tiles) was tried here and measured slower on the P104-100: 44 GFLOP/s
+// against 86 for the simple kernel below, and a single 512x512 GEMV already costs
+// 88 us on this card. Kept the simple kernel; revisit on real hardware.
+
