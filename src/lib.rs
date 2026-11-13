@@ -18,6 +18,7 @@
 //! Model graphs (`codec`, `lm`) are added on top of [`ops`] and never touch a
 //! backend directly.
 
+pub mod audio;
 pub mod codec;
 pub mod conditioning;
 pub mod config;

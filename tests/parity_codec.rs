@@ -157,6 +157,49 @@ fn codec_encoder_matches_reference() -> Result<()> {
         let diff = max_abs_diff(&want_ds, &dev.read(&downsampled)?);
         eprintln!("[{}] encoder downsample: max|diff|={diff:.3e}", dev.describe());
         assert!(diff < 5e-3, "encoder downsample diff {diff}");
+
+        // SplitRVQ: 1 semantic + 15 acoustic codebooks, frame-major.
+        let want_codes = goldens.i64("prompt_codes");
+        let code_shape = goldens.shape("prompt_codes"); // [1, 16, frames]
+        let want_frames = code_shape[2];
+        let codes = codec.encode_codes(&downsampled)?;
+        assert_eq!(codes.len(), want_frames * 16);
+        // Golden is [1, 16, frames] (codebook-major); the port returns frame-major.
+        let mut want_frame_major = Vec::with_capacity(want_frames * 16);
+        for t in 0..want_frames {
+            for k in 0..16 {
+                want_frame_major.push(want_codes[k * want_frames + t] as u32);
+            }
+        }
+        let mismatches = codes.iter().zip(&want_frame_major).filter(|(a, b)| a != b).count();
+        eprintln!("[{}] SplitRVQ: {} codes, {} mismatches", dev.describe(), codes.len(), mismatches);
+        assert_eq!(mismatches, 0, "quantised codes differ");
     }
+    Ok(())
+}
+
+/// `prepare_prompt` must reproduce the reference's silence trimming bit for bit:
+/// the codec sees exactly this waveform.
+#[test]
+fn prepare_prompt_matches_reference() -> Result<()> {
+    let Some(goldens) = Goldens::open() else {
+        eprintln!("skipping: run scripts/dump_acoustic.py");
+        return Ok(());
+    };
+    let want = goldens.f32("prompt_audio");
+    let path = std::path::Path::new(r"D:\M5-TTS\assets\aslp_default_voice.wav");
+    if !path.is_file() {
+        eprintln!("skipping: {} not found", path.display());
+        return Ok(());
+    }
+    let got = m5_tts_wgpu::audio::prepare_prompt(path, 24000)?;
+    eprintln!("prepare_prompt: {} samples vs golden {}", got.len(), want.len());
+    assert_eq!(got.len(), want.len(), "sample count");
+    let mut diff = 0.0f32;
+    for (a, b) in want.iter().zip(&got) {
+        diff = diff.max((a - b).abs());
+    }
+    eprintln!("prepare_prompt: max|diff|={diff:.3e}");
+    assert!(diff < 1e-6, "prepare_prompt diff {diff}");
     Ok(())
 }

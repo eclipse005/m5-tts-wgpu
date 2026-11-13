@@ -152,16 +152,43 @@ impl Codec {
     }
 
     /// `downsample`: causal conv(512 -> 512, k4, s2), no bias.
+    ///
+    /// This one module uses `pad_mode="replicate"` while every other convolution in
+    /// the codec uses `"constant"` (verified on the live modules). With causal
+    /// padding that only changes the first output frame, which is exactly where the
+    /// port diverged before. The two replicated frames are prepended here instead of
+    /// adding a second padding mode to the kernels.
     pub fn encoder_downsample(&self, x: &Tensor) -> Result<Tensor> {
         let dev = self.device();
         let [channels, t_in] = x.shape();
         let weight = self.tensor("encoder.downsample.conv.weight", [channels, channels * 4])?;
         let zero = dev.zeros([channels, 1])?;
-        let mut geometry = causal(4, 2, t_in);
+
+        const KS: usize = 4;
+        const STRIDE: usize = 2;
+        let pad = KS - STRIDE;
+        let host = dev.read(x)?;
+        let padded_len = t_in + pad;
+        let mut padded = vec![0.0f32; channels * padded_len];
+        for channel in 0..channels {
+            let src = &host[channel * t_in..(channel + 1) * t_in];
+            let dst = &mut padded[channel * padded_len..(channel + 1) * padded_len];
+            for slot in dst.iter_mut().take(pad) {
+                *slot = src[0]; // replicate the first frame
+            }
+            dst[pad..].copy_from_slice(src);
+        }
+        let padded = dev.tensor([channels, padded_len], &padded)?;
+
+        // The padding is materialised, so pad = 0 and the output length is the
+        // reference's `ceil(input / stride)` — not derived from the padded length.
+        let mut geometry = causal(KS, STRIDE, padded_len);
+        geometry.pad = 0;
+        geometry.t_out = t_in.div_ceil(STRIDE);
         geometry.cin = channels;
         geometry.cout = channels;
         let mut out = dev.zeros([channels, geometry.t_out])?;
-        ops::conv1d(dev, x, &weight, &zero, &mut out, &geometry)?;
+        ops::conv1d(dev, &padded, &weight, &zero, &mut out, &geometry)?;
         Ok(out)
     }
 }
