@@ -72,6 +72,20 @@ def depth_logits(model, last_h, c0, codes):
     curr_pos = torch.arange(0, curr_h.size(1))[None]
     cache = DynamicCache(config=model.decoder.config)
     out = []
+    captured = {}
+    layer_outs = {}
+    hooks = [
+        layer.register_forward_hook(_capture_first_hidden(layer_outs, index))
+        for index, layer in enumerate(model.decoder.layers)
+    ]
+    captured["input"] = model.projection(curr_h).detach().clone()
+    # Single-layer replay of the depth stack, to bisect a layer vs stack mismatch.
+    pos0 = torch.arange(0, curr_h.size(1))[None]
+    pos_emb = model.decoder.position_embedding(captured["input"], pos0)
+    layer0 = model.decoder.layers[0](
+        hidden_states=captured["input"], attention_mask=None, position_ids=pos0,
+        position_embeddings=pos_emb, use_cache=False, past_key_value=None)
+    captured["layer0"] = (layer0[0] if isinstance(layer0, tuple) else layer0).detach().clone()
     for i in range(1, model.args.use_codebooks):
         dec_h = model.decoder(
             hidden_states=model.projection(curr_h),
@@ -82,10 +96,15 @@ def depth_logits(model, last_h, c0, codes):
         ).to(dtype=dtype)
         logits = torch.mm(dec_h[:, -1, :], model.audio_head[i - 1])
         out.append(logits.detach().reshape(-1))
+        if i == 1:
+            captured["layer_out"] = dec_h.detach().clone()
         ci = torch.tensor([[codes[i]]], dtype=c0.dtype)
         curr_h = model._embed_audio(i, ci)
         curr_pos = curr_pos[:, -1:] + 1
-    return out
+    for hook in hooks:
+        hook.remove()
+    captured["layers"] = layer_outs
+    return out, captured
 
 
 def main():
@@ -112,6 +131,20 @@ def main():
     gen = tts.generator
     model = gen._model
 
+    # Sampler noise: recorded so the Rust sampler can be replayed without
+    # reproducing torch's MT19937 stream. `_multinomial_sample_one_no_sync` draws
+    # `q ~ Exp(1)` per call and returns argmax(probs / q).
+    import m5.model.model as m5model
+    noise_log = []
+    original_sample = m5model._multinomial_sample_one_no_sync
+
+    def sample_spy(probs):
+        q = torch.empty_like(probs).exponential_(1)
+        token = torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+        if len(noise_log) < 16:
+            noise_log.append((q.detach().reshape(-1).clone(), token.detach().reshape(-1).clone()))
+        return token
+
     # Read-only observation: keep every generate_frame call's inputs and result.
     audit = []
     original = CSM.generate_frame
@@ -136,6 +169,7 @@ def main():
           for index, layer in enumerate(model.backbone.layers)],
     ]
     CSM.generate_frame = spy
+    m5model._multinomial_sample_one_no_sync = sample_spy
     try:
         audio = tts.infer(args.text, prompt_wav=args.prompt_wav, prompt_text=args.prompt_text, lang="Chinese")
         h0 = hidden_capture["h"]
@@ -144,6 +178,7 @@ def main():
         c0_logits = logits_capture["c0"]
     finally:
         CSM.generate_frame = original
+        m5model._multinomial_sample_one_no_sync = original_sample
         for handle in handles:
             handle.remove()
 
@@ -154,7 +189,11 @@ def main():
 
     # Depth-decoder replay for frame 0 (deterministic given h and the samples).
     last_h = h0[:, -1, :]
-    ci = depth_logits(model, last_h, torch.tensor([[int(frames[0][0])]]), codes[0])
+    # NB: the depth decoder consumes *tokens* (logit space, 0..2050), not the
+    # codec codes (`token - 1`). Feeding codes here silently shifts every
+    # embedding by one row.
+    sample0 = [int(v) for v in frames[0]]
+    ci, depth_captured = depth_logits(model, last_h, torch.tensor([[sample0[0]]]), sample0)
 
     prompt = prepare_prompt(args.prompt_wav, tts.sample_rate, device="cpu")
     enc = gen._audio_tokenizer.encode(prompt.numpy(), sr=tts.sample_rate)
@@ -230,6 +269,15 @@ def main():
             **{f"frame0_layer{i}": save(f"frame0_layer{i}", layer_capture[i].reshape(-1).numpy(), out)
                for i in sorted(layer_capture)},
             "backbone_inv_freq": save("backbone_inv_freq", inv_freq.numpy(), out),
+            # Frame-0 sampler noise and the token each draw produced.
+            "frame0_depth_input": save("frame0_depth_input", depth_captured["input"].reshape(-1).numpy(), out),
+            "frame0_depth_layer_out": save("frame0_depth_layer_out", depth_captured["layer_out"].reshape(-1).numpy(), out),
+            "frame0_depth_layer0": save("frame0_depth_layer0", depth_captured["layer0"].reshape(-1).numpy(), out),
+            **{f"frame0_depth_stack{i}": save(f"frame0_depth_stack{i}",
+                                             depth_captured["layers"][i].reshape(-1).numpy(), out)
+               for i in sorted(depth_captured["layers"])},
+            **{f"frame0_noise{i}": save(f"frame0_noise{i}", q.numpy(), out)
+               for i, (q, _tok) in enumerate(noise_log[:16])},
             "frame0_c0_logits": save("frame0_c0_logits", c0_logits.reshape(-1).numpy(), out),
             **{f"frame0_ci{i}_logits": save(f"frame0_ci{i}_logits", ci[i - 1].numpy(), out)
                for i in range(1, len(ci) + 1)},
@@ -237,6 +285,8 @@ def main():
         "frame0_tokens_shape": list(audit[0]["tokens"].shape),
         "frame0_sample_c0": int(frames[0][0]),
         "frame0_sample": [int(v) for v in frames[0]],
+        "frame0_noise_tokens": [int(tok[0]) for _, tok in noise_log[:16]],
+        "frame0_noise_count": len(noise_log),
     }
     (out / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
 

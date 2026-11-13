@@ -277,6 +277,174 @@
     32
    ]
   },
+  "frame0_depth_input": {
+   "file": "frame0_depth_input.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_layer_out": {
+   "file": "frame0_depth_layer_out.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_layer0": {
+   "file": "frame0_depth_layer0.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_stack0": {
+   "file": "frame0_depth_stack0.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_stack1": {
+   "file": "frame0_depth_stack1.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_stack2": {
+   "file": "frame0_depth_stack2.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_stack3": {
+   "file": "frame0_depth_stack3.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_depth_stack4": {
+   "file": "frame0_depth_stack4.bin",
+   "dtype": "float32",
+   "shape": [
+    1024
+   ]
+  },
+  "frame0_noise0": {
+   "file": "frame0_noise0.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise1": {
+   "file": "frame0_noise1.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise2": {
+   "file": "frame0_noise2.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise3": {
+   "file": "frame0_noise3.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise4": {
+   "file": "frame0_noise4.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise5": {
+   "file": "frame0_noise5.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise6": {
+   "file": "frame0_noise6.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise7": {
+   "file": "frame0_noise7.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise8": {
+   "file": "frame0_noise8.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise9": {
+   "file": "frame0_noise9.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise10": {
+   "file": "frame0_noise10.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise11": {
+   "file": "frame0_noise11.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise12": {
+   "file": "frame0_noise12.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise13": {
+   "file": "frame0_noise13.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise14": {
+   "file": "frame0_noise14.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_noise15": {
+   "file": "frame0_noise15.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
   "frame0_c0_logits": {
    "file": "frame0_c0_logits.bin",
    "dtype": "float32",
@@ -413,5 +581,24 @@
   737,
   872,
   1175
- ]
+ ],
+ "frame0_noise_tokens": [
+  440,
+  1327,
+  1356,
+  1210,
+  1441,
+  219,
+  1049,
+  1656,
+  1020,
+  1858,
+  1779,
+  1378,
+  1556,
+  737,
+  872,
+  1175
+ ],
+ "frame0_noise_count": 16
 }

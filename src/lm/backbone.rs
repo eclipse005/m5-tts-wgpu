@@ -124,11 +124,9 @@ impl Lm {
         let (cos, sin) = rope_table(&(0..frames).collect::<Vec<_>>());
         let mut hidden = self.device().copy(x)?;
         for layer in 0..BACKBONE_LAYERS {
-            hidden = self.backbone_layer(layer, &hidden, &cos, &sin, Some((kv, 0, true)))?;
+            hidden = self.llama_layer("backbone", layer, &hidden, &cos, &sin, Some((kv, 0, true)))?;
         }
-        let norm = self.vector("backbone.norm.weight", HIDDEN)?;
-        let mut out = self.device().zeros([frames, HIDDEN])?;
-        ops::rms_norm(self.device(), &hidden, &norm, &mut out, 1e-5)?;
+        let out = self.llama_norm("backbone", &hidden)?;
         kv.len = frames;
         Ok(out)
     }
@@ -144,11 +142,9 @@ impl Lm {
         let (cos, sin) = rope_table(&[position]);
         let mut hidden = self.device().copy(x)?;
         for layer in 0..BACKBONE_LAYERS {
-            hidden = self.backbone_layer(layer, &hidden, &cos, &sin, Some((kv, position, false)))?;
+            hidden = self.llama_layer("backbone", layer, &hidden, &cos, &sin, Some((kv, position, false)))?;
         }
-        let norm = self.vector("backbone.norm.weight", HIDDEN)?;
-        let mut out = self.device().zeros([1, HIDDEN])?;
-        ops::rms_norm(self.device(), &hidden, &norm, &mut out, 1e-5)?;
+        let out = self.llama_norm("backbone", &hidden)?;
         if position + 1 > kv.len {
             kv.len = position + 1;
         }
@@ -167,14 +163,27 @@ impl Lm {
     pub fn backbone_layer_public(&self, index: usize, x: &Tensor, frames: usize,
                                  kv: &mut KvCache) -> Result<Tensor> {
         let (cos, sin) = rope_table(&(0..frames).collect::<Vec<_>>());
-        self.backbone_layer(index, x, &cos, &sin, Some((kv, 0, true)))
+        self.llama_layer("backbone", index, x, &cos, &sin, Some((kv, 0, true)))
     }
 
+    /// Final RMSNorm of a stack (`{prefix}.norm.weight`).
+    pub fn llama_norm(&self, prefix: &str, x: &Tensor) -> Result<Tensor> {
+        let norm = self.vector(&format!("{prefix}.norm.weight"), HIDDEN)?;
+        let [frames, _] = x.shape();
+        let mut out = self.device().zeros([frames, HIDDEN])?;
+        ops::rms_norm(self.device(), x, &norm, &mut out, 1e-5)?;
+        Ok(out)
+    }
+
+    /// One llama layer of any stack (`prefix` is `backbone` or `decoder`).
+    ///
+    /// `kv` is `(cache, position, prefill)`: prefill attends over the whole input
+    /// and writes rows at `position`, a step attends over the cache.
     #[allow(clippy::too_many_arguments)]
-    fn backbone_layer(&self, index: usize, x: &Tensor, cos: &[f32], sin: &[f32],
-                      kv: Option<(&mut KvCache, usize, bool)>) -> Result<Tensor> {
+    pub fn llama_layer(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32], sin: &[f32],
+                       kv: Option<(&mut KvCache, usize, bool)>) -> Result<Tensor> {
         let dev = self.device();
-        let p = format!("backbone.layers.{index}");
+        let p = format!("{prefix}.layers.{index}");
         let [frames, _] = x.shape();
         let q_dim = HEADS * HEAD_DIM;
         let kv_dim = KV_HEADS * HEAD_DIM;

@@ -46,6 +46,17 @@ impl Goldens {
             .collect()
     }
 
+    /// A plain integer array stored at the index root (e.g. `frame0_noise_tokens`).
+    pub fn root_i64(&self, key: &str) -> Vec<i64> {
+        self.index
+            .get(key)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("golden index has no array {key}"))
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect()
+    }
+
     /// Flatten a golden to `[rows, cols]`, asserting the element count.
     pub fn matrix(&self, name: &str) -> ([usize; 2], Vec<f32>) {
         let shape = self.shape(name);

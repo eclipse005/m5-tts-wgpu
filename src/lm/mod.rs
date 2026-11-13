@@ -10,6 +10,8 @@
 //! rather than configured.
 
 pub mod backbone;
+pub mod depth;
+pub mod sample;
 
 use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
@@ -53,6 +55,9 @@ pub struct Lm {
     /// 333 MB of tables to the device for that would be absurd.
     text_emb: Vec<f32>,
     audio_emb: Vec<f32>,
+    /// `audio_head` as `[codebooks-1, hidden, vocab]`, kept on the host because the
+    /// depth decoder needs a different per-codebook transpose each step.
+    audio_head: Vec<f32>,
     text_vocab: usize,
 }
 
@@ -72,6 +77,7 @@ impl Lm {
         let text_vocab = tok.vocab_size();
         let text_emb = weights.get_f32("text_embeddings.weight")?;
         let audio_emb = weights.get_f32("audio_embeddings.weight")?;
+        let audio_head = weights.get_f32("audio_head")?;
         if text_emb.len() != text_vocab * HIDDEN {
             bail!("text_embeddings has {} values, expected {}", text_emb.len(), text_vocab * HIDDEN);
         }
@@ -88,12 +94,40 @@ impl Lm {
             cache: RefCell::new(HashMap::new()),
             text_emb,
             audio_emb,
+            audio_head,
             text_vocab,
         })
     }
 
     pub fn device(&self) -> &Device {
         &self.dev
+    }
+
+    /// Raw audio embedding table (`[CODEBOOKS * AUDIO_VOCAB, HIDDEN]`), host side.
+    pub fn audio_embedding_table(&self) -> &[f32] {
+        &self.audio_emb
+    }
+
+    /// One codebook's projection matrix, transposed to `[vocab, HIDDEN]` and cached.
+    pub fn audio_head_matrix(&self, codebook: usize) -> Result<Rc<Tensor>> {
+        if codebook + 1 >= CODEBOOKS {
+            bail!("audio_head has {} matrices, asked for {codebook}", CODEBOOKS - 1);
+        }
+        let key = format!("audio_head.{codebook}");
+        if let Some(t) = self.cache.borrow().get(&key) {
+            return Ok(t.clone());
+        }
+        let stride = HIDDEN * AUDIO_VOCAB;
+        let slice = &self.audio_head[codebook * stride..(codebook + 1) * stride];
+        let mut rows = vec![0.0f32; AUDIO_VOCAB * HIDDEN];
+        for h in 0..HIDDEN {
+            for v in 0..AUDIO_VOCAB {
+                rows[v * HIDDEN + h] = slice[h * AUDIO_VOCAB + v];
+            }
+        }
+        let tensor = Rc::new(self.dev.tensor([AUDIO_VOCAB, HIDDEN], &rows)?);
+        self.cache.borrow_mut().insert(key, tensor.clone());
+        Ok(tensor)
     }
 
     pub fn text_vocab(&self) -> usize {
