@@ -24,9 +24,14 @@ fn main() -> anyhow::Result<()> {
     ops::transpose(dev, &input, &mut time_major)?;
 
     // Same-process A/B: cross-run numbers drift on this box.
+    std::env::set_var("M5_NO_UNIT_FUSION", "1");
     let t = std::time::Instant::now();
     let _ = codec.seanet(&input)?;
-    println!("channels-first: {:.3}s", t.elapsed().as_secs_f64());
+    println!("op-level fusion:  {:.3}s", t.elapsed().as_secs_f64());
+    std::env::remove_var("M5_NO_UNIT_FUSION");
+    let t = std::time::Instant::now();
+    let _ = codec.seanet(&input)?;
+    println!("unit-level fusion: {:.3}s", t.elapsed().as_secs_f64());
     let start = std::time::Instant::now();
     let pcm = codec.seanet_cl(&time_major)?;
     let elapsed = start.elapsed().as_secs_f64();
