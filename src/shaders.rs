@@ -930,3 +930,199 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 "#;
+
+/// Tiled causal conv1d for the GPU.
+///
+/// One workgroup owns 64 output channels x 64 timesteps. The input window is
+/// staged in workgroup memory per 32-channel chunk, so each staged value feeds 16
+/// FMAs (4 timesteps x 4 channels per thread) instead of one; the naive kernel let
+/// every output re-read its window from global memory, which is why it ran at
+/// 28 GFLOP/s while cuDNN reaches ~800 GMAC/s on the same card for this shape.
+pub const CONV1D_TILED_GPU: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const CT: u32 = 64u;    // output channels per workgroup
+const TT: u32 = 64u;    // timesteps per workgroup
+const CI: u32 = 32u;    // input channels staged at once
+const WIN: u32 = TT + 8u * 9u;   // window: TT + (ks-1)*dilation, dilation <= 9
+
+var<workgroup> stage: array<f32, 32 * 640>;   // [ci][window]
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let co0 = wid.x * CT;
+    let t0 = wid.y * TT;
+    // 16 threads in y own 4 timesteps each; 16 in x own 4 channels each.
+    let t_base = t0 + lid.y * 4u;
+    let c_base = co0 + lid.x * 4u;
+    let span = (p[2] - 1u) * p[3] + 1u;
+
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+
+    let chunks = (p[0] + CI - 1u) / CI;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        // Stage [ci0..ci0+CI) x [t0*stride - pad .. + TT*stride + span)
+        let win_len = TT * p[4] + span;
+        for (var i = tid; i < CI * win_len; i = i + 256u) {
+            let ci_local = i / win_len;
+            let j = i % win_len;
+            let ci = c0 * CI + ci_local;
+            var value = 0.0;
+            if (ci < p[0]) {
+                let src = i32(t0 * p[4]) + i32(j) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) {
+                    value = x[ci * p[6] + u32(src)];
+                }
+            }
+            stage[ci_local * win_len + j] = value;
+        }
+        workgroupBarrier();
+
+        for (var ci_local = 0u; ci_local < CI; ci_local = ci_local + 1u) {
+            let ci = c0 * CI + ci_local;
+            if (ci >= p[0]) { continue; }
+            for (var tap = 0u; tap < p[2]; tap = tap + 1u) {
+                var xv: array<f32, 4>;
+                for (var i = 0u; i < 4u; i = i + 1u) {
+                    xv[i] = stage[ci_local * win_len + (lid.y * 4u + i) * p[4] + tap * p[3]];
+                }
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    let wv = w[((c_base + j) * p[0] + ci) * p[2] + tap];
+                    for (var i = 0u; i < 4u; i = i + 1u) {
+                        acc[i][j] = acc[i][j] + xv[i] * wv;
+                    }
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let t = t_base + i;
+        if (t >= p[7]) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let co = c_base + j;
+            if (co >= p[1]) { continue; }
+            y[co * p[7] + t] = acc[i][j] + b[co];
+        }
+    }
+}
+"#;
+
+/// Pure FMA loop: measures the card's achievable fp32 throughput with no memory
+/// traffic, i.e. the ceiling every other kernel is judged against.
+pub const FMA_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    var a = f32(gid.x) * 1e-6 + 1.0;
+    var b = 1.0000001;
+    var c = 0.9999999;
+    var d = 1.0000002;
+    for (var i = 0u; i < p[0]; i = i + 1u) {
+        a = a * b + 0.0000001;
+        b = b * c + 0.0000001;
+        c = c * d + 0.0000001;
+        d = d * a + 0.0000001;
+    }
+    out[gid.x] = a + b + c + d;
+}
+"#;
+
+/// Tiled causal conv1d, channels-last output, **packed weights** `[tap*cin+ci][cout]`.
+///
+/// The weight layout is what makes this fast: with lanes walking `co`, one
+/// vector load per lane covers four consecutive output channels, so a whole warp
+/// touches one contiguous run instead of sixteen cache lines `cin*ks` apart (the
+/// reason the checkpoint-layout kernel measured 27 GFLOP/s while the card does
+/// 2.1 TFLOP/s in a pure FMA loop).
+pub const CONV1D_CL_GPU: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;          // [t_in, cin]
+@group(0) @binding(1) var<storage, read> w: array<f32>;          // [(tap*cin+ci)*cout + co]
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;    // [t_out, cout]
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const TT: u32 = 64u;   // timesteps per workgroup
+const CT: u32 = 64u;   // channels per workgroup
+const CI: u32 = 16u;   // input channels staged at once
+
+var<workgroup> stage: array<f32, 16 * 640>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t0 = wid.x * TT;
+    let co0 = wid.y * CT;
+    let t_base = t0 + lid.y * 4u;
+    let c_base = co0 + lid.x * 4u;
+    let span = (p[2] - 1u) * p[3] + 1u;
+    let win_len = TT * p[4] + span;
+
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+
+    let chunks = (p[0] + CI - 1u) / CI;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        for (var i = tid; i < CI * win_len; i = i + 256u) {
+            let ci_local = i / win_len;
+            let j = i % win_len;
+            let ci = c0 * CI + ci_local;
+            var value = 0.0;
+            if (ci < p[0]) {
+                let src = i32(t0 * p[4]) + i32(j) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) {
+                    value = x[u32(src) * p[0] + ci];
+                }
+            }
+            stage[ci_local * win_len + j] = value;
+        }
+        workgroupBarrier();
+
+        for (var ci_local = 0u; ci_local < CI; ci_local = ci_local + 1u) {
+            let ci = c0 * CI + ci_local;
+            if (ci >= p[0]) { continue; }
+            for (var tap = 0u; tap < p[2]; tap = tap + 1u) {
+                var xv: array<f32, 4>;
+                for (var i = 0u; i < 4u; i = i + 1u) {
+                    xv[i] = stage[ci_local * win_len + (lid.y * 4u + i) * p[4] + tap * p[3]];
+                }
+                let wbase = (tap * p[0] + ci) * p[1] + c_base;
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    let wv = w[wbase + j];   // consecutive lanes read consecutive co
+                    for (var i = 0u; i < 4u; i = i + 1u) {
+                        acc[i][j] = acc[i][j] + xv[i] * wv;
+                    }
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let t = t_base + i;
+        if (t >= p[7]) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let co = c_base + j;
+            if (co >= p[1]) { continue; }
+            y[t * p[1] + co] = acc[i][j] + b[co];
+        }
+    }
+}
+"#;

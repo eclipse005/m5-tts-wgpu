@@ -254,3 +254,17 @@ pub fn sample_topk(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buffer,
     gpu.dispatch("sample_topk_f32", shaders::SAMPLE_TOPK_F32, "main",
                  &[(0, logits), (1, noise), (2, out), (3, &params)], (1, 1, 1));
 }
+
+/// Channels-last conv with packed weights `[tap*cin+ci][cout]`.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_cl(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: &Buffer, y: &Buffer,
+                 cin: usize, cout: usize, ks: usize, dilation: usize, stride: usize,
+                 pad: usize, t_in: usize, t_out: usize) {
+    let params = gpu.upload_u32("conv1d_cl.params", &[
+        cin as u32, cout as u32, ks as u32, dilation as u32,
+        stride as u32, pad as u32, t_in as u32, t_out as u32,
+    ]);
+    let groups = (t_out.div_ceil(64) as u32, cout.div_ceil(64) as u32, 1);
+    gpu.dispatch("conv1d_cl_gpu", shaders::CONV1D_CL_GPU, "main",
+                 &[(0, x), (1, w), (2, bias), (3, y), (4, &params)], groups);
+}
