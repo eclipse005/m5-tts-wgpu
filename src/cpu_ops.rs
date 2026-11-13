@@ -10,6 +10,36 @@ use rayon::prelude::*;
 pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, k): (usize, usize, usize)) {
     // `ops` validates shapes; the assertion documents the contract.
     debug_assert_eq!((x.len(), w.len(), y.len()), (m * k, n * k, m * n));
+    // Decode is m = 1: parallelising over rows would leave one thread doing all
+    // the work, so spread that case across the output columns instead. This is the
+    // difference between ~0.6 and ~10 GFLOP/s for the per-frame GEMMs.
+    if m == 1 {
+        let xr = &x[..k];
+        let vectorised = avx2_available();
+        // A single decode step is 512x512: forking rayon for ~0.3 M MAC costs more
+        // than the arithmetic, so small GEMVs run serially.
+        let parallel = true; // measured: forking beats serial even at 0.3M MAC
+        let body = |(c, slot): (usize, &mut f32)| {
+            let wr = &w[c * k..(c + 1) * k];
+            let dot = if vectorised {
+                // SAFETY: guarded by `avx2_available()`.
+                unsafe { dot_avx2(xr, wr, k) }
+            } else {
+                let mut acc = 0.0f32;
+                for i in 0..k {
+                    acc += xr[i] * wr[i];
+                }
+                acc
+            };
+            *slot = dot + bias.map(|b| b[c]).unwrap_or(0.0);
+        };
+        if parallel {
+            y.par_iter_mut().enumerate().with_min_len(16).for_each(body);
+        } else {
+            y.iter_mut().enumerate().for_each(body);
+        }
+        return;
+    }
     let row = |r: usize| -> Vec<f32> {
         let xr = &x[r * k..(r + 1) * k];
         (0..n)
@@ -23,8 +53,6 @@ pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, 
             })
             .collect()
     };
-    // Rows are independent; the closures allocate one row each, which keeps the
-    // inner dot product contiguous in both operands.
     y.par_chunks_mut(n)
         .enumerate()
         .for_each(|(r, out)| out.copy_from_slice(&row(r)));
@@ -61,16 +89,25 @@ pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
             });
 
         let window = &window;
+        // Stride-1 convolutions (every SEANet residual/pointwise tap) are vectorised
+        // over time: the staged window is contiguous, so the inner loop becomes a
+        // straight FMA chain. Strided convs keep the scalar path.
+        let vectorised = stride == 1 && avx2_available();
         y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
             let mut acc = vec![0.0f32; tn];
             for ci in 0..cin {
                 let base = ci * len;
-                let wrow = (co * cin + ci) * ks;
-                for k in 0..ks {
-                    let wv = w[wrow + k];
-                    let off = k * dilation;
-                    for (j, slot) in acc.iter_mut().enumerate() {
-                        *slot += window[base + j * stride + off] * wv;
+                let wrow = &w[(co * cin + ci) * ks..(co * cin + ci) * ks + ks];
+                if vectorised {
+                    // SAFETY: guarded by `avx2_available()` above.
+                    unsafe { conv_block_avx2(&window[base..base + len], wrow, &mut acc, tn, ks, dilation) };
+                } else {
+                    for k in 0..ks {
+                        let wv = wrow[k];
+                        let off = k * dilation;
+                        for (j, slot) in acc.iter_mut().enumerate() {
+                            *slot += window[base + j * stride + off] * wv;
+                        }
                     }
                 }
             }
@@ -98,12 +135,12 @@ pub fn snake_beta(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize, t
 
 /// `y = a + b`.
 pub fn add(a: &[f32], b: &[f32], y: &mut [f32]) {
-    y.par_iter_mut().zip(a.par_iter().zip(b.par_iter())).for_each(|(o, (x, z))| *o = x + z);
+    y.par_iter_mut().zip(a.par_iter().zip(b.par_iter())).with_min_len(16).for_each(|(o, (x, z))| *o = x + z);
 }
 
 /// `y += x` (residual connections in the codec).
 pub fn residual(y: &mut [f32], x: &[f32]) {
-    y.par_iter_mut().zip(x.par_iter()).for_each(|(o, v)| *o += v);
+    y.par_iter_mut().zip(x.par_iter()).with_min_len(16).for_each(|(o, v)| *o += v);
 }
 
 /// RVQ dequantise-and-sum: `out[d,t] = sum_k table[k][code[t,k]][d] / clamp(usage, eps)`.
@@ -165,14 +202,14 @@ pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32], rows: usize, c
 
 /// `y = silu(gate) * up`.
 pub fn silu_mul(gate: &[f32], up: &[f32], y: &mut [f32]) {
-    y.par_iter_mut().zip(gate.par_iter().zip(up.par_iter())).for_each(|(o, (g, u))| {
+    y.par_iter_mut().zip(gate.par_iter().zip(up.par_iter())).with_min_len(16).for_each(|(o, (g, u))| {
         *o = (g / (1.0 + (-g).exp())) * u;
     });
 }
 
 /// In-place per-channel scale on `[rows, cols]`.
 pub fn scale_cols(x: &mut [f32], scale: &[f32], cols: usize) {
-    x.par_chunks_mut(cols).for_each(|row| {
+    x.par_chunks_mut(cols).with_min_len(1).for_each(|row| {
         for (c, v) in row.iter_mut().enumerate() {
             *v *= scale[c];
         }
@@ -290,7 +327,7 @@ pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
 
 /// Exact GELU: `0.5 x (1 + erf(x / sqrt 2))`.
 pub fn gelu(x: &mut [f32]) {
-    x.par_iter_mut().for_each(|v| {
+    x.par_iter_mut().with_min_len(16).for_each(|v| {
         *v = 0.5 * *v * (1.0 + erf(*v * std::f32::consts::FRAC_1_SQRT_2));
     });
 }
@@ -381,9 +418,79 @@ pub fn repeat_kv(x: &[f32], y: &mut [f32], frames: usize, kv_heads: usize, heads
 
 /// ELU (alpha 1), in place.
 pub fn elu(x: &mut [f32]) {
-    x.par_iter_mut().for_each(|v| {
+    x.par_iter_mut().with_min_len(16).for_each(|v| {
         if *v <= 0.0 {
             *v = v.exp() - 1.0;
         }
     });
+}
+
+/// 8-lane FMA dot product, horizontally reduced at the end.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 8 <= k {
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(av, bv, acc);
+        i += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum: f32 = lanes.iter().sum();
+    while i < k {
+        sum += *a.get_unchecked(i) * *b.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+/// True when the CPU can run the AVX2 + FMA path.
+fn avx2_available() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        false
+    }
+}
+
+/// `acc += window[k*dilation + j] * w[k]` for the whole time block, 8 lanes at a
+/// time. Stride-1 only.
+///
+/// Time is the outer loop so the accumulator stays in a register across all taps;
+/// with the tap loop outside, every FMA needed a load and a store of the same
+/// accumulator and ran at a third of this rate.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv_block_avx2(window: &[f32], w: &[f32], acc: &mut [f32], tn: usize, ks: usize,
+                          dilation: usize) {
+    use std::arch::x86_64::*;
+    let acc_ptr = acc.as_mut_ptr();
+    let win_ptr = window.as_ptr();
+    let mut j = 0usize;
+    while j + 8 <= tn {
+        let mut a = _mm256_loadu_ps(acc_ptr.add(j));
+        for k in 0..ks {
+            let wv = _mm256_set1_ps(*w.get_unchecked(k));
+            let x = _mm256_loadu_ps(win_ptr.add(k * dilation + j));
+            a = _mm256_fmadd_ps(x, wv, a);
+        }
+        _mm256_storeu_ps(acc_ptr.add(j), a);
+        j += 8;
+    }
+    // Tail: scalar.
+    while j < tn {
+        let mut sum = *acc_ptr.add(j);
+        for k in 0..ks {
+            sum += *win_ptr.add(k * dilation + j) * *w.get_unchecked(k);
+        }
+        *acc_ptr.add(j) = sum;
+        j += 1;
+    }
 }

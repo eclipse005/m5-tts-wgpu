@@ -158,11 +158,15 @@ impl Pipeline {
         )?;
         let text_tokens = self.lm.tok.encode(&conditioned)?;
 
+        let profile = std::env::var("M5_PROFILE").is_ok();
+        let mut phase = std::time::Instant::now();
         let prompt_codes = match &args.prompt_wav {
             Some(path) => self.encode_reference(path).context("encode reference audio")?,
             None => Vec::new(),
         };
         let prompt_frames = prompt_codes.len() / CODEBOOKS;
+        if profile { eprintln!("  encode reference: {:.3}s", phase.elapsed().as_secs_f64()); }
+        phase = std::time::Instant::now();
 
         // Frames: text slots first, then the reference codes, then an all-zero EOS
         // frame which the reference drops again before the first step.
@@ -186,6 +190,8 @@ impl Pipeline {
         let h = self.lm.backbone_prefill(&embedded, &mut kv)?;
         let mut last = last_row(self.lm.device(), &h, prompt_len)?;
 
+        if profile { eprintln!("  backbone prefill: {:.3}s", phase.elapsed().as_secs_f64()); }
+        phase = std::time::Instant::now();
         let mut generated: Vec<u32> = Vec::new();
         let mut position = prompt_len;
         for frame in 0..args.max_audio_frames {
@@ -217,6 +223,12 @@ impl Pipeline {
             position += 1;
         }
         let generated_frames = generated.len() / CODEBOOKS;
+        if profile {
+            let per_frame = phase.elapsed().as_secs_f64() / generated_frames.max(1) as f64;
+            eprintln!("  generation: {:.3}s for {generated_frames} frames ({:.1} ms/frame)",
+                      phase.elapsed().as_secs_f64(), per_frame * 1e3);
+        }
+        phase = std::time::Instant::now();
 
         // Decode: reference codes (if any) followed by the generated codes.
         let mut all_codes = prompt_codes.clone();
@@ -238,6 +250,7 @@ impl Pipeline {
         }
         let audio = host[trim_front..host.len() - trim_back].to_vec();
 
+        if profile { eprintln!("  codec decode: {:.3}s", phase.elapsed().as_secs_f64()); }
         Ok(Synthesis {
             codes: all_codes,
             frames,
