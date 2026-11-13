@@ -51,6 +51,9 @@ pub struct Lm {
     dev: Device,
     weights: Weights,
     cache: RefCell<HashMap<String, Rc<Tensor>>>,
+    /// Raw bf16 weight rows, kept as the checkpoint stores them so the decode GEMVs
+    /// read half the bytes (see `cpu_ops::dot_bf16`).
+    bf16_cache: RefCell<HashMap<String, Rc<Vec<u8>>>>,
     /// Embedding tables stay on the host: one frame needs 17 lookups, and copying
     /// 333 MB of tables to the device for that would be absurd.
     text_emb: Vec<f32>,
@@ -92,6 +95,7 @@ impl Lm {
             dev,
             weights,
             cache: RefCell::new(HashMap::new()),
+            bf16_cache: RefCell::new(HashMap::new()),
             text_emb,
             audio_emb,
             audio_head,
@@ -104,6 +108,20 @@ impl Lm {
     }
 
     /// Raw audio embedding table (`[CODEBOOKS * AUDIO_VOCAB, HIDDEN]`), host side.
+    /// Raw bf16 bytes of a weight, or `None` when the checkpoint stores f32.
+    pub fn bf16_bytes(&self, name: &str) -> Option<Rc<Vec<u8>>> {
+        if let Some(bytes) = self.bf16_cache.borrow().get(name) {
+            return Some(bytes.clone());
+        }
+        let entry = self.weights.get(name).ok()?;
+        if entry.dtype != crate::weights::DType::Bf16 {
+            return None;
+        }
+        let bytes = Rc::new(entry.data.clone());
+        self.bf16_cache.borrow_mut().insert(name.to_string(), bytes.clone());
+        Some(bytes)
+    }
+
     /// Weight cache, exposed so sibling modules can memoise device copies.
     pub(crate) fn cache_ref(&self) -> &RefCell<HashMap<String, Rc<Tensor>>> {
         &self.cache

@@ -215,6 +215,11 @@ impl Lm {
         let fused = std::env::var("M5_NO_FUSED").is_err();
         if fused && !dev.is_gpu() && x.shape()[0] == 1 {
             if let Some((cache, position, false)) = kv {
+                // bf16 checkpoints (VoiceClone) keep their weights in bf16: half the
+                // DRAM traffic for the same, bit-identical result.
+                if std::env::var("M5_NO_BF16").is_err() {
+                    return self.llama_layer_cpu_step_bf16(prefix, index, x, cos, sin, cache, position);
+                }
                 return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position);
             }
         }
@@ -397,6 +402,102 @@ impl Lm {
         cpu_ops::silu_gemv(&gate_up[..INTERMEDIATE], &gate_up[INTERMEDIATE..], down_w.cpu_slice()?,
                            &x1, &mut out, INTERMEDIATE, HIDDEN);
         if profile { eprintln!("      down {:.0}us", phase.elapsed().as_secs_f64() * 1e6); }
+        dev.tensor([1, HIDDEN], &out)
+    }
+}
+
+impl Lm {
+    /// Concatenated bf16 rows for `[a; b; c]`, or `None` if any part is f32.
+    fn concat_bf16(&self, key: &str, names: &[String]) -> Option<Rc<Vec<u8>>> {
+        if let Some(bytes) = self.bf16_cache.borrow().get(key) {
+            return Some(bytes.clone());
+        }
+        let mut out: Vec<u8> = Vec::new();
+        for name in names {
+            let bytes = self.bf16_bytes(name)?;
+            out.extend_from_slice(&bytes);
+        }
+        let bytes = Rc::new(out);
+        self.bf16_cache.borrow_mut().insert(key.to_string(), bytes.clone());
+        Some(bytes)
+    }
+
+    fn qkv_bf16(&self, prefix: &str, index: usize) -> Option<Rc<Vec<u8>>> {
+        let p = format!("{prefix}.layers.{index}");
+        self.concat_bf16(&format!("{p}.qkv.bf16"), &[
+            format!("{p}.self_attn.q_proj.weight"),
+            format!("{p}.self_attn.k_proj.weight"),
+            format!("{p}.self_attn.v_proj.weight"),
+        ])
+    }
+
+    fn gate_up_bf16(&self, prefix: &str, index: usize) -> Option<Rc<Vec<u8>>> {
+        let p = format!("{prefix}.layers.{index}");
+        self.concat_bf16(&format!("{p}.gate_up.bf16"), &[
+            format!("{p}.mlp.gate_proj.weight"),
+            format!("{p}.mlp.up_proj.weight"),
+        ])
+    }
+}
+
+impl Lm {
+    /// bf16 variant of [`Lm::llama_layer_cpu_step`]: identical math, half the
+    /// weight bytes. Only used when every weight of the layer is stored bf16
+    /// (VoiceClone); CustomVoice stays on the f32 path.
+    fn llama_layer_cpu_step_bf16(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32],
+                                 sin: &[f32], cache: &mut KvCache, position: usize) -> Result<Tensor> {
+        let dev = self.device();
+        let p = format!("{prefix}.layers.{index}");
+        let q_dim = HEADS * HEAD_DIM;
+        let kv_dim = KV_HEADS * HEAD_DIM;
+        let row = x.cpu_slice()?.to_vec();
+
+        let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+        let qkv_w = self.qkv_bf16(prefix, index);
+        let mut qkv = vec![0.0f32; q_dim + 2 * kv_dim];
+        match &qkv_w {
+            Some(w) => cpu_ops::rms_norm_gemv_bf16(&row, input_norm.cpu_slice()?, w, None, &mut qkv,
+                                                  HIDDEN, q_dim + 2 * kv_dim, 1e-5),
+            None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
+        }
+
+        let (q, rest) = qkv.split_at_mut(q_dim);
+        let (k, v) = rest.split_at_mut(kv_dim);
+        cpu_ops::rope_tabled(q, cos, sin, 1, HEADS, HEAD_DIM);
+        cpu_ops::rope_tabled(k, cos, sin, 1, KV_HEADS, HEAD_DIM);
+        let mut k_full = vec![0.0f32; q_dim];
+        let mut v_full = vec![0.0f32; q_dim];
+        cpu_ops::repeat_kv(k, &mut k_full, 1, KV_HEADS, HEADS, HEAD_DIM);
+        cpu_ops::repeat_kv(v, &mut v_full, 1, KV_HEADS, HEADS, HEAD_DIM);
+        cpu_ops::write_rows(cache.k[index].cpu_slice_mut()?, &k_full, q_dim, position);
+        cpu_ops::write_rows(cache.v[index].cpu_slice_mut()?, &v_full, q_dim, position);
+        let mut attended = vec![0.0f32; q_dim];
+        cpu_ops::attention_decode(q, cache.k[index].cpu_slice()?, cache.v[index].cpu_slice()?,
+                                 &mut attended, position + 1, HEADS, HEAD_DIM);
+
+        let o_w = self.bf16_bytes(&format!("{p}.self_attn.o_proj.weight"));
+        let mut x1 = vec![0.0f32; HIDDEN];
+        match &o_w {
+            Some(w) => cpu_ops::gemv_add_bf16(&attended, w, &row, &mut x1, q_dim, HIDDEN),
+            None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
+        }
+
+        let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+        let gate_up_w = self.gate_up_bf16(prefix, index);
+        let mut gate_up = vec![0.0f32; 2 * INTERMEDIATE];
+        match &gate_up_w {
+            Some(w) => cpu_ops::rms_norm_gemv_bf16(&x1, post_norm.cpu_slice()?, w, None, &mut gate_up,
+                                                  HIDDEN, 2 * INTERMEDIATE, 1e-5),
+            None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
+        }
+
+        let down_w = self.bf16_bytes(&format!("{p}.mlp.down_proj.weight"));
+        let mut out = vec![0.0f32; HIDDEN];
+        match &down_w {
+            Some(w) => cpu_ops::silu_gemv_bf16(&gate_up[..INTERMEDIATE], &gate_up[INTERMEDIATE..], w,
+                                               &x1, &mut out, INTERMEDIATE, HIDDEN),
+            None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
+        }
         dev.tensor([1, HIDDEN], &out)
     }
 }

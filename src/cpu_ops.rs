@@ -1008,3 +1008,82 @@ unsafe fn transpose_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32]
         _mm256_storeu_ps(row.as_mut_ptr().add(co), acc);
     }
 }
+
+// ---------------------------------------------------------------------------
+// bf16 weights, widened inside the kernel
+//
+// The VoiceClone checkpoint stores bf16, and lifting it to f32 at load doubles the
+// bytes every GEMV has to pull from memory — which is what the decode loop is
+// bound on (75 layer passes per frame stream ~1.1 GB against a 30 MB L3). bf16 ->
+// f32 is a lossless shift, so widening per use keeps the arithmetic bit-identical
+// while halving the traffic.
+// ---------------------------------------------------------------------------
+
+/// Widen one bf16 pair (little-endian) into two f32s.
+#[inline]
+fn bf16_pair(bytes: &[u8]) -> (f32, f32) {
+    let lo = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let hi = u16::from_le_bytes([bytes[2], bytes[3]]);
+    (
+        f32::from_bits((lo as u32) << 16),
+        f32::from_bits((hi as u32) << 16),
+    )
+}
+
+/// `dot(x, bf16 weight row)` where `bytes` is the row's raw bf16 data.
+fn dot_bf16(x: &[f32], bytes: &[u8], k: usize) -> f32 {
+    let mut acc = 0.0f32;
+    let mut i = 0usize;
+    while i + 2 <= k {
+        let (a, b) = bf16_pair(&bytes[i * 2..i * 2 + 4]);
+        acc += x[i] * a + x[i + 1] * b;
+        i += 2;
+    }
+    while i < k {
+        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        acc += x[i] * f32::from_bits((bits as u32) << 16);
+        i += 1;
+    }
+    acc
+}
+
+/// bf16 twin of [`rms_norm_gemv`]: norm, then project from bf16 weights.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_gemv_bf16(x: &[f32], norm_w: &[f32], w: &[u8], bias: Option<&[f32]>, y: &mut [f32],
+                          cols: usize, rows: usize, eps: f32) {
+    let mut normed = vec![0.0f32; cols];
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+    let inv = 1.0 / (mean_sq + eps).sqrt();
+    for c in 0..cols {
+        normed[c] = x[c] * inv * norm_w[c];
+    }
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * cols * 2..(r + 1) * cols * 2];
+        dot_bf16(&normed, row, cols) + bias.map(|b| b[r]).unwrap_or(0.0)
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+/// bf16 twin of [`gemv_add`].
+pub fn gemv_add_bf16(x: &[f32], w: &[u8], residual: &[f32], y: &mut [f32], k: usize, n: usize) {
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * k * 2..(r + 1) * k * 2];
+        dot_bf16(x, row, k) + residual[r]
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+/// bf16 twin of [`silu_gemv`].
+pub fn silu_gemv_bf16(gate: &[f32], up: &[f32], w: &[u8], residual: &[f32], y: &mut [f32],
+                      inter: usize, n: usize) {
+    let mut act = vec![0.0f32; inter];
+    for i in 0..inter {
+        let g = gate[i];
+        act[i] = (g / (1.0 + (-g).exp())) * up[i];
+    }
+    let dot = |r: usize| -> f32 {
+        let row = &w[r * inter * 2..(r + 1) * inter * 2];
+        dot_bf16(&act, row, inter) + residual[r]
+    };
+    y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}

@@ -14,11 +14,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Same-process A/B: cross-run numbers drift on this box.
-    for noset in [false, true] {
-        if noset {
-            std::env::set_var("M5_NO_FUSED", "1");
+    for (label, no_bf16) in [("bf16+fused", false), ("f32+fused ", true)] {
+        if no_bf16 {
+            std::env::set_var("M5_NO_BF16", "1");
         } else {
-            std::env::remove_var("M5_NO_FUSED");
+            std::env::remove_var("M5_NO_BF16");
         }
         let lm = Lm::load(dir, Device::Cpu)?;
         let h = lm.device().tensor([1, HIDDEN], &vec![0.02f32; HIDDEN])?;
@@ -26,8 +26,7 @@ fn main() -> anyhow::Result<()> {
         let _ = lm.depth_codes(&h, 0, &noise, 0.9, 10, true)?;
         let start = Instant::now();
         for _ in 0..calls { let _ = lm.depth_codes(&h, 0, &noise, 0.9, 10, true)?; }
-        println!("cpu {}: {:.1} ms/frame", if noset { "generic " } else { "fused   " },
-                 start.elapsed().as_secs_f64() * 1e3 / calls as f64);
+        println!("cpu {label}: {:.1} ms/frame", start.elapsed().as_secs_f64() * 1e3 / calls as f64);
     }
 
     for spec in ["cpu", "gpu"] {
