@@ -1126,3 +1126,379 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 "#;
+
+/// Register-blocked channels-last conv: 8 timesteps x 4 channels per thread.
+///
+/// Weights are read once per eight FMAs (vs once per FMA in the naive kernel), so
+/// the kernel needs ~500 GB/s of cache bandwidth at the card's 2.1 TFLOP/s instead
+/// of the ~2 TB/s that made the simple version stall at 49 GFLOP/s. The 32
+/// accumulators are named locals: an `array<f32, N>` spills out of registers on
+/// this backend (see ctc-forced-aligner-wgpu's tile notes).
+pub const CONV1D_REG_GPU: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const TT: u32 = 128u;
+const CT: u32 = 64u;
+// Staged input channels (stride <= 2: the window fits 16 channels in 20 KB). The window length is `TT * stride + span`, so with the
+// worst stride the codec uses (8) a chunk of 4 keeps the staging inside 18 KB of
+// workgroup memory; sizing it for the largest case is what a constant `WIN`
+// silently broke before (shared-memory overrun on strided layers).
+const CI: u32 = 16u;
+const WIN_MAX: u32 = 128u * 8u + 64u;
+
+var<workgroup> stage: array<f32, 16 * 320>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t0 = wid.x * TT;
+    let co0 = wid.y * CT;
+    let t_base = t0 + lid.y * 8u;
+    let c_base = co0 + lid.x * 4u;
+    let span = (p[2] - 1u) * p[3] + 1u;
+    let win_len = TT * p[4] + span;
+
+    var a00: f32 = 0.0;
+    var a01: f32 = 0.0;
+    var a02: f32 = 0.0;
+    var a03: f32 = 0.0;
+    var a10: f32 = 0.0;
+    var a11: f32 = 0.0;
+    var a12: f32 = 0.0;
+    var a13: f32 = 0.0;
+    var a20: f32 = 0.0;
+    var a21: f32 = 0.0;
+    var a22: f32 = 0.0;
+    var a23: f32 = 0.0;
+    var a30: f32 = 0.0;
+    var a31: f32 = 0.0;
+    var a32: f32 = 0.0;
+    var a33: f32 = 0.0;
+    var a40: f32 = 0.0;
+    var a41: f32 = 0.0;
+    var a42: f32 = 0.0;
+    var a43: f32 = 0.0;
+    var a50: f32 = 0.0;
+    var a51: f32 = 0.0;
+    var a52: f32 = 0.0;
+    var a53: f32 = 0.0;
+    var a60: f32 = 0.0;
+    var a61: f32 = 0.0;
+    var a62: f32 = 0.0;
+    var a63: f32 = 0.0;
+    var a70: f32 = 0.0;
+    var a71: f32 = 0.0;
+    var a72: f32 = 0.0;
+    var a73: f32 = 0.0;
+
+    let chunks = (p[0] + CI - 1u) / CI;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        for (var i = tid; i < CI * win_len; i = i + 256u) {
+            let ci_local = i / win_len;
+            let j = i % win_len;
+            let ci = c0 * CI + ci_local;
+            var value = 0.0;
+            if (ci < p[0]) {
+                let src = i32(t0 * p[4]) + i32(j) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) {
+                    value = x[u32(src) * p[0] + ci];
+                }
+            }
+            stage[ci_local * win_len + j] = value;
+        }
+        workgroupBarrier();
+
+        for (var ci_local = 0u; ci_local < CI; ci_local = ci_local + 1u) {
+            let ci = c0 * CI + ci_local;
+            if (ci >= p[0]) { continue; }
+            for (var tap = 0u; tap < p[2]; tap = tap + 1u) {
+                var xv: array<f32, 8>;
+                for (var i = 0u; i < 8u; i = i + 1u) {
+                    xv[i] = stage[ci_local * win_len + (lid.y * 8u + i) * p[4] + tap * p[3]];
+                }
+                let wbase = (tap * p[0] + ci) * p[1] + c_base;
+                let wv0 = w[wbase];
+                let wv1 = w[wbase + 1u];
+                let wv2 = w[wbase + 2u];
+                let wv3 = w[wbase + 3u];
+                a00 = a00 + xv[0] * wv0;
+                a01 = a01 + xv[0] * wv1;
+                a02 = a02 + xv[0] * wv2;
+                a03 = a03 + xv[0] * wv3;
+                a10 = a10 + xv[1] * wv0;
+                a11 = a11 + xv[1] * wv1;
+                a12 = a12 + xv[1] * wv2;
+                a13 = a13 + xv[1] * wv3;
+                a20 = a20 + xv[2] * wv0;
+                a21 = a21 + xv[2] * wv1;
+                a22 = a22 + xv[2] * wv2;
+                a23 = a23 + xv[2] * wv3;
+                a30 = a30 + xv[3] * wv0;
+                a31 = a31 + xv[3] * wv1;
+                a32 = a32 + xv[3] * wv2;
+                a33 = a33 + xv[3] * wv3;
+                a40 = a40 + xv[4] * wv0;
+                a41 = a41 + xv[4] * wv1;
+                a42 = a42 + xv[4] * wv2;
+                a43 = a43 + xv[4] * wv3;
+                a50 = a50 + xv[5] * wv0;
+                a51 = a51 + xv[5] * wv1;
+                a52 = a52 + xv[5] * wv2;
+                a53 = a53 + xv[5] * wv3;
+                a60 = a60 + xv[6] * wv0;
+                a61 = a61 + xv[6] * wv1;
+                a62 = a62 + xv[6] * wv2;
+                a63 = a63 + xv[6] * wv3;
+                a70 = a70 + xv[7] * wv0;
+                a71 = a71 + xv[7] * wv1;
+                a72 = a72 + xv[7] * wv2;
+                a73 = a73 + xv[7] * wv3;
+            }
+        }
+        workgroupBarrier();
+    }
+
+        let cc0 = c_base + 0u;
+        let cc1 = c_base + 1u;
+        let cc2 = c_base + 2u;
+        let cc3 = c_base + 3u;
+        if (t_base + 0u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 0u) * p[1] + cc0] = a00 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 0u) * p[1] + cc1] = a01 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 0u) * p[1] + cc2] = a02 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 0u) * p[1] + cc3] = a03 + b[cc3]; }
+        }
+        if (t_base + 1u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 1u) * p[1] + cc0] = a10 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 1u) * p[1] + cc1] = a11 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 1u) * p[1] + cc2] = a12 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 1u) * p[1] + cc3] = a13 + b[cc3]; }
+        }
+        if (t_base + 2u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 2u) * p[1] + cc0] = a20 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 2u) * p[1] + cc1] = a21 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 2u) * p[1] + cc2] = a22 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 2u) * p[1] + cc3] = a23 + b[cc3]; }
+        }
+        if (t_base + 3u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 3u) * p[1] + cc0] = a30 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 3u) * p[1] + cc1] = a31 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 3u) * p[1] + cc2] = a32 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 3u) * p[1] + cc3] = a33 + b[cc3]; }
+        }
+        if (t_base + 4u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 4u) * p[1] + cc0] = a40 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 4u) * p[1] + cc1] = a41 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 4u) * p[1] + cc2] = a42 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 4u) * p[1] + cc3] = a43 + b[cc3]; }
+        }
+        if (t_base + 5u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 5u) * p[1] + cc0] = a50 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 5u) * p[1] + cc1] = a51 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 5u) * p[1] + cc2] = a52 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 5u) * p[1] + cc3] = a53 + b[cc3]; }
+        }
+        if (t_base + 6u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 6u) * p[1] + cc0] = a60 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 6u) * p[1] + cc1] = a61 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 6u) * p[1] + cc2] = a62 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 6u) * p[1] + cc3] = a63 + b[cc3]; }
+        }
+        if (t_base + 7u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 7u) * p[1] + cc0] = a70 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 7u) * p[1] + cc1] = a71 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 7u) * p[1] + cc2] = a72 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 7u) * p[1] + cc3] = a73 + b[cc3]; }
+        }
+}
+"#;
+pub const CONV1D_REG_GPU_STRIDED: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const TT: u32 = 128u;
+const CT: u32 = 64u;
+// Staged input channels. The window length is `TT * stride + span`, so with the
+// worst stride the codec uses (8) a chunk of 4 keeps the staging inside 18 KB of
+// workgroup memory; sizing it for the largest case is what a constant `WIN`
+// silently broke before (shared-memory overrun on strided layers).
+const CI: u32 = 4u;
+const WIN_MAX: u32 = 128u * 8u + 64u;
+
+var<workgroup> stage: array<f32, 4 * 1152>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t0 = wid.x * TT;
+    let co0 = wid.y * CT;
+    let t_base = t0 + lid.y * 8u;
+    let c_base = co0 + lid.x * 4u;
+    let span = (p[2] - 1u) * p[3] + 1u;
+    let win_len = TT * p[4] + span;
+
+    var a00: f32 = 0.0;
+    var a01: f32 = 0.0;
+    var a02: f32 = 0.0;
+    var a03: f32 = 0.0;
+    var a10: f32 = 0.0;
+    var a11: f32 = 0.0;
+    var a12: f32 = 0.0;
+    var a13: f32 = 0.0;
+    var a20: f32 = 0.0;
+    var a21: f32 = 0.0;
+    var a22: f32 = 0.0;
+    var a23: f32 = 0.0;
+    var a30: f32 = 0.0;
+    var a31: f32 = 0.0;
+    var a32: f32 = 0.0;
+    var a33: f32 = 0.0;
+    var a40: f32 = 0.0;
+    var a41: f32 = 0.0;
+    var a42: f32 = 0.0;
+    var a43: f32 = 0.0;
+    var a50: f32 = 0.0;
+    var a51: f32 = 0.0;
+    var a52: f32 = 0.0;
+    var a53: f32 = 0.0;
+    var a60: f32 = 0.0;
+    var a61: f32 = 0.0;
+    var a62: f32 = 0.0;
+    var a63: f32 = 0.0;
+    var a70: f32 = 0.0;
+    var a71: f32 = 0.0;
+    var a72: f32 = 0.0;
+    var a73: f32 = 0.0;
+
+    let chunks = (p[0] + CI - 1u) / CI;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        for (var i = tid; i < CI * win_len; i = i + 256u) {
+            let ci_local = i / win_len;
+            let j = i % win_len;
+            let ci = c0 * CI + ci_local;
+            var value = 0.0;
+            if (ci < p[0]) {
+                let src = i32(t0 * p[4]) + i32(j) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) {
+                    value = x[u32(src) * p[0] + ci];
+                }
+            }
+            stage[ci_local * win_len + j] = value;
+        }
+        workgroupBarrier();
+
+        for (var ci_local = 0u; ci_local < CI; ci_local = ci_local + 1u) {
+            let ci = c0 * CI + ci_local;
+            if (ci >= p[0]) { continue; }
+            for (var tap = 0u; tap < p[2]; tap = tap + 1u) {
+                var xv: array<f32, 8>;
+                for (var i = 0u; i < 8u; i = i + 1u) {
+                    xv[i] = stage[ci_local * win_len + (lid.y * 8u + i) * p[4] + tap * p[3]];
+                }
+                let wbase = (tap * p[0] + ci) * p[1] + c_base;
+                let wv0 = w[wbase];
+                let wv1 = w[wbase + 1u];
+                let wv2 = w[wbase + 2u];
+                let wv3 = w[wbase + 3u];
+                a00 = a00 + xv[0] * wv0;
+                a01 = a01 + xv[0] * wv1;
+                a02 = a02 + xv[0] * wv2;
+                a03 = a03 + xv[0] * wv3;
+                a10 = a10 + xv[1] * wv0;
+                a11 = a11 + xv[1] * wv1;
+                a12 = a12 + xv[1] * wv2;
+                a13 = a13 + xv[1] * wv3;
+                a20 = a20 + xv[2] * wv0;
+                a21 = a21 + xv[2] * wv1;
+                a22 = a22 + xv[2] * wv2;
+                a23 = a23 + xv[2] * wv3;
+                a30 = a30 + xv[3] * wv0;
+                a31 = a31 + xv[3] * wv1;
+                a32 = a32 + xv[3] * wv2;
+                a33 = a33 + xv[3] * wv3;
+                a40 = a40 + xv[4] * wv0;
+                a41 = a41 + xv[4] * wv1;
+                a42 = a42 + xv[4] * wv2;
+                a43 = a43 + xv[4] * wv3;
+                a50 = a50 + xv[5] * wv0;
+                a51 = a51 + xv[5] * wv1;
+                a52 = a52 + xv[5] * wv2;
+                a53 = a53 + xv[5] * wv3;
+                a60 = a60 + xv[6] * wv0;
+                a61 = a61 + xv[6] * wv1;
+                a62 = a62 + xv[6] * wv2;
+                a63 = a63 + xv[6] * wv3;
+                a70 = a70 + xv[7] * wv0;
+                a71 = a71 + xv[7] * wv1;
+                a72 = a72 + xv[7] * wv2;
+                a73 = a73 + xv[7] * wv3;
+            }
+        }
+        workgroupBarrier();
+    }
+
+        let cc0 = c_base + 0u;
+        let cc1 = c_base + 1u;
+        let cc2 = c_base + 2u;
+        let cc3 = c_base + 3u;
+        if (t_base + 0u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 0u) * p[1] + cc0] = a00 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 0u) * p[1] + cc1] = a01 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 0u) * p[1] + cc2] = a02 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 0u) * p[1] + cc3] = a03 + b[cc3]; }
+        }
+        if (t_base + 1u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 1u) * p[1] + cc0] = a10 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 1u) * p[1] + cc1] = a11 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 1u) * p[1] + cc2] = a12 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 1u) * p[1] + cc3] = a13 + b[cc3]; }
+        }
+        if (t_base + 2u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 2u) * p[1] + cc0] = a20 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 2u) * p[1] + cc1] = a21 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 2u) * p[1] + cc2] = a22 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 2u) * p[1] + cc3] = a23 + b[cc3]; }
+        }
+        if (t_base + 3u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 3u) * p[1] + cc0] = a30 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 3u) * p[1] + cc1] = a31 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 3u) * p[1] + cc2] = a32 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 3u) * p[1] + cc3] = a33 + b[cc3]; }
+        }
+        if (t_base + 4u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 4u) * p[1] + cc0] = a40 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 4u) * p[1] + cc1] = a41 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 4u) * p[1] + cc2] = a42 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 4u) * p[1] + cc3] = a43 + b[cc3]; }
+        }
+        if (t_base + 5u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 5u) * p[1] + cc0] = a50 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 5u) * p[1] + cc1] = a51 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 5u) * p[1] + cc2] = a52 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 5u) * p[1] + cc3] = a53 + b[cc3]; }
+        }
+        if (t_base + 6u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 6u) * p[1] + cc0] = a60 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 6u) * p[1] + cc1] = a61 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 6u) * p[1] + cc2] = a62 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 6u) * p[1] + cc3] = a63 + b[cc3]; }
+        }
+        if (t_base + 7u < p[7]) {
+            if (cc0 < p[1]) { y[(t_base + 7u) * p[1] + cc0] = a70 + b[cc0]; }
+            if (cc1 < p[1]) { y[(t_base + 7u) * p[1] + cc1] = a71 + b[cc1]; }
+            if (cc2 < p[1]) { y[(t_base + 7u) * p[1] + cc2] = a72 + b[cc2]; }
+            if (cc3 < p[1]) { y[(t_base + 7u) * p[1] + cc3] = a73 + b[cc3]; }
+        }
+}
+"#;

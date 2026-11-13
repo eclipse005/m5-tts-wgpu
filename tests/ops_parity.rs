@@ -453,3 +453,40 @@ fn channels_last_conv_matches_channels_first() {
         assert!(worst < 2e-3, "channels-last conv diff {worst}");
     }
 }
+
+#[test]
+fn gpu_channels_last_conv_matches_cpu() {
+    let Some(gpu) = gpu() else { return };
+    use m5_tts_wgpu::cpu_ops;
+    use m5_tts_wgpu::gpu_ops;
+    for (cin, cout, ks, stride, t_in) in
+        [(96usize, 96usize, 7usize, 1usize, 300usize), (192, 96, 7, 1, 190),
+         (32, 64, 3, 2, 128), (16, 128, 4, 4, 64)]
+    {
+        let pad = ks - stride;
+        let t_out = if stride == 1 { t_in } else { t_in.div_ceil(stride) };
+        let x = rand_vec(t_in * cin, 81);
+        let w = rand_vec(cout * cin * ks, 82);
+        let b = rand_vec(cout, 83);
+        let packed = cpu_ops::pack_conv_weights(&w, cout, cin, ks);
+
+        let mut want = vec![0.0f32; t_out * cout];
+        cpu_ops::conv1d_channels_last(&x, &packed, &b, &mut want, cin, cout, ks, 1, stride, pad,
+                                      t_in, t_out);
+
+        let xg = gpu.tensor([t_in, cin], &x).unwrap();
+        let wg = gpu.tensor([ks * cin, cout], &packed).unwrap();
+        let bg = gpu.tensor([cout, 1], &b).unwrap();
+        let yg = gpu.zeros([t_out, cout]).unwrap();
+        gpu_ops::conv1d_cl(gpu.gpu().unwrap(), xg.gpu_buffer().unwrap(), wg.gpu_buffer().unwrap(),
+                           bg.gpu_buffer().unwrap(), yg.gpu_buffer().unwrap(),
+                           cin, cout, ks, 1, stride, pad, t_in, t_out);
+        let got = gpu.read(&yg).unwrap();
+        let mut worst = 0.0f32;
+        for (a, c) in want.iter().zip(&got) {
+            worst = worst.max((a - c).abs());
+        }
+        eprintln!("gpu cl conv cin={cin} cout={cout} ks={ks} stride={stride}: max|diff|={worst:.3e}");
+        assert!(worst < 5e-3, "gpu channels-last conv diff {worst}");
+    }
+}

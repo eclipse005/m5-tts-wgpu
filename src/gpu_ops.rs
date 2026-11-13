@@ -264,7 +264,13 @@ pub fn conv1d_cl(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: &Buffer, y: &Buffer,
         cin as u32, cout as u32, ks as u32, dilation as u32,
         stride as u32, pad as u32, t_in as u32, t_out as u32,
     ]);
-    let groups = (t_out.div_ceil(64) as u32, cout.div_ceil(64) as u32, 1);
-    gpu.dispatch("conv1d_cl_gpu", shaders::CONV1D_CL_GPU, "main",
-                 &[(0, x), (1, w), (2, bias), (3, y), (4, &params)], groups);
+    let groups = (t_out.div_ceil(128) as u32, cout.div_ceil(64) as u32, 1);
+    // Short windows stage 16 channels; strided layers need 4 to stay in 18 KB.
+    if stride <= 2 {
+        gpu.dispatch("conv1d_reg_gpu", shaders::CONV1D_REG_GPU, "main",
+                     &[(0, x), (1, w), (2, bias), (3, y), (4, &params)], groups);
+    } else {
+        gpu.dispatch("conv1d_reg_gpu_strided", shaders::CONV1D_REG_GPU_STRIDED, "main",
+                     &[(0, x), (1, w), (2, bias), (3, y), (4, &params)], groups);
+    }
 }
