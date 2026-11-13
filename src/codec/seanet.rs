@@ -4,6 +4,7 @@
 use anyhow::Result;
 
 use super::Codec;
+use crate::cpu_ops;
 use crate::device::{Device, Tensor};
 use crate::ops::{self, Conv1d};
 
@@ -26,6 +27,13 @@ fn causal_conv(codec: &Codec, x: &Tensor, weight_name: &str, bias_name: &str,
 fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Result<Tensor> {
     let dev: &Device = codec.device();
     let channels = x.shape()[0];
+    // CPU: fuse each snake into its convolution and the residual into the last one.
+    if !dev.is_gpu() {
+        let cv1 = codec.snake_conv(x, &format!("{prefix}.act1"), &format!("{prefix}.conv1.conv.weight"),
+                                   &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation, None)?;
+        return codec.snake_conv(&cv1, &format!("{prefix}.act2"), &format!("{prefix}.conv2.conv.weight"),
+                                &format!("{prefix}.conv2.conv.bias"), channels, 1, 1, Some(x));
+    }
 
     let alpha = codec.vector(&format!("{prefix}.act1.alpha"), channels)?;
     let beta = codec.vector(&format!("{prefix}.act1.beta"), channels)?;
@@ -164,5 +172,32 @@ impl Codec {
         let pcm = self.seanet(&upsampled)?;
         if profile { eprintln!("    seanet {:.3}s", phase.elapsed().as_secs_f64()); }
         Ok(pcm)
+    }
+}
+
+impl Codec {
+    /// Fused `snake -> conv -> (+residual)` for the CPU path.
+    ///
+    /// `x` is the tensor the snake applies to; `residual` (when given) is added to
+    /// the convolution result. Both fusions exist because the tail is DRAM-bound —
+    /// see `cpu_ops::snake_conv1d`.
+    fn snake_conv(&self, x: &Tensor, act_prefix: &str, weight_name: &str, bias_name: &str,
+                  cout: usize, ks: usize, dilation: usize, residual: Option<&Tensor>) -> Result<Tensor> {
+        let dev = self.device();
+        let [cin, t_in] = x.shape();
+        let weight = self.tensor(weight_name, [cout, cin * ks])?;
+        let bias = self.vector(bias_name, cout)?;
+        let alpha = self.vector(&format!("{act_prefix}.alpha"), cin)?;
+        let beta = self.vector(&format!("{act_prefix}.beta"), cin)?;
+        let t_out = t_in;
+        let mut out = dev.zeros([cout, t_out])?;
+        match dev {
+            crate::device::Device::Cpu => cpu_ops::snake_conv1d(
+                x.cpu_slice()?, alpha.cpu_slice()?, beta.cpu_slice()?, weight.cpu_slice()?,
+                bias.cpu_slice()?, residual.map(|r| r.cpu_slice()).transpose()?, out.cpu_slice_mut()?,
+                (cin, cout, ks, dilation, 1, (ks - 1) * dilation, t_in, t_out)),
+            _ => anyhow::bail!("fused snake+conv is CPU-only"),
+        }
+        Ok(out)
     }
 }

@@ -431,48 +431,68 @@ pub fn conv1d_depthwise(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
 pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
                         cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
     debug_assert!(ks >= stride && ks <= 2 * stride, "unexpected kernel/stride {ks}/{stride}");
+    let taps = ks.div_ceil(stride);
     let t_out = t_in * stride;
-    const BLOCK: usize = 1024;
-    y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
-        let mut acc = vec![0.0f32; stride * BLOCK];
+    const BLOCK: usize = 512;
+    const CO: usize = 4;
+
+    // `out_block` always starts at row `co0`, so the body indexes rows relative.
+    let body = |co0: usize, rows: usize, out_block: &mut [f32]| {
+        // One accumulator plane per (channel, phase).
+        let mut acc = vec![0.0f32; CO * stride * BLOCK];
         for q0 in (0..t_in).step_by(BLOCK) {
             let len = BLOCK.min(t_in - q0);
-            // Each phase owns its own `stride * BLOCK`-slot lane, so zero those
-            // lanes separately: clearing only `[0, stride * len)` leaves stale
-            // values in the r >= 1 lanes whenever a call spans several blocks.
-            for r in 0..stride {
-                for slot in acc[r * BLOCK..r * BLOCK + len].iter_mut() {
-                    *slot = 0.0;
-                }
+            for slot in acc.iter_mut() {
+                *slot = 0.0;
             }
             for ci in 0..cin {
                 let xrow = &x[ci * t_in..(ci + 1) * t_in];
-                let wbase = (ci * cout + co) * ks;
-                for r in 0..stride {
-                    let lane = &mut acc[r * BLOCK..r * BLOCK + len];
-                    let mut tap = 0usize;
-                    let mut k = r;
-                    while k < ks {
-                        let wv = w[wbase + k];
-                        for (q, slot) in lane.iter_mut().enumerate() {
-                            let index = q0 + q;
-                            if index >= tap {
-                                *slot += xrow[index - tap] * wv;
+                for tap in 0..taps {
+                    for r in 0..stride {
+                        let k = r + tap * stride;
+                        if k >= ks {
+                            continue;
+                        }
+                        // Four output channels share one x read: the previous version
+                        // re-read x for every co and streamed ~1 GB per block.
+                        for c in 0..rows {
+                            // ConvTranspose1d stores [cin, cout, ks].
+                            let wv = w[(ci * cout + co0 + c) * ks + k];
+                            let off = (c * stride + r) * BLOCK;
+                            let lane = &mut acc[off..off + len];
+                            for (q, slot) in lane.iter_mut().enumerate() {
+                                let index = q0 + q;
+                                if index >= tap {
+                                    *slot += xrow[index - tap] * wv;
+                                }
                             }
                         }
-                        tap += 1;
-                        k += stride;
                     }
                 }
             }
             for r in 0..stride {
-                let lane = &acc[r * BLOCK..r * BLOCK + len];
-                for (q, value) in lane.iter().enumerate() {
-                    out[(q0 + q) * stride + r] = value + b[co];
+                for c in 0..rows {
+                    let off = (c * stride + r) * BLOCK;
+                    let lane = &acc[off..off + len];
+                    for (q, value) in lane.iter().enumerate() {
+                        out_block[c * t_out + (q0 + q) * stride + r] = value + b[co0 + c];
+                    }
                 }
             }
         }
-    });
+    };
+    if cout % CO == 0 {
+        y.par_chunks_mut(t_out * CO)
+            .enumerate()
+            .for_each(|(block, out)| body(block * CO, CO, out));
+    } else {
+        y.par_chunks_mut(t_out * CO)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let co0 = block * CO;
+                body(co0, (cout - co0).min(CO), out);
+            });
+    }
 }
 
 /// Exact GELU: `0.5 x (1 + erf(x / sqrt 2))`.
@@ -1086,4 +1106,144 @@ pub fn silu_gemv_bf16(gate: &[f32], up: &[f32], w: &[u8], residual: &[f32], y: &
         dot_bf16(&act, row, inter) + residual[r]
     };
     y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
+}
+
+/// SnakeBeta fused into the conv input, optional residual fused into the output.
+///
+/// A SEANet residual unit is `snake -> conv7 -> snake -> conv1 -> +x`, i.e. ten
+/// passes over a 41 MB activation on the largest block (the decode is DRAM-bound,
+/// measured 158 GMAC/s against PyTorch's 232). Staging the *activated* window per
+/// time block and writing the residual sum in the same pass halves that: the snake
+/// no longer needs its own read+write, and the add does not either.
+#[allow(clippy::too_many_arguments)]
+pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f32],
+                    residual: Option<&[f32]>, y: &mut [f32],
+                    (cin, cout, ks, dilation, stride, pad, t_in, t_out):
+                        (usize, usize, usize, usize, usize, usize, usize, usize)) {
+    const BT: usize = 128;
+    let span = (ks - 1) * dilation + 1;
+    let a: Vec<f32> = alpha.iter().map(|v| v.exp()).collect();
+    let b: Vec<f32> = beta.iter().map(|v| v.exp() + 1e-9).collect();
+
+    for t0 in (0..t_out).step_by(BT) {
+        let tn = BT.min(t_out - t0);
+        let start = t0 as isize * stride as isize - pad as isize;
+        let len = (tn - 1) * stride + span;
+        let mut window = vec![0.0f32; cin * len];
+        window
+            .par_chunks_mut(len)
+            .enumerate()
+            .take(cin)
+            .for_each(|(ci, row)| {
+                let (ca, cb) = (a[ci], b[ci]);
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let src = start + j as isize;
+                    if src >= 0 && (src as usize) < t_in {
+                        let v = x[ci * t_in + src as usize];
+                        let s = (v * ca).sin();
+                        *slot = v + s * s / cb;
+                    }
+                }
+            });
+
+        let window = &window;
+        let vectorised = stride == 1 && avx2_available();
+        const CO: usize = 4;
+        if vectorised && cout % CO == 0 {
+            y.par_chunks_mut(t_out * CO).enumerate().for_each(|(block, out_block)| {
+                let co0 = block * CO;
+                let mut acc = vec![0.0f32; CO * tn];
+                for ci in 0..cin {
+                    let base = ci * len;
+                    let rows: [&[f32]; CO] = std::array::from_fn(|r| {
+                        let s = (co0 + r) * cin * ks + ci * ks;
+                        &w[s..s + ks]
+                    });
+                    // SAFETY: guarded by `avx2_available()`.
+                    unsafe { conv_block4_avx2(&window[base..base + len], &rows, &mut acc, tn, ks, dilation) };
+                }
+                for r in 0..CO {
+                    let lane = &acc[r * tn..(r + 1) * tn];
+                    let co = co0 + r;
+                    let dst = &mut out_block[r * t_out + t0..r * t_out + t0 + tn];
+                    match residual {
+                        Some(res) => {
+                            for (q, slot) in dst.iter_mut().enumerate() {
+                                *slot = lane[q] + bias[co] + res[co * t_out + t0 + q];
+                            }
+                        }
+                        None => {
+                            for (q, slot) in dst.iter_mut().enumerate() {
+                                *slot = lane[q] + bias[co];
+                            }
+                        }
+                    }
+                }
+            });
+            continue;
+        }
+        // Scalar fallback (strided or unaligned channel counts).
+        for (co, out) in y.chunks_mut(t_out).enumerate().take(cout) {
+            for (q, slot) in out[t0..t0 + tn].iter_mut().enumerate() {
+                let mut sum = bias[co];
+                for ci in 0..cin {
+                    for k in 0..ks {
+                        sum += window[ci * len + q * stride + k * dilation] * w[(co * cin + ci) * ks + k];
+                    }
+                }
+                *slot = sum + residual.map(|r| r[co * t_out + t0 + q]).unwrap_or(0.0);
+            }
+        }
+    }
+}
+
+/// Eight-row stride-1 conv block: one window load feeds eight FMAs.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv_block8_avx2(window: &[f32], w: &[&[f32]; 8], acc: &mut [f32], tn: usize,
+                           ks: usize, dilation: usize) {
+    use std::arch::x86_64::*;
+    let win = window.as_ptr();
+    let acc_ptr = acc.as_mut_ptr();
+    let mut j = 0usize;
+    while j + 8 <= tn {
+        let mut a0 = _mm256_loadu_ps(acc_ptr.add(j));
+        let mut a1 = _mm256_loadu_ps(acc_ptr.add(tn + j));
+        let mut a2 = _mm256_loadu_ps(acc_ptr.add(2 * tn + j));
+        let mut a3 = _mm256_loadu_ps(acc_ptr.add(3 * tn + j));
+        let mut a4 = _mm256_loadu_ps(acc_ptr.add(4 * tn + j));
+        let mut a5 = _mm256_loadu_ps(acc_ptr.add(5 * tn + j));
+        let mut a6 = _mm256_loadu_ps(acc_ptr.add(6 * tn + j));
+        let mut a7 = _mm256_loadu_ps(acc_ptr.add(7 * tn + j));
+        for k in 0..ks {
+            let x = _mm256_loadu_ps(win.add(k * dilation + j));
+            a0 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[0].get_unchecked(k)), a0);
+            a1 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[1].get_unchecked(k)), a1);
+            a2 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[2].get_unchecked(k)), a2);
+            a3 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[3].get_unchecked(k)), a3);
+            a4 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[4].get_unchecked(k)), a4);
+            a5 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[5].get_unchecked(k)), a5);
+            a6 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[6].get_unchecked(k)), a6);
+            a7 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[7].get_unchecked(k)), a7);
+        }
+        _mm256_storeu_ps(acc_ptr.add(j), a0);
+        _mm256_storeu_ps(acc_ptr.add(tn + j), a1);
+        _mm256_storeu_ps(acc_ptr.add(2 * tn + j), a2);
+        _mm256_storeu_ps(acc_ptr.add(3 * tn + j), a3);
+        _mm256_storeu_ps(acc_ptr.add(4 * tn + j), a4);
+        _mm256_storeu_ps(acc_ptr.add(5 * tn + j), a5);
+        _mm256_storeu_ps(acc_ptr.add(6 * tn + j), a6);
+        _mm256_storeu_ps(acc_ptr.add(7 * tn + j), a7);
+        j += 8;
+    }
+    while j < tn {
+        for r in 0..8 {
+            let mut sum = *acc_ptr.add(r * tn + j);
+            for k in 0..ks {
+                sum += *win.add(k * dilation + j) * *w[r].get_unchecked(k);
+            }
+            *acc_ptr.add(r * tn + j) = sum;
+        }
+        j += 1;
+    }
 }
