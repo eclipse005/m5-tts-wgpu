@@ -47,6 +47,12 @@ fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Re
 fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) -> Result<Tensor> {
     let dev = codec.device();
     let [cin, frames] = x.shape();
+    let profile = std::env::var("M5_PROFILE_DEEP").is_ok();
+    let mut phase = std::time::Instant::now();
+    let lap = |name: &str, phase: &mut std::time::Instant| {
+        if profile { eprintln!("        {name}: {:.3}s", phase.elapsed().as_secs_f64()); }
+        *phase = std::time::Instant::now();
+    };
     let cout = cin / 2;
 
     let alpha = codec.vector(&format!("{prefix}.block.0.alpha"), cin)?;
@@ -59,9 +65,11 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     let bias = codec.vector(&format!("{prefix}.block.1.conv.bias"), cout)?;
     let mut up = dev.zeros([cout, frames * upsample_rate])?;
     ops::conv_transpose1d(dev, &h, &weight, &bias, &mut up, ks, upsample_rate)?;
+    lap("transposed conv", &mut phase);
 
     for (unit, dilation) in [(2usize, 1usize), (3, 3), (4, 9)] {
         up = residual_unit(codec, &up, &format!("{prefix}.block.{unit}"), dilation)?;
+        lap(&format!("residual unit (dilation {dilation})"), &mut phase);
     }
     Ok(up)
 }
@@ -90,9 +98,16 @@ impl Codec {
         if let Some(t) = trace.as_deref_mut() {
             t.push(("conv0".to_string(), self.device().copy(&h)?));
         }
+        let profile = std::env::var("M5_PROFILE").is_ok();
+        let mut phase = std::time::Instant::now();
         for (index, rate) in cfg.upsample_rates.iter().enumerate() {
             let prefix = format!("decoder.decoder.{}", index + 1);
             h = decoder_block(self, &h, &prefix, *rate)?;
+            if profile {
+                eprintln!("      block{} ({}ch -> {:.0}k samples): {:.3}s", index + 1, h.shape()[0],
+                          h.shape()[1] as f64 / 1e3, phase.elapsed().as_secs_f64());
+                phase = std::time::Instant::now();
+            }
             if let Some(t) = trace.as_deref_mut() {
                 t.push((format!("block{}", index + 1), self.device().copy(&h)?));
             }
@@ -104,8 +119,10 @@ impl Codec {
         if let Some(t) = trace.as_deref_mut() {
             t.push(("snake".to_string(), self.device().copy(&h)?));
         }
+        if profile { eprintln!("      final snake: {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let mut pcm = causal_conv(self, &h, "decoder.decoder.6.conv.weight",
                                   "decoder.decoder.6.conv.bias", 1, 7, 1)?;
+        if profile { eprintln!("      final conv: {:.3}s", phase.elapsed().as_secs_f64()); }
 
         // `wav.clamp(min=-1, max=1)`: the reference's own saturation, which is also
         // where its occasional click comes from.
@@ -121,17 +138,25 @@ impl Codec {
     pub fn decoder(&self, codes: &[u32], frames: usize) -> Result<Tensor> {
         let dev = self.device();
         let cfg = &self.cfg;
+        let profile = std::env::var("M5_PROFILE").is_ok();
+        let mut phase = std::time::Instant::now();
 
         let quantized = self.dequantize(codes, frames)?; // [codebook_dim, frames]
+        if profile { eprintln!("    quantise {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let h = causal_conv(self, &quantized, "decoder.pre_conv.conv.weight",
                                 "decoder.pre_conv.conv.bias", cfg.latent_dim, 3, 1)?;
 
         let mut time_major = dev.zeros([frames, cfg.latent_dim])?;
         ops::transpose(dev, &h, &mut time_major)?;
+        if profile { eprintln!("    pre_conv {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let transformed = self.transformer(&time_major)?;
+        if profile { eprintln!("    pre_transformer {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let mut channels_major = dev.zeros([cfg.latent_dim, frames])?;
         ops::transpose(dev, &transformed, &mut channels_major)?;
         let upsampled = self.upsample(&channels_major)?;
-        self.seanet(&upsampled)
+        if profile { eprintln!("    upsample {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        let pcm = self.seanet(&upsampled)?;
+        if profile { eprintln!("    seanet {:.3}s", phase.elapsed().as_secs_f64()); }
+        Ok(pcm)
     }
 }
