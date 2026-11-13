@@ -10,21 +10,22 @@ use anyhow::Result;
 
 use super::Codec;
 use crate::device::{Device, Tensor};
+use std::rc::Rc;
 use crate::ops;
 
 /// One transformer layer's weights, resolved once per decode.
 struct LayerWeights {
-    input_norm: Tensor,
-    post_norm: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    o: Tensor,
-    attn_scale: Tensor,
-    gate: Tensor,
-    up: Tensor,
-    down: Tensor,
-    mlp_scale: Tensor,
+    input_norm: Rc<Tensor>,
+    post_norm: Rc<Tensor>,
+    q: Rc<Tensor>,
+    k: Rc<Tensor>,
+    v: Rc<Tensor>,
+    o: Rc<Tensor>,
+    attn_scale: Rc<Tensor>,
+    gate: Rc<Tensor>,
+    up: Rc<Tensor>,
+    down: Rc<Tensor>,
+    mlp_scale: Rc<Tensor>,
 }
 
 fn layer_weights(codec: &Codec, index: usize) -> Result<LayerWeights> {

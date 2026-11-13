@@ -98,20 +98,22 @@ pub fn conv1d(dev: &Device, x: &Tensor, w: &Tensor, bias: &Tensor, y: &mut Tenso
     Ok(())
 }
 
-/// SnakeBeta in place.
-pub fn snake_beta(dev: &Device, x: &mut Tensor, alpha: &Tensor, beta: &Tensor) -> Result<()> {
+/// SnakeBeta, out of place: the activation runs on an owned copy so callers keep
+/// their input intact (in-place on a shared GPU buffer is a silent aliasing bug).
+pub fn snake_beta(dev: &Device, x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
     let [channels, time] = x.shape();
     expect("snake alpha", alpha.shape(), [channels, 1])?;
     expect("snake beta", beta.shape(), [channels, 1])?;
+    let mut out = dev.copy(x)?;
     match dev {
         Device::Gpu(gpu) => {
-            gpu_ops::snake_beta(gpu, x.gpu_buffer()?, alpha.gpu_buffer()?, beta.gpu_buffer()?, channels, time);
+            gpu_ops::snake_beta(gpu, out.gpu_buffer()?, alpha.gpu_buffer()?, beta.gpu_buffer()?, channels, time);
         }
         Device::Cpu => {
-            cpu_ops::snake_beta(x.cpu_slice_mut()?, alpha.cpu_slice()?, beta.cpu_slice()?, channels, time);
+            cpu_ops::snake_beta(out.cpu_slice_mut()?, alpha.cpu_slice()?, beta.cpu_slice()?, channels, time);
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// `y = a + b`.

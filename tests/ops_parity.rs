@@ -297,3 +297,88 @@ fn conv_transpose_matches_between_backends() {
         assert_close(&format!("conv_transpose ks={ks} stride={rate}"), &want, &gpu.read(&got).unwrap());
     }
 }
+
+#[test]
+fn seanet_shapes_match_between_backends() {
+    let Some(gpu) = gpu() else { return };
+    // The exact op shapes the SEANet tail uses, at a small time extent so the
+    // test stays fast; a shape/layout bug shows up regardless of length.
+    let cpu = Device::Cpu;
+
+    // depthwise 96 channels, k=7 causal
+    let (c, t) = (96usize, 64usize);
+    let x = tensor(&cpu, [c, t], 51);
+    let w = tensor(&cpu, [c, 7], 52);
+    let b = tensor(&cpu, [c, 1], 53);
+    let mut want = cpu.zeros([c, t]).unwrap();
+    ops::conv1d_depthwise(&cpu, &x, &w, &b, &mut want, 7, 6).unwrap();
+    let want = cpu.read(&want).unwrap();
+    let mut got = gpu.zeros([c, t]).unwrap();
+    ops::conv1d_depthwise(&gpu, &gpu.tensor([c, t], &cpu.read(&x).unwrap()).unwrap(),
+                          &gpu.tensor([c, 7], &cpu.read(&w).unwrap()).unwrap(),
+                          &gpu.tensor([c, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, 7, 6).unwrap();
+    assert_close("depthwise c=96", &want, &gpu.read(&got).unwrap());
+
+    // dilated conv1d 96 -> 96, k=7, dilation 9
+    let dil = 9usize;
+    let p = Conv1d::causal(c, c, 7, t).dilated(dil);
+    let w = tensor(&cpu, [c, c * 7], 54);
+    let b = tensor(&cpu, [c, 1], 55);
+    let mut want = cpu.zeros([c, t]).unwrap();
+    ops::conv1d(&cpu, &x, &w, &b, &mut want, &p).unwrap();
+    let want = cpu.read(&want).unwrap();
+    let mut got = gpu.zeros([c, t]).unwrap();
+    ops::conv1d(&gpu, &gpu.tensor([c, t], &cpu.read(&x).unwrap()).unwrap(),
+                &gpu.tensor([c, c * 7], &cpu.read(&w).unwrap()).unwrap(),
+                &gpu.tensor([c, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, &p).unwrap();
+    assert_close("conv1d 96x96 dil=9", &want, &gpu.read(&got).unwrap());
+
+    // mono output conv: 96 -> 1
+    let p = Conv1d::causal(c, 1, 7, t);
+    let w = tensor(&cpu, [1, c * 7], 56);
+    let b = tensor(&cpu, [1, 1], 57);
+    let mut want = cpu.zeros([1, t]).unwrap();
+    ops::conv1d(&cpu, &x, &w, &b, &mut want, &p).unwrap();
+    let want = cpu.read(&want).unwrap();
+    let mut got = gpu.zeros([1, t]).unwrap();
+    ops::conv1d(&gpu, &gpu.tensor([c, t], &cpu.read(&x).unwrap()).unwrap(),
+                &gpu.tensor([1, c * 7], &cpu.read(&w).unwrap()).unwrap(),
+                &gpu.tensor([1, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, &p).unwrap();
+    assert_close("conv1d 96->1", &want, &gpu.read(&got).unwrap());
+
+    // wide conv: 1536 -> 768, k=7
+    let (cin, cout, t) = (192usize, 96usize, 32usize);
+    let x = tensor(&cpu, [cin, t], 58);
+    let p = Conv1d::causal(cin, cout, 7, t);
+    let w = tensor(&cpu, [cout, cin * 7], 59);
+    let b = tensor(&cpu, [cout, 1], 60);
+    let mut want = cpu.zeros([cout, t]).unwrap();
+    ops::conv1d(&cpu, &x, &w, &b, &mut want, &p).unwrap();
+    let want = cpu.read(&want).unwrap();
+    let mut got = gpu.zeros([cout, t]).unwrap();
+    ops::conv1d(&gpu, &gpu.tensor([cin, t], &cpu.read(&x).unwrap()).unwrap(),
+                &gpu.tensor([cout, cin * 7], &cpu.read(&w).unwrap()).unwrap(),
+                &gpu.tensor([cout, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, &p).unwrap();
+    assert_close("conv1d 192->96", &want, &gpu.read(&got).unwrap());
+}
+
+#[test]
+fn conv1d_matches_at_seanet_prime_shape() {
+    let Some(gpu) = gpu() else { return };
+    // decoder.decoder.0: 1024 -> 1536, k=7, 32 frames (8 codec frames upsampled x4).
+    let (cin, cout, ks, t) = (1024usize, 1536usize, 7usize, 32usize);
+    let cpu = Device::Cpu;
+    let x = tensor(&cpu, [cin, t], 71);
+    let w = tensor(&cpu, [cout, cin * ks], 72);
+    let b = tensor(&cpu, [cout, 1], 73);
+    let p = Conv1d::causal(cin, cout, ks, t);
+    let mut want = cpu.zeros([cout, t]).unwrap();
+    ops::conv1d(&cpu, &x, &w, &b, &mut want, &p).unwrap();
+    let want = cpu.read(&want).unwrap();
+
+    let mut got = gpu.zeros([cout, t]).unwrap();
+    ops::conv1d(&gpu, &gpu.tensor([cin, t], &cpu.read(&x).unwrap()).unwrap(),
+                &gpu.tensor([cout, cin * ks], &cpu.read(&w).unwrap()).unwrap(),
+                &gpu.tensor([cout, 1], &cpu.read(&b).unwrap()).unwrap(), &mut got, &p).unwrap();
+    assert_close("conv1d 1024->1536", &want, &gpu.read(&got).unwrap());
+}

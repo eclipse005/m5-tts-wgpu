@@ -107,6 +107,42 @@
     15360
    ]
   },
+  "codec_quantized_short": {
+   "file": "codec_quantized_short.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    512,
+    8
+   ]
+  },
+  "codec_pre_conv_short": {
+   "file": "codec_pre_conv_short.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    8,
+    1024
+   ]
+  },
+  "codec_transformer_short": {
+   "file": "codec_transformer_short.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    8,
+    1024
+   ]
+  },
+  "codec_upsample_short": {
+   "file": "codec_upsample_short.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    1024,
+    32
+   ]
+  },
   "final_audio": {
    "file": "final_audio.bin",
    "dtype": "float32",

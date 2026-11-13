@@ -171,3 +171,10 @@ pub fn gelu(gpu: &Gpu, x: &Buffer, len: usize) {
     gpu.dispatch("gelu_f32", shaders::GELU_F32, "main",
                  &[(0, x), (1, &params)], grid(len));
 }
+
+/// `y = x`.
+pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
+    let params = gpu.upload_u32("copy.params", &[len as u32]);
+    gpu.dispatch("copy_f32", shaders::COPY_F32, "main",
+                 &[(0, x), (1, y), (2, &params)], grid(len));
+}

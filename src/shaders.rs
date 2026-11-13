@@ -496,3 +496,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     x[i] = 0.5 * v * (1.0 + erf_approx(v * 0.70710678));
 }
 "#;
+
+/// `y = x`, used by [`crate::device::Device::copy`].
+pub const COPY_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 1>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0]) { return; }
+    y[i] = x[i];
+}
+"#;

@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::path::Path;
 
 use crate::device::{Device, Tensor};
@@ -71,7 +72,7 @@ pub struct Codec {
     weights: Weights,
     /// Device tensors are created once per name; the SEANet stack alone is ~450
     /// tensors per decode otherwise.
-    cache: RefCell<HashMap<String, Tensor>>,
+    cache: RefCell<HashMap<String, Rc<Tensor>>>,
 }
 
 impl Codec {
@@ -96,7 +97,10 @@ impl Codec {
     }
 
     /// Device tensor for `name`, validated against `shape` (row-major).
-    pub fn tensor(&self, name: &str, shape: [usize; 2]) -> Result<Tensor> {
+    ///
+    /// Handed out behind `Rc` because weights are read-only and shared; copying an
+    /// 11M-float conv weight per call would dominate everything else.
+    pub fn tensor(&self, name: &str, shape: [usize; 2]) -> Result<Rc<Tensor>> {
         if let Some(t) = self.cache.borrow().get(name) {
             if t.shape() != shape {
                 bail!("{name}: cached shape {:?} != {shape:?}", t.shape());
@@ -107,13 +111,13 @@ impl Codec {
         if entry.shape.iter().product::<usize>() != shape[0] * shape[1] {
             bail!("{name}: checkpoint shape {:?} does not flatten to {shape:?}", entry.shape);
         }
-        let tensor = self.dev.tensor(shape, &entry.to_f32()?)?;
+        let tensor = Rc::new(self.dev.tensor(shape, &entry.to_f32()?)?);
         self.cache.borrow_mut().insert(name.to_string(), tensor.clone());
         Ok(tensor)
     }
 
     /// 1-D parameter as a `[len, 1]` tensor (kernels take 2-D shapes).
-    pub fn vector(&self, name: &str, len: usize) -> Result<Tensor> {
+    pub fn vector(&self, name: &str, len: usize) -> Result<Rc<Tensor>> {
         self.tensor(name, [len, 1])
     }
 
@@ -121,7 +125,7 @@ impl Codec {
     ///
     /// `rvq_rest` stores one tensor per codebook; concatenating them on the host
     /// keeps a decode at one bind group per group instead of fifteen.
-    pub fn acoustic_tables(&self) -> Result<(Tensor, Tensor)> {
+    pub fn acoustic_tables(&self) -> Result<(Rc<Tensor>, Rc<Tensor>)> {
         let cfg = &self.cfg;
         let rest = cfg.num_quantizers - 1;
         let dim = cfg.codebook_dim / 2;
@@ -143,8 +147,8 @@ impl Codec {
             let start = k * cfg.codebook_size;
             usage[start..start + cfg.codebook_size].copy_from_slice(&self.dev.read(&u)?);
         }
-        let tables = self.dev.tensor([rest * cfg.codebook_size, dim], &tables)?;
-        let usage = self.dev.tensor([rest * cfg.codebook_size, 1], &usage)?;
+        let tables = Rc::new(self.dev.tensor([rest * cfg.codebook_size, dim], &tables)?);
+        let usage = Rc::new(self.dev.tensor([rest * cfg.codebook_size, 1], &usage)?);
         self.cache.borrow_mut().insert("rvq_rest.tables".into(), tables.clone());
         self.cache.borrow_mut().insert("rvq_rest.usage".into(), usage.clone());
         Ok((tables, usage))
@@ -154,7 +158,7 @@ impl Codec {
     /// transformer. Returns `[frames, latent_dim]` (time-major), which is the
     /// layout `pre_transformer` consumes.
     pub fn pre_transformer_input(&self, codes: &[u32], frames: usize) -> Result<Tensor> {
-        let mut quantized = quantizer::dequantize(self, codes, frames)?; // [codebook_dim, frames]
+        let quantized = quantizer::dequantize(self, codes, frames)?; // [codebook_dim, frames]
         let cfg = &self.cfg;
         let mut projected = self.dev.zeros([cfg.latent_dim, frames])?;
         let weight = self.tensor("decoder.pre_conv.conv.weight", [cfg.latent_dim, cfg.codebook_dim * 3])?;
@@ -163,7 +167,6 @@ impl Codec {
         ops::conv1d(&self.dev, &quantized, &weight, &bias, &mut projected, &conv)?;
         let mut time_major = self.dev.zeros([frames, cfg.latent_dim])?;
         ops::transpose(&self.dev, &projected, &mut time_major)?;
-        quantized = time_major.clone();
         Ok(time_major)
     }
 }

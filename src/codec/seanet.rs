@@ -27,16 +27,15 @@ fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Re
     let dev: &Device = codec.device();
     let channels = x.shape()[0];
 
-    let mut h = x.clone();
     let alpha = codec.vector(&format!("{prefix}.act1.alpha"), channels)?;
     let beta = codec.vector(&format!("{prefix}.act1.beta"), channels)?;
-    ops::snake_beta(dev, &mut h, &alpha, &beta)?;
-    let mut h3 = causal_conv(codec, &h, &format!("{prefix}.conv1.conv.weight"),
-                             &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation)?;
+    let h = ops::snake_beta(dev, x, &alpha, &beta)?;
+    let h3 = causal_conv(codec, &h, &format!("{prefix}.conv1.conv.weight"),
+                         &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation)?;
     let alpha2 = codec.vector(&format!("{prefix}.act2.alpha"), channels)?;
     let beta2 = codec.vector(&format!("{prefix}.act2.beta"), channels)?;
-    ops::snake_beta(dev, &mut h3, &alpha2, &beta2)?;
-    let out = causal_conv(codec, &h3, &format!("{prefix}.conv2.conv.weight"),
+    let h4 = ops::snake_beta(dev, &h3, &alpha2, &beta2)?;
+    let out = causal_conv(codec, &h4, &format!("{prefix}.conv2.conv.weight"),
                           &format!("{prefix}.conv2.conv.bias"), channels, 1, 1)?;
 
     let mut sum = dev.zeros(x.shape())?;
@@ -50,10 +49,9 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     let [cin, frames] = x.shape();
     let cout = cin / 2;
 
-    let mut h = x.clone();
     let alpha = codec.vector(&format!("{prefix}.block.0.alpha"), cin)?;
     let beta = codec.vector(&format!("{prefix}.block.0.beta"), cin)?;
-    ops::snake_beta(dev, &mut h, &alpha, &beta)?;
+    let h = ops::snake_beta(dev, x, &alpha, &beta)?;
 
     // CausalTransConvNet(cin, cout, kernel=2*rate, stride=rate), trimmed to frames*rate.
     let ks = 2 * upsample_rate;
@@ -74,17 +72,38 @@ impl Codec {
     /// Split out so the tests can drive it with a fixed input and bisect GPU/CPU
     /// differences without re-running the whole decode.
     pub fn seanet(&self, upsampled: &Tensor) -> Result<Tensor> {
+        self.seanet_impl(upsampled, None)
+    }
+
+    /// Same computation, but returns each stage's output so a GPU/CPU divergence
+    /// can be localised instead of guessed at.
+    pub fn seanet_trace(&self, upsampled: &Tensor) -> Result<(Tensor, Vec<(String, Tensor)>)> {
+        let mut trace = Vec::new();
+        let pcm = self.seanet_impl(upsampled, Some(&mut trace))?;
+        Ok((pcm, trace))
+    }
+
+    fn seanet_impl(&self, upsampled: &Tensor, mut trace: Option<&mut Vec<(String, Tensor)>>) -> Result<Tensor> {
         let cfg = &self.cfg;
         let mut h = causal_conv(self, upsampled, "decoder.decoder.0.conv.weight",
                                 "decoder.decoder.0.conv.bias", cfg.decoder_dim, 7, 1)?;
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(("conv0".to_string(), self.device().copy(&h)?));
+        }
         for (index, rate) in cfg.upsample_rates.iter().enumerate() {
             let prefix = format!("decoder.decoder.{}", index + 1);
             h = decoder_block(self, &h, &prefix, *rate)?;
+            if let Some(t) = trace.as_deref_mut() {
+                t.push((format!("block{}", index + 1), self.device().copy(&h)?));
+            }
         }
         let channels = h.shape()[0];
         let alpha = self.vector("decoder.decoder.5.alpha", channels)?;
         let beta = self.vector("decoder.decoder.5.beta", channels)?;
-        ops::snake_beta(self.device(), &mut h, &alpha, &beta)?;
+        h = ops::snake_beta(self.device(), &h, &alpha, &beta)?;
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(("snake".to_string(), self.device().copy(&h)?));
+        }
         let mut pcm = causal_conv(self, &h, "decoder.decoder.6.conv.weight",
                                   "decoder.decoder.6.conv.bias", 1, 7, 1)?;
 
@@ -104,7 +123,7 @@ impl Codec {
         let cfg = &self.cfg;
 
         let quantized = self.dequantize(codes, frames)?; // [codebook_dim, frames]
-        let mut h = causal_conv(self, &quantized, "decoder.pre_conv.conv.weight",
+        let h = causal_conv(self, &quantized, "decoder.pre_conv.conv.weight",
                                 "decoder.pre_conv.conv.bias", cfg.latent_dim, 3, 1)?;
 
         let mut time_major = dev.zeros([frames, cfg.latent_dim])?;

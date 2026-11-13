@@ -14,7 +14,7 @@ impl Codec {
     /// `[latent, frames]` -> `[latent, frames * product(upsampling_ratios)]`.
     pub fn upsample(&self, x: &Tensor) -> Result<Tensor> {
         let dev = self.device();
-        let mut hidden = x.clone();
+        let mut hidden = dev.copy(x)?;
         for (stage, factor) in self.cfg.upsampling_ratios.iter().enumerate() {
             let prefix = format!("decoder.upsample.{stage}");
             let [channels, frames] = hidden.shape();

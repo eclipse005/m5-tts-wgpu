@@ -83,6 +83,19 @@ impl Device {
         }
     }
 
+    /// Explicit tensor copy (device-to-device on the GPU, `Vec` clone on the CPU).
+    pub fn copy(&self, tensor: &Tensor) -> Result<Tensor> {
+        let mut out = self.zeros(tensor.shape())?;
+        match (self, tensor, &mut out) {
+            (Device::Gpu(gpu), Tensor::Gpu(src, shape), Tensor::Gpu(dst, _)) => {
+                crate::gpu_ops::copy(gpu, src, dst, shape[0] * shape[1]);
+            }
+            (Device::Cpu, Tensor::Cpu(src, _), Tensor::Cpu(dst, _)) => dst.copy_from_slice(src),
+            _ => bail!("copy across devices"),
+        }
+        Ok(out)
+    }
+
     pub fn gpu(&self) -> Result<&Gpu> {
         match self {
             Device::Gpu(gpu) => Ok(gpu),
@@ -93,7 +106,10 @@ impl Device {
 
 /// A 2-D activation. Rows/columns mean whatever the stage says (channels x time
 /// for the codec, tokens x hidden for the LM).
-#[derive(Clone)]
+///
+/// Deliberately **not** `Clone`: on the GPU the payload is a buffer handle, so a
+/// derived clone would alias device memory and an "in-place" op would silently
+/// overwrite its caller's tensor. Use [`Device::copy`] instead.
 pub enum Tensor {
     Gpu(wgpu::Buffer, [usize; 2]),
     Cpu(Vec<f32>, [usize; 2]),

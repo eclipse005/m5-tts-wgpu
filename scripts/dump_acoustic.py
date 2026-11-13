@@ -159,6 +159,17 @@ def main():
     # Windows TDR watchdog on the full 109 440-sample tail, so the GPU pipeline is
     # gated on a short slice as well.
     short = codes[:8]
+    # Stage replay for the short slice (the GPU path is bisected on these).
+    with torch.inference_mode():
+        q_short = codec.quantizer.decode(torch.from_numpy(short).long().T[None])
+        pre_short = codec.pre_conv(q_short).transpose(1, 2)
+        tr_short = codec.pre_transformer(inputs_embeds=pre_short).last_hidden_state
+        up_short = tr_short.permute(0, 2, 1)
+        for blocks in codec.upsample:
+            for block in blocks:
+                up_short = block(up_short)
+    short_stages = {"codec_quantized_short": q_short, "codec_pre_conv_short": pre_short,
+                    "codec_transformer_short": tr_short, "codec_upsample_short": up_short}
     wavs_short, _ = gen._audio_tokenizer.decode({"audio_codes": [torch.from_numpy(short).long()]})
     pcm_short = np.asarray(wavs_short[0], dtype=np.float32).reshape(-1)
 
@@ -176,6 +187,7 @@ def main():
             "pcm": save("pcm", pcm, out),
             "codes_short": save("codes_short", short, out),
             "pcm_short": save("pcm_short", pcm_short, out),
+            **{k: save(k, v.detach().float().numpy(), out) for k, v in short_stages.items()},
             "final_audio": save("final_audio", audio.numpy(), out),
             "codec_quantized": save("codec_quantized", stage["quantized"].numpy(), out),
             "codec_pre_conv": save("codec_pre_conv", stage["pre_conv"].numpy(), out),
