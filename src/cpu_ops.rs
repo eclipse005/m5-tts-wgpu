@@ -795,3 +795,216 @@ mod perf_tests {
         assert!(elapsed < 5.0, "fused gemv took {elapsed:.1} ms");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Channels-last convolution (the general design, not a per-layer patch)
+//
+// oneDNN and every fast conv engine work channels-last because it makes the
+// reduction axis contiguous: for one output element the (tap, channel) pairs are
+// adjacent in memory, so the inner loop is a plain SIMD FMA chain. In `[C, T]`
+// layout every tap is a separate strided stream and the weights get re-walked per
+// output channel, which is why the channels-first kernel sat at ~60 GFLOP/s.
+//
+// Weights are packed once at load as `[(tap * cin + ci) * cout + co]`, so for a
+// fixed reduction index the `cout` values are contiguous.
+// ---------------------------------------------------------------------------
+
+/// Pack `[cout, cin, ks]` weights into the channels-last GEMM layout
+/// `[tap * cin + ci][co]`, adding the bias later (biases stay separate).
+pub fn pack_conv_weights(w: &[f32], cout: usize, cin: usize, ks: usize) -> Vec<f32> {
+    let mut packed = vec![0.0f32; ks * cin * cout];
+    for co in 0..cout {
+        for ci in 0..cin {
+            for tap in 0..ks {
+                packed[(tap * cin + ci) * cout + co] = w[(co * cin + ci) * ks + tap];
+            }
+        }
+    }
+    packed
+}
+
+/// Pack `[cin, cout, ks]` weights (PyTorch's `ConvTranspose1d` layout) into the
+/// same `[tap * cin + ci][co]` matrix the forward conv uses.
+pub fn pack_conv_transpose_weights(w: &[f32], cin: usize, cout: usize, ks: usize) -> Vec<f32> {
+    let mut packed = vec![0.0f32; ks * cin * cout];
+    for ci in 0..cin {
+        for co in 0..cout {
+            for tap in 0..ks {
+                packed[(tap * cin + ci) * cout + co] = w[(ci * cout + co) * ks + tap];
+            }
+        }
+    }
+    packed
+}
+
+/// Channels-last causal conv1d.
+///
+/// `x` is `[t_in, cin]`, `y` is `[t_out, cout]`, `w` is the packed weight matrix
+/// from [`pack_conv_weights`]. One thread owns one timestep and eight output
+/// channels, so the reduction is a broadcast-plus-FMA chain: `x[t, ci]` is a
+/// scalar, the next eight weights are one contiguous vector load, and the
+/// accumulator stays in a register for the whole reduction.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_channels_last(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+                            cin: usize, cout: usize, ks: usize, dilation: usize, stride: usize,
+                            pad: usize, t_in: usize, t_out: usize) {
+    debug_assert_eq!(w.len(), ks * cin * cout);
+    debug_assert_eq!(y.len(), t_out * cout);
+    let blocks = cout / 8;
+    let vectorised = avx2_available() && cout % 8 == 0;
+    if vectorised {
+        // One task per timestep; inside, the eight-channel blocks are independent.
+        y.par_chunks_mut(cout).enumerate().take(t_out).for_each(|(t, row)| {
+            // SAFETY: guarded by `avx2_available()`; `row` is `cout` floats and the
+            // weight matrix is fully bounds-checked by construction.
+            unsafe { conv_row_avx2(x, w, bias, row, cin, cout, blocks, ks, dilation, stride, pad, t_in, t) };
+        });
+        return;
+    }
+    for (t, row) in y.chunks_mut(cout).enumerate().take(t_out) {
+        for (co, slot) in row.iter_mut().enumerate() {
+            let mut acc = bias[co];
+            for tap in 0..ks {
+                let src = (t * stride + tap * dilation) as isize - pad as isize;
+                if src < 0 || (src as usize) >= t_in {
+                    continue;
+                }
+                let xrow = &x[src as usize * cin..(src as usize + 1) * cin];
+                let wbase = tap * cin * cout;
+                for ci in 0..cin {
+                    acc += xrow[ci] * w[wbase + ci * cout + co];
+                }
+            }
+            *slot = acc;
+        }
+    }
+}
+
+/// One timestep of [`conv1d_channels_last`], eight output channels per FMA.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
+                        cin: usize, cout: usize, blocks: usize, ks: usize, dilation: usize,
+                        stride: usize, pad: usize, t_in: usize, t: usize) {
+    use std::arch::x86_64::*;
+    for block in 0..blocks {
+        let co = block * 8;
+        let mut acc = if !bias.is_empty() {
+            _mm256_loadu_ps(bias.as_ptr().add(co))
+        } else {
+            _mm256_setzero_ps()
+        };
+        for tap in 0..ks {
+            let src = (t * stride + tap * dilation) as isize - pad as isize;
+            if src < 0 || (src as usize) >= t_in {
+                continue;
+            }
+            let xrow = x.as_ptr().add(src as usize * cin);
+            let wbase = tap * cin * cout + co;
+            for ci in 0..cin {
+                let a = _mm256_set1_ps(*xrow.add(ci));
+                let wv = _mm256_loadu_ps(w.as_ptr().add(wbase + ci * cout));
+                acc = _mm256_fmadd_ps(a, wv, acc);
+            }
+        }
+        _mm256_storeu_ps(row.as_mut_ptr().add(co), acc);
+    }
+}
+
+/// SnakeBeta on channels-last activations (`[t, channels]`).
+pub fn snake_beta_channels_last(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize) {
+    let a: Vec<f32> = alpha.iter().map(|v| v.exp()).collect();
+    let b: Vec<f32> = beta.iter().map(|v| v.exp() + 1e-9).collect();
+    let body = |block: &mut [f32]| {
+        for (i, v) in block.iter_mut().enumerate() {
+            let c = i % channels;
+            let s = (*v * a[c]).sin();
+            *v += s * s / b[c];
+        }
+    };
+    if wide_enough(x.len()) {
+        // Chunk by rows-in-bulk, not by single rows: 182k one-row tasks cost more
+        // in scheduling than the sine work itself.
+        x.par_chunks_mut(channels * 64).for_each(body);
+    } else {
+        x.chunks_mut(channels * 64).for_each(body);
+    }
+}
+
+/// Transposed conv1d on channels-last activations.
+///
+/// `y[q*stride + r, co]` gets `sum_m x[q - m, ci] * w[(r + m*stride) * cin + ci][co]`.
+/// One thread owns one output timestep and eight channels, so the reduction is the
+/// same broadcast-plus-vector-FMA chain the forward conv uses.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose1d_channels_last(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+                                      cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
+    debug_assert_eq!(w.len(), ks * cin * cout);
+    let t_out = t_in * stride;
+    debug_assert_eq!(y.len(), t_out * cout);
+    if avx2_available() && cout % 8 == 0 {
+        y.par_chunks_mut(cout).enumerate().take(t_out).for_each(|(j, row)| {
+            // SAFETY: guarded by `avx2_available()`.
+            unsafe { transpose_row_avx2(x, w, bias, row, cin, cout, ks, stride, t_in, j) };
+        });
+        return;
+    }
+    for (j, row) in y.chunks_mut(cout).enumerate().take(t_out) {
+        let q = j / stride;
+        let r = j % stride;
+        for (co, slot) in row.iter_mut().enumerate() {
+            let mut acc = bias[co];
+            let mut tap = 0usize;
+            let mut k = r;
+            while k < ks {
+                if q >= tap {
+                    let xrow = &x[(q - tap) * cin..(q - tap + 1) * cin];
+                    let wbase = k * cin * cout;
+                    for ci in 0..cin {
+                        acc += xrow[ci] * w[wbase + ci * cout + co];
+                    }
+                }
+                tap += 1;
+                k += stride;
+            }
+            *slot = acc;
+        }
+    }
+}
+
+/// One output timestep of [`conv_transpose1d_channels_last`], eight channels per FMA.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn transpose_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
+                             cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize,
+                             j: usize) {
+    use std::arch::x86_64::*;
+    let q = j / stride;
+    let r = j % stride;
+    let _ = t_in;
+    for co in (0..cout).step_by(8) {
+        let mut acc = if !bias.is_empty() {
+            _mm256_loadu_ps(bias.as_ptr().add(co))
+        } else {
+            _mm256_setzero_ps()
+        };
+        let mut tap = 0usize;
+        let mut k = r;
+        while k < ks {
+            if q >= tap {
+                let xrow = x.as_ptr().add((q - tap) * cin);
+                let wbase = k * cin * cout + co;
+                for ci in 0..cin {
+                    let a = _mm256_set1_ps(*xrow.add(ci));
+                    let wv = _mm256_loadu_ps(w.as_ptr().add(wbase + ci * cout));
+                    acc = _mm256_fmadd_ps(a, wv, acc);
+                }
+            }
+            tap += 1;
+            k += stride;
+        }
+        _mm256_storeu_ps(row.as_mut_ptr().add(co), acc);
+    }
+}

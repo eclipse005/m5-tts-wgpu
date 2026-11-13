@@ -155,6 +155,12 @@ impl Codec {
         ops::transpose(dev, &transformed, &mut channels_major)?;
         let upsampled = self.upsample(&channels_major)?;
         if profile { eprintln!("    upsample {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        // Channels-first stays. A channels-last rewrite (seanet_cl, same math,
+        // SNR 112 dB) measures 2.66 s against 2.03 s here on the same input: at
+        // these sizes the tail is DRAM-bound, so the better arithmetic intensity of
+        // the channels-last kernels does not survive the streaming. See
+        // examples/seanet_cl_check.rs. Cutting traffic (fusing snake/residual into
+        // the convolution) is the lever that matters, not the layout.
         let pcm = self.seanet(&upsampled)?;
         if profile { eprintln!("    seanet {:.3}s", phase.elapsed().as_secs_f64()); }
         Ok(pcm)

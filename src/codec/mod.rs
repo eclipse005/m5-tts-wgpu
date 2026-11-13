@@ -11,6 +11,7 @@
 pub mod encoder;
 pub mod quantizer;
 pub mod seanet;
+pub mod seanet_cl;
 pub mod transformer;
 pub mod upsample;
 
@@ -149,6 +150,11 @@ impl Codec {
     /// RoPE theta of the encoder transformer (plain frequencies, no scaling).
     pub fn encoder_rope_theta(&self) -> f64 {
         self.enc.rope_theta
+    }
+
+    /// Weight cache, exposed so stage modules can memoise packed weights.
+    pub(crate) fn cache_ref(&self) -> &RefCell<HashMap<String, Rc<Tensor>>> {
+        &self.cache
     }
 
     pub fn device(&self) -> &Device {

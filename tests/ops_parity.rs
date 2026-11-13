@@ -413,3 +413,43 @@ fn gpu_sampler_matches_cpu_sampler() {
         assert_eq!(got[0], want, "sampler mismatch (seed {seed})");
     }
 }
+
+#[test]
+fn channels_last_conv_matches_channels_first() {
+    // Same math, two layouts: the packed channels-last GEMM must reproduce the
+    // reference conv exactly (this is what the codec will run on).
+    use m5_tts_wgpu::cpu_ops;
+    for (cin, cout, ks, dilation, stride, t_in) in
+        [(96usize, 96usize, 7usize, 1usize, 1usize, 37usize),
+         (192, 96, 7, 9, 1, 29),
+         (64, 128, 8, 1, 4, 64),
+         (33, 41, 3, 2, 1, 17)]
+    {
+        let pad = (ks - 1) * dilation;
+        let t_out = if stride == 1 { t_in } else { t_in.div_ceil(stride) };
+        let x_cl = rand_vec(t_in * cin, 71);
+        let w = rand_vec(cout * cin * ks, 72);
+        let b = rand_vec(cout, 73);
+        let packed = cpu_ops::pack_conv_weights(&w, cout, cin, ks);
+        let mut y_cl = vec![0.0f32; t_out * cout];
+        cpu_ops::conv1d_channels_last(&x_cl, &packed, &b, &mut y_cl, cin, cout, ks, dilation,
+                                      stride, pad, t_in, t_out);
+        // Compare with the channels-first kernel on the same data.
+        let mut x_cf = vec![0.0f32; cin * t_in];
+        for t in 0..t_in {
+            for c in 0..cin {
+                x_cf[c * t_in + t] = x_cl[t * cin + c];
+            }
+        }
+        let mut y_cf = vec![0.0f32; cout * t_out];
+        cpu_ops::conv1d(&x_cf, &w, &b, &mut y_cf, (cin, cout, ks, dilation, stride, pad, t_in, t_out));
+        let mut worst = 0.0f32;
+        for t in 0..t_out {
+            for c in 0..cout {
+                worst = worst.max((y_cl[t * cout + c] - y_cf[c * t_out + t]).abs());
+            }
+        }
+        eprintln!("cl vs cf cin={cin} cout={cout} ks={ks} stride={stride}: max|diff|={worst:.3e}");
+        assert!(worst < 2e-3, "channels-last conv diff {worst}");
+    }
+}

@@ -23,6 +23,22 @@ fn main() -> anyhow::Result<()> {
                  kernel_only, 140.0 / kernel_only / 1e3, readback, 70.0 / readback / 1e3);
     }
 
+    // Channels-last (packed) vs channels-first, same math, same data volume.
+    {
+        let (cin, cout, ks, t) = (96usize, 96usize, 7usize, 182400usize);
+        let macs = (cin * cout * ks * t) as f64;
+        let w = vec![0.01f32; cout * cin * ks];
+        let b = vec![0.001f32; cout];
+        let packed = m5_tts_wgpu::cpu_ops::pack_conv_weights(&w, cout, cin, ks);
+        let x = vec![0.01f32; t * cin];
+        let mut y = vec![0.0f32; t * cout];
+        m5_tts_wgpu::cpu_ops::conv1d_channels_last(&x, &packed, &b, &mut y, cin, cout, ks, 1, 1, ks - 1, t, t);
+        let start = Instant::now();
+        m5_tts_wgpu::cpu_ops::conv1d_channels_last(&x, &packed, &b, &mut y, cin, cout, ks, 1, 1, ks - 1, t, t);
+        let s = start.elapsed().as_secs_f64();
+        println!("cpu channels-last: {:.3}s  {:.1} GFLOP/s", s, 2.0 * macs / s / 1e9);
+    }
+
     for spec in ["cpu", "gpu"] {
         let dev = Device::open(spec)?;
         let x = dev.tensor([cin, t], &vec![0.01f32; cin * t])?;
