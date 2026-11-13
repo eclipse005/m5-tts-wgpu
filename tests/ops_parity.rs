@@ -490,3 +490,55 @@ fn gpu_channels_last_conv_matches_cpu() {
         assert!(worst < 5e-3, "gpu channels-last conv diff {worst}");
     }
 }
+
+/// Transposed conv against a naive in-test reference, over shapes that the
+/// backend-to-backend test misses: several q-blocks (t_in > BLOCK), channel counts
+/// that are not a multiple of four, and every stride the codec uses. This is the
+/// coverage that would have caught the silently wrong AVX2 path.
+#[test]
+fn conv_transpose_matches_naive_reference() {
+    use m5_tts_wgpu::cpu_ops;
+    for (cin, cout, stride, t_in) in [
+        (4usize, 2usize, 2usize, 10usize),
+        (6, 3, 8, 40),
+        (8, 4, 5, 700),     // multi q-block
+        (5, 6, 3, 1100),    // multi block, cout % 4 != 0, cin % 4 != 0
+        (192, 96, 3, 1200), // the shape block 4 actually runs
+    ] {
+        let ks = 2 * stride;
+        let t_out = t_in * stride;
+        let x = rand_vec(cin * t_in, 91);
+        let w = rand_vec(cin * cout * ks, 92);
+        let b = rand_vec(cout, 93);
+        let mut y = vec![0.0f32; cout * t_out];
+        cpu_ops::conv_transpose1d(&x, &w, &b, &mut y, cin, cout, ks, stride, t_in);
+
+        // Naive gather: y[co, j] = sum over taps with (j - k) % stride == 0.
+        let mut want = vec![0.0f32; cout * t_out];
+        for co in 0..cout {
+            for j in 0..t_out {
+                let mut sum = b[co];
+                for k in 0..ks {
+                    let num = j as isize - k as isize;
+                    if num < 0 || (num as usize) % stride != 0 {
+                        continue;
+                    }
+                    let t = num as usize / stride;
+                    if t >= t_in {
+                        continue;
+                    }
+                    for ci in 0..cin {
+                        sum += x[ci * t_in + t] * w[(ci * cout + co) * ks + k];
+                    }
+                }
+                want[co * t_out + j] = sum;
+            }
+        }
+        let mut worst = 0.0f32;
+        for (a, c) in want.iter().zip(&y) {
+            worst = worst.max((a - c).abs());
+        }
+        eprintln!("transpose naive cin={cin} cout={cout} stride={stride} t_in={t_in}: max|diff|={worst:.3e}");
+        assert!(worst < 5e-4, "transposed conv diff {worst}");
+    }
+}
