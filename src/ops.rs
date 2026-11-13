@@ -104,6 +104,10 @@ pub fn snake_beta(dev: &Device, x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Re
     let [channels, time] = x.shape();
     expect("snake alpha", alpha.shape(), [channels, 1])?;
     expect("snake beta", beta.shape(), [channels, 1])?;
+    // Measured: copy + in-place stays faster than the fused read/write variant on
+    // the last SEANet block, and the GPU kernel is in-place anyway. A fused version
+    // with a polynomial sine was tried and came out slower; revisit only with a
+    // microbenchmark in hand.
     let mut out = dev.copy(x)?;
     match dev {
         Device::Gpu(gpu) => {
