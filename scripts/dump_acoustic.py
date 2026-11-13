@@ -196,8 +196,18 @@ def main():
     ci, depth_captured = depth_logits(model, last_h, torch.tensor([[sample0[0]]]), sample0)
 
     prompt = prepare_prompt(args.prompt_wav, tts.sample_rate, device="cpu")
-    enc = gen._audio_tokenizer.encode(prompt.numpy(), sr=tts.sample_rate)
-    prompt_codes = enc.audio_codes[0].cpu().numpy().astype(np.int64)  # (frames, codebooks)
+    # Encoder stages, replayed step by step so the port can be bisected layer by
+    # layer (same idea as the decoder's stage captures).
+    with torch.inference_mode():
+        encoder = gen._audio_tokenizer.model.encoder
+        audio = torch.from_numpy(np.asarray(prompt.numpy(), dtype=np.float32))[None, None, :]
+        seanet = encoder.encoder(audio, padding_cache=None)
+        transformed = encoder.encoder_transformer(seanet.transpose(1, 2))[0].transpose(1, 2)
+        downsampled = encoder.downsample(transformed, padding_cache=None)
+        encoded = encoder.quantizer.encode(downsampled, 16).transpose(0, 1)
+    encoder_stages = {"prompt_audio": prompt.reshape(1, -1), "prompt_seanet": seanet, "prompt_transformer": transformed,
+                      "prompt_downsample": downsampled}
+    prompt_codes = encoded.cpu().numpy().astype(np.int64)  # (frames, codebooks)
 
     # Codec stage replay for the same fixed code matrix: `forward` wrapped by hand
     # so every stage boundary is captured (hooks miss `.decode()` entry points).
@@ -252,6 +262,7 @@ def main():
         "topk": sorted({int(r["topk"]) for r in audit}),
         "tensors": {
             "prompt_codes": save("prompt_codes", prompt_codes, out),
+            **{k: save(k, v.detach().float().numpy(), out) for k, v in encoder_stages.items()},
             "codes": save("codes", codes, out),
             "pcm": save("pcm", pcm, out),
             "codes_short": save("codes_short", short, out),

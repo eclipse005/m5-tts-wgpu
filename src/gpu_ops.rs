@@ -210,3 +210,10 @@ pub fn repeat_kv(gpu: &Gpu, x: &Buffer, y: &Buffer, frames: usize, kv_heads: usi
     gpu.dispatch("repeat_kv_f32", shaders::REPEAT_KV_F32, "main",
                  &[(0, x), (1, y), (2, &params)], grid(frames * heads * head_dim));
 }
+
+/// ELU (alpha 1), in place.
+pub fn elu(gpu: &Gpu, x: &Buffer, len: usize) {
+    let params = gpu.upload_u32("elu.params", &[len as u32]);
+    gpu.dispatch("elu_f32", shaders::ELU_F32, "main",
+                 &[(0, x), (1, &params)], grid(len));
+}

@@ -378,3 +378,12 @@ pub fn repeat_kv(x: &[f32], y: &mut [f32], frames: usize, kv_heads: usize, heads
         }
     });
 }
+
+/// ELU (alpha 1), in place.
+pub fn elu(x: &mut [f32]) {
+    x.par_iter_mut().for_each(|v| {
+        if *v <= 0.0 {
+            *v = v.exp() - 1.0;
+        }
+    });
+}

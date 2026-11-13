@@ -8,6 +8,7 @@
 //! weight map. Both graph halves call [`crate::ops`] only, so the same code runs
 //! on wgpu and on the CPU twin.
 
+pub mod encoder;
 pub mod quantizer;
 pub mod seanet;
 pub mod transformer;
@@ -45,8 +46,52 @@ pub struct CodecConfig {
     pub layer_scale_initial_scale: f64,
 }
 
+/// `encoder_config` of the codec: the encoder transformer has its own geometry
+/// (8 heads, no GQA) and its own RoPE theta.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EncoderConfig {
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
+    #[serde(default = "default_enc_heads")]
+    pub num_attention_heads: usize,
+    #[serde(default = "default_head_dim")]
+    pub head_dim: usize,
+    #[serde(default = "default_enc_layers")]
+    pub num_hidden_layers: usize,
+    #[serde(default = "default_intermediate")]
+    pub intermediate_size: usize,
+    #[serde(default = "default_window")]
+    pub sliding_window: usize,
+    #[serde(default = "default_norm_eps")]
+    pub norm_eps: f64,
+}
+
+fn default_rope_theta() -> f64 {
+    10_000.0
+}
+fn default_enc_heads() -> usize {
+    8
+}
+fn default_head_dim() -> usize {
+    64
+}
+fn default_enc_layers() -> usize {
+    8
+}
+fn default_intermediate() -> usize {
+    2048
+}
+fn default_window() -> usize {
+    250
+}
+fn default_norm_eps() -> f64 {
+    1e-5
+}
+
 #[derive(Deserialize)]
 struct CodecFile {
+    #[serde(default)]
+    encoder_config: Option<EncoderConfig>,
     decoder_config: CodecConfig,
     #[serde(default)]
     #[allow(dead_code)]
@@ -68,6 +113,8 @@ pub struct Codec {
     pub sample_rate: usize,
     /// Codec frame rate in Hz (24000 / `encode_downsample_rate`).
     pub frame_rate: f64,
+    /// Encoder transformer geometry (its own heads/theta/window).
+    pub enc: EncoderConfig,
     dev: Device,
     weights: Weights,
     /// Device tensors are created once per name; the SEANet stack alone is ~450
@@ -82,14 +129,23 @@ impl Codec {
         let file: CodecFile = serde_json::from_str(&text).context("parse codec config.json")?;
         let weights = Weights::load(&dir.join("model.safetensors"))?;
         let frame_rate = file.decoder_config.frame_rate(file.encode_downsample_rate);
+        let enc = file.encoder_config.unwrap_or_else(|| {
+            serde_json::from_str("{}").expect("encoder defaults")
+        });
         Ok(Self {
             cfg: file.decoder_config,
             sample_rate,
             frame_rate,
+            enc,
             dev,
             weights,
             cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// RoPE theta of the encoder transformer (plain frequencies, no scaling).
+    pub fn encoder_rope_theta(&self) -> f64 {
+        self.enc.rope_theta
     }
 
     pub fn device(&self) -> &Device {

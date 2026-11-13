@@ -110,3 +110,53 @@ fn codec_decode_stages_match_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// Encoder half: prompt audio -> SEANet latent, compared stage by stage.
+#[test]
+fn codec_encoder_matches_reference() -> Result<()> {
+    let Some(goldens) = Goldens::open() else {
+        eprintln!("skipping: run scripts/dump_acoustic.py");
+        return Ok(());
+    };
+    let Some(dir) = codec_dir() else {
+        eprintln!("skipping: no codec bundle (set M5_CODEC)");
+        return Ok(());
+    };
+    let audio = goldens.f32("prompt_audio");
+    let (want_seanet_shape, want_seanet) = goldens.matrix("prompt_seanet");
+
+    for dev in [Device::Cpu, Device::open("gpu")?] {
+        let codec = Codec::load(&dir, dev, 24000)?;
+        let dev = codec.device();
+        let input = dev.tensor([1, audio.len()], &audio)?;
+        let latent = codec.seanet_encode(&input)?;
+        assert_eq!(latent.shape(), want_seanet_shape);
+        let diff = max_abs_diff(&want_seanet, &dev.read(&latent)?);
+        eprintln!("[{}] seanet encode: max|diff|={diff:.3e}", dev.describe());
+        assert!(diff < 2e-3, "seanet encoder diff {diff}");
+
+        // transformer works on [frames, channels]
+        let (want_tr_shape, want_tr) = goldens.matrix("prompt_transformer");
+        let mut time_major = dev.zeros([want_seanet_shape[1], want_seanet_shape[0]])?;
+        ops::transpose(dev, &latent, &mut time_major)?;
+        let transformed = codec.encoder_transformer(&time_major)?;
+        // The golden is channel-major ([1, 512, 86]); the port keeps the
+        // transformer input time-major, so transpose back for comparison.
+        let mut transformed_channels = dev.zeros([transformed.shape()[1], transformed.shape()[0]])?;
+        ops::transpose(dev, &transformed, &mut transformed_channels)?;
+        assert_eq!(transformed_channels.shape(), want_tr_shape);
+        let diff = max_abs_diff(&want_tr, &dev.read(&transformed_channels)?);
+        eprintln!("[{}] encoder transformer: max|diff|={diff:.3e}", dev.describe());
+        assert!(diff < 2e-3, "encoder transformer diff {diff}");
+
+        let (want_ds_shape, want_ds) = goldens.matrix("prompt_downsample");
+        let mut channels_major = dev.zeros([transformed.shape()[1], transformed.shape()[0]])?;
+        ops::transpose(dev, &transformed, &mut channels_major)?;
+        let downsampled = codec.encoder_downsample(&channels_major)?;
+        assert_eq!(downsampled.shape(), want_ds_shape);
+        let diff = max_abs_diff(&want_ds, &dev.read(&downsampled)?);
+        eprintln!("[{}] encoder downsample: max|diff|={diff:.3e}", dev.describe());
+        assert!(diff < 5e-3, "encoder downsample diff {diff}");
+    }
+    Ok(())
+}

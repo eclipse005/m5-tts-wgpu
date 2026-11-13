@@ -73,8 +73,44 @@
    "file": "prompt_codes.bin",
    "dtype": "int64",
    "shape": [
-    43,
-    16
+    1,
+    16,
+    43
+   ]
+  },
+  "prompt_audio": {
+   "file": "prompt_audio.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    82211
+   ]
+  },
+  "prompt_seanet": {
+   "file": "prompt_seanet.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    512,
+    86
+   ]
+  },
+  "prompt_transformer": {
+   "file": "prompt_transformer.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    512,
+    86
+   ]
+  },
+  "prompt_downsample": {
+   "file": "prompt_downsample.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    512,
+    43
    ]
   },
   "codes": {
@@ -147,7 +183,9 @@
    "file": "final_audio.bin",
    "dtype": "float32",
    "shape": [
-    105120
+    1,
+    1,
+    82211
    ]
   },
   "codec_quantized": {

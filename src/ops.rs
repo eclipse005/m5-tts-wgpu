@@ -390,3 +390,13 @@ pub fn repeat_kv(dev: &Device, x: &Tensor, y: &mut Tensor, kv_heads: usize, head
     }
     Ok(())
 }
+
+/// ELU (alpha 1), in place. Callers own the tensor (see [`Device::copy`]).
+pub fn elu(dev: &Device, x: &mut Tensor) -> Result<()> {
+    let len = x.numel();
+    match dev {
+        Device::Gpu(gpu) => gpu_ops::elu(gpu, x.gpu_buffer()?, len),
+        Device::Cpu => cpu_ops::elu(x.cpu_slice_mut()?),
+    }
+    Ok(())
+}

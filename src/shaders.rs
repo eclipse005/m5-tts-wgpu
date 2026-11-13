@@ -738,3 +738,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     y[i] = x[t * kv * d + src_head * d + dd];
 }
 "#;
+
+/// ELU with alpha = 1: `x > 0 ? x : exp(x) - 1`.
+pub const ELU_F32: &str = r#"
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32, 1>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0]) { return; }
+    let v = x[i];
+    x[i] = select(exp(v) - 1.0, v, v > 0.0);
+}
+"#;
