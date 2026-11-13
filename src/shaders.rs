@@ -510,3 +510,111 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     y[i] = x[i];
 }
 "#;
+
+/// Tiled conv1d: implicit GEMM over `K = cin * ks`.
+///
+/// One workgroup computes an 8-channel x 32-time tile; the K loop stages an 8x8
+/// weight block and an 8x32 input window in workgroup memory. That is ~6x less
+/// global traffic than the per-output form and keeps each dispatch in the
+/// microsecond range, which is what stops the Windows TDR watchdog on the last
+/// SEANet block.
+pub const CONV1D_TILED_F32: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const BM: u32 = 8u;
+const BN: u32 = 32u;
+const BK: u32 = 8u;
+var<workgroup> As: array<array<f32, 8>, 8>;
+var<workgroup> Bs: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let co0 = wid.x * BM;
+    let t0 = wid.y * BN;
+    let kdim = p[0] * p[2];
+    let row = li / BN;
+    let col = li % BN;
+    var acc = 0.0;
+    let chunks = (kdim + BK - 1u) / BK;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        if (li < BM * BK) {
+            let r = li / BK;
+            let kk = c0 * BK + (li % BK);
+            var v = 0.0;
+            if (co0 + r < p[1] && kk < kdim) { v = w[(co0 + r) * kdim + kk]; }
+            As[r][li % BK] = v;
+        }
+        {
+            let kk = c0 * BK + row;
+            var v = 0.0;
+            if (kk < kdim) {
+                let ci = kk / p[2];
+                let k = kk % p[2];
+                let src = i32(t0 + col) * i32(p[4]) + i32(k * p[3]) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) { v = x[ci * p[6] + u32(src)]; }
+            }
+            Bs[row][col] = v;
+        }
+        workgroupBarrier();
+        for (var i = 0u; i < BK; i = i + 1u) {
+            acc = acc + As[row][i] * Bs[i][col];
+        }
+        workgroupBarrier();
+    }
+    let co = co0 + row;
+    let t = t0 + col;
+    if (co < p[1] && t < p[7]) {
+        y[co * p[7] + t] = acc + b[co];
+    }
+}
+"#;
+
+/// Streaming conv1d: 8 output channels per thread, one timestep per lane.
+///
+/// The codec's shapes are narrow in channels (96..1536) and very long in time
+/// (up to 182 400), which makes the implicit-GEMM tiling barrier-bound: 84 K
+/// chunks x 2 barriers per workgroup cost more than the arithmetic. This form
+/// keeps 8 accumulators in registers, streams `x` coalesced across lanes and
+/// lets L1/L2 absorb the reuse across the 8 channels, which measured 15x faster
+/// than the tiled version on the same layer.
+pub const CONV1D_STREAM_F32: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const BC: u32 = 8u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // x-major over time so consecutive workgroups keep the same 21 KB weight
+    // block hot and stream a new input window (the swapped order thrashing both).
+    let co0 = wid.y * BC;
+    let t = wid.x * 256u + lid.x;
+    if (t >= p[7]) { return; }
+    var acc: array<f32, 8>;
+    for (var c = 0u; c < BC; c = c + 1u) { acc[c] = 0.0; }
+    for (var ci = 0u; ci < p[0]; ci = ci + 1u) {
+        for (var k = 0u; k < p[2]; k = k + 1u) {
+            let src = i32(t) * i32(p[4]) + i32(k * p[3]) - i32(p[5]);
+            if (src < 0 || src >= i32(p[6])) { continue; }
+            let xv = x[ci * p[6] + u32(src)];
+            for (var c = 0u; c < BC; c = c + 1u) {
+                if (co0 + c < p[1]) {
+                    acc[c] = acc[c] + xv * w[(co0 + c) * p[0] * p[2] + ci * p[2] + k];
+                }
+            }
+        }
+    }
+    for (var c = 0u; c < BC; c = c + 1u) {
+        if (co0 + c < p[1]) { y[(co0 + c) * p[7] + t] = acc[c] + b[co0 + c]; }
+    }
+}
+"#;

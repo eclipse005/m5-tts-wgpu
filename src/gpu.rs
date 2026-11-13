@@ -77,10 +77,14 @@ impl Gpu {
                 .await
         })
         .context("request wgpu device")?;
+        // Windows resets the device (TDR) if a single submit runs longer than
+        // ~2 s, and one SEANet block is already hundreds of dispatches on a slow
+        // kernel. 8 keeps the worst-case submit well inside the watchdog;
+        // `M5_MAX_PENDING` overrides for experiments.
         let max_pending = std::env::var("M5_MAX_PENDING")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(256);
+            .unwrap_or(8);
         Ok(Self {
             device,
             queue,

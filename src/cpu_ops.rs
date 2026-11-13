@@ -31,28 +31,54 @@ pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, 
 }
 
 /// Causal conv1d, `[channels, time]`, `y = conv(x) + bias`.
+///
+/// Cache-blocked: one time block of the input window is staged once and reused by
+/// every output channel, and the inner loop walks the staged window contiguously
+/// with the weight in a register. The naive per-output form re-read the same
+/// window `cout` times and was the whole codec's bottleneck.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
               (cin, cout, ks, dilation, stride, pad, t_in, t_out): (usize, usize, usize, usize, usize, usize, usize, usize)) {
-    y.par_chunks_mut(t_out).enumerate().for_each(|(co, out)| {
-        if co >= cout {
-            return;
-        }
-        for (t, slot) in out.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            for ci in 0..cin {
-                let wbase = (co * cin + ci) * ks;
-                let xbase = ci * t_in;
-                for k in 0..ks {
-                    let src = (t * stride + k * dilation) as isize - pad as isize;
+    const BT: usize = 128;
+    let span = (ks - 1) * dilation + 1;
+    for t0 in (0..t_out).step_by(BT) {
+        let tn = BT.min(t_out - t0);
+        let start = t0 as isize * stride as isize - pad as isize;
+        let len = (tn - 1) * stride + span;
+        // Window for this block, zero-padded outside the input.
+        let mut window = vec![0.0f32; cin * len];
+        window
+            .par_chunks_mut(len)
+            .enumerate()
+            .take(cin)
+            .for_each(|(ci, row)| {
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let src = start + j as isize;
                     if src >= 0 && (src as usize) < t_in {
-                        acc += x[xbase + src as usize] * w[wbase + k];
+                        *slot = x[ci * t_in + src as usize];
+                    }
+                }
+            });
+
+        let window = &window;
+        y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
+            let mut acc = vec![0.0f32; tn];
+            for ci in 0..cin {
+                let base = ci * len;
+                let wrow = (co * cin + ci) * ks;
+                for k in 0..ks {
+                    let wv = w[wrow + k];
+                    let off = k * dilation;
+                    for (j, slot) in acc.iter_mut().enumerate() {
+                        *slot += window[base + j * stride + off] * wv;
                     }
                 }
             }
-            *slot = acc + bias[co];
-        }
-    });
+            for (j, slot) in acc.iter().enumerate() {
+                out[t0 + j] = slot + bias[co];
+            }
+        });
+    }
 }
 
 /// SnakeBeta in place: `x + sin(exp(a) x)^2 / (exp(b) + 1e-9)`.
