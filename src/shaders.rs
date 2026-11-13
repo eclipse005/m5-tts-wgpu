@@ -8,8 +8,8 @@ pub const RESIDUAL_F32: &str = r#"
 @group(0) @binding(2) var<storage, read> p: array<u32, 1>;
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
     if (i >= p[0]) { return; }
     y[i] = y[i] + x[i];
 }
@@ -77,8 +77,8 @@ pub const CONV1D_F32: &str = r#"
 @group(0) @binding(4) var<storage, read> p: array<u32, 8>;
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
     if (idx >= p[1] * p[7]) { return; }
     let co = idx / p[7];
     let t = idx % p[7];
@@ -104,8 +104,8 @@ pub const SNAKE_BETA_F32: &str = r#"
 @group(0) @binding(3) var<storage, read> p: array<u32, 2>;
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
     if (idx >= p[0] * p[1]) { return; }
     let c = idx / p[1];
     let v = x[idx];
@@ -125,8 +125,8 @@ pub const ADD_F32: &str = r#"
 @group(0) @binding(3) var<storage, read> p: array<u32, 1>;
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
     if (i >= p[0]) { return; }
     y[i] = a[i] + b[i];
 }
@@ -145,8 +145,8 @@ pub const GATHER_SUM_F32: &str = r#"
 @group(0) @binding(4) var<storage, read> p: array<u32, 8>;
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
     let dim = p[0];
     let frames = p[1];
     if (idx >= dim * frames) { return; }
@@ -171,10 +171,328 @@ pub const TRANSPOSE_F32: &str = r#"
 @group(0) @binding(2) var<storage, read> p: array<u32, 4>;
 
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let r = gid.x;
     let c = gid.y;
     if (r >= p[0] || c >= p[1]) { return; }
     y[c * p[0] + r] = x[r * p[1] + c];
+}
+"#;
+
+/// Row-wise RMSNorm: `y = x / sqrt(mean(x^2) + eps) * w`.
+pub const RMS_NORM_F32: &str = r#"
+// 0=rows 1=cols 2=eps(bits) 3=0
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 4>;
+var<workgroup> partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = p[1];
+    let row = wid.x;
+    let lane = lid.x;
+    let base = row * cols;
+    var acc = 0.0;
+    var c = lane;
+    loop {
+        if (c >= cols) { break; }
+        let v = x[base + c];
+        acc = acc + v * v;
+        c = c + 64u;
+    }
+    partial[lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + partial[i]; }
+        let eps = bitcast<f32>(p[2]);
+        partial[0] = inverseSqrt(total / f32(cols) + eps);
+    }
+    workgroupBarrier();
+    let inv = partial[0];
+    var c2 = lane;
+    loop {
+        if (c2 >= cols) { break; }
+        y[base + c2] = x[base + c2] * inv * w[c2];
+        c2 = c2 + 64u;
+    }
+}
+"#;
+
+/// Row-wise LayerNorm with affine: `y = (x - mean) / sqrt(var + eps) * w + b`.
+pub const LAYER_NORM_F32: &str = r#"
+// 0=rows 1=cols 2=eps(bits) 3=0
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+var<workgroup> partial: array<f32, 64>;
+var<workgroup> stats: array<f32, 2>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = p[1];
+    let base = wid.x * cols;
+    let lane = lid.x;
+    var sum = 0.0;
+    var c = lane;
+    loop {
+        if (c >= cols) { break; }
+        sum = sum + x[base + c];
+        c = c + 64u;
+    }
+    partial[lane] = sum;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + partial[i]; }
+        stats[0] = total / f32(cols);
+    }
+    workgroupBarrier();
+    let mean = stats[0];
+    var sq = 0.0;
+    var c2 = lane;
+    loop {
+        if (c2 >= cols) { break; }
+        let d = x[base + c2] - mean;
+        sq = sq + d * d;
+        c2 = c2 + 64u;
+    }
+    partial[lane] = sq;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + partial[i]; }
+        let eps = bitcast<f32>(p[2]);
+        stats[1] = inverseSqrt(total / f32(cols) + eps);
+    }
+    workgroupBarrier();
+    let inv = stats[1];
+    var c3 = lane;
+    loop {
+        if (c3 >= cols) { break; }
+        y[base + c3] = (x[base + c3] - mean) * inv * w[c3] + b[c3];
+        c3 = c3 + 64u;
+    }
+}
+"#;
+
+/// `y = silu(gate) * up`.
+pub const SILU_MUL_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> gate: array<f32>;
+@group(0) @binding(1) var<storage, read> up: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 1>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0]) { return; }
+    let g = gate[i];
+    y[i] = (g / (1.0 + exp(-g))) * up[i];
+}
+"#;
+
+/// `x[.., c] *= scale[c]` on a `[rows, cols]` tensor.
+pub const SCALE_COLS_F32: &str = r#"
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 2>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0] * p[1]) { return; }
+    x[i] = x[i] * scale[i % p[1]];
+}
+"#;
+
+/// `y = a + scale * b` (residual with a learned per-channel gate).
+pub const ADD_SCALED_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read> scale: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 2>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0] * p[1]) { return; }
+    let c = i % p[1];
+    y[i] = a[i] + scale[c] * b[i];
+}
+"#;
+
+/// Rotary position embedding, rotate-half form, applied in place to `[T, H*D]`.
+pub const ROPE_F32: &str = r#"
+// 0=T 1=heads 2=head_dim 3=theta(bits)
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let d = p[2];
+    let h = p[1];
+    let half = d / 2u;
+    let total = p[0] * h * half;
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= total) { return; }
+    let j = i % half;              // rotary pair index
+    let t = i / (h * half);        // position
+    let theta = bitcast<f32>(p[3]);
+    let freq = pow(theta, -2.0 * f32(j) / f32(d));
+    let angle = f32(t) * freq;
+    let c = cos(angle);
+    let s = sin(angle);
+    let base = t * h * d + (i / half % h) * d;
+    let a = x[base + j];
+    let b = x[base + j + half];
+    x[base + j] = a * c - b * s;
+    x[base + j + half] = b * c + a * s;
+}
+"#;
+
+/// Causal attention with a sliding window, `[T, H*D]` in and out.
+///
+/// One workgroup per (query, head). Lanes split the score pass across keys and
+/// each lane writes one output element. Nothing is written back to workgroup
+/// memory after the barrier: every lane recomputes exp() locally, which is cheap
+/// at window <= 256 and removes a genuine write/read race.
+pub const ATTENTION_F32: &str = r#"
+// 0=T 1=heads 2=head_dim 3=window
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+var<workgroup> scores: array<f32, 256>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let heads = p[1];
+    let d = p[2];
+    let window = p[3];
+    let row = wid.x;
+    let qpos = row / heads;
+    let head = row % heads;
+    let lane = lid.x;
+    let start = select(0u, qpos + 1u - window, qpos + 1u > window);
+    let span = qpos + 1u - start;
+    let stride = heads * d;
+    let qbase = qpos * stride + head * d;
+    let scale = inverseSqrt(f32(d));
+
+    var kk = lane;
+    loop {
+        if (kk >= span) { break; }
+        let kpos = start + kk;
+        let kbase = kpos * stride + head * d;
+        var acc = 0.0;
+        for (var i = 0u; i < d; i = i + 1u) {
+            acc = acc + q[qbase + i] * k[kbase + i];
+        }
+        scores[kk] = acc * scale;
+        kk = kk + 64u;
+    }
+    workgroupBarrier();
+
+    var maxs = -1e30;
+    for (var i = 0u; i < span; i = i + 1u) { maxs = max(maxs, scores[i]); }
+    var sum = 0.0;
+    for (var i = 0u; i < span; i = i + 1u) { sum = sum + exp(scores[i] - maxs); }
+    let inv_sum = 1.0 / sum;
+
+    if (lane < d) {
+        var acc = 0.0;
+        for (var j = 0u; j < span; j = j + 1u) {
+            acc = acc + exp(scores[j] - maxs) * v[(start + j) * stride + head * d + lane];
+        }
+        out[qbase + lane] = acc * inv_sum;
+    }
+}
+"#;
+
+/// Depthwise causal conv1d (`groups == channels`): `y[c,t] = sum_k x[c,t+k-pad] w[c,k] + b[c]`.
+pub const CONV1D_DW_F32: &str = r#"
+// 0=channels 1=ks 2=pad 3=t_in 4=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
+    if (idx >= p[0] * p[4]) { return; }
+    let c = idx / p[4];
+    let t = idx % p[4];
+    var acc = 0.0;
+    for (var k = 0u; k < p[1]; k = k + 1u) {
+        let src = i32(t) + i32(k) - i32(p[2]);
+        if (src >= 0 && src < i32(p[3])) {
+            acc = acc + x[c * p[3] + u32(src)] * w[c * p[1] + k];
+        }
+    }
+    y[c * p[4] + t] = acc + b[c];
+}
+"#;
+
+/// Transposed conv1d, causal form: `y[co, t*S + k] += x[ci, t] * w[ci, co, k]`,
+/// then the reference trims `kernel - stride` samples from the right.
+///
+/// Weight layout is PyTorch's `ConvTranspose1d`: `[in, out, kernel]`.
+pub const CONV_TRANSPOSE_F32: &str = r#"
+// 0=cin 1=cout 2=ks 3=stride 4=t_in 5=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
+    if (idx >= p[1] * p[5]) { return; }
+    let co = idx / p[5];
+    let j = idx % p[5];
+    var acc = 0.0;
+    for (var k = 0u; k < p[2]; k = k + 1u) {
+        let num = i32(j) - i32(k);
+        if (num < 0) { continue; }
+        if (num % i32(p[3]) != 0) { continue; }
+        let t = u32(num) / p[3];
+        if (t >= p[4]) { continue; }
+        for (var ci = 0u; ci < p[0]; ci = ci + 1u) {
+            acc = acc + x[ci * p[4] + t] * w[(ci * p[1] + co) * p[2] + k];
+        }
+    }
+    y[co * p[5] + j] = acc + b[co];
+}
+"#;
+
+/// Exact GELU (`erf` form; A&S 7.1.26 for erf, max error ~1.5e-7).
+pub const GELU_F32: &str = r#"
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32, 1>;
+
+fn erf_approx(v: f32) -> f32 {
+    let s = select(-1.0, 1.0, v >= 0.0);
+    let ax = abs(v);
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-ax * ax);
+    return s * y;
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0]) { return; }
+    let v = x[i];
+    x[i] = 0.5 * v * (1.0 + erf_approx(v * 0.70710678));
 }
 "#;

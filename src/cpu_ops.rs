@@ -111,3 +111,172 @@ pub fn transpose(x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
         }
     });
 }
+
+/// Row-wise RMSNorm.
+pub fn rms_norm(x: &[f32], w: &[f32], y: &mut [f32], rows: usize, cols: usize, eps: f32) {
+    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+        let row = &x[r * cols..(r + 1) * cols];
+        let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        for c in 0..cols {
+            out[c] = row[c] * inv * w[c];
+        }
+    });
+}
+
+/// Row-wise LayerNorm with affine parameters.
+pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32], rows: usize, cols: usize, eps: f32) {
+    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+        let row = &x[r * cols..(r + 1) * cols];
+        let mean = row.iter().sum::<f32>() / cols as f32;
+        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        for c in 0..cols {
+            out[c] = (row[c] - mean) * inv * w[c] + b[c];
+        }
+    });
+}
+
+/// `y = silu(gate) * up`.
+pub fn silu_mul(gate: &[f32], up: &[f32], y: &mut [f32]) {
+    y.par_iter_mut().zip(gate.par_iter().zip(up.par_iter())).for_each(|(o, (g, u))| {
+        *o = (g / (1.0 + (-g).exp())) * u;
+    });
+}
+
+/// In-place per-channel scale on `[rows, cols]`.
+pub fn scale_cols(x: &mut [f32], scale: &[f32], cols: usize) {
+    x.par_chunks_mut(cols).for_each(|row| {
+        for (c, v) in row.iter_mut().enumerate() {
+            *v *= scale[c];
+        }
+    });
+}
+
+/// `y = a + scale[c] * b`.
+pub fn add_scaled(a: &[f32], b: &[f32], scale: &[f32], y: &mut [f32], cols: usize) {
+    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+        let a = &a[r * cols..(r + 1) * cols];
+        let b = &b[r * cols..(r + 1) * cols];
+        for c in 0..cols {
+            out[c] = a[c] + scale[c] * b[c];
+        }
+    });
+}
+
+/// Rotary position embedding, rotate-half form.
+pub fn rope(x: &mut [f32], frames: usize, heads: usize, head_dim: usize, theta: f32) {
+    let half = head_dim / 2;
+    let stride = heads * head_dim;
+    x.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
+        for h in 0..heads {
+            let base = h * head_dim;
+            for j in 0..half {
+                let freq = theta.powf(-2.0 * j as f32 / head_dim as f32);
+                let angle = t as f32 * freq;
+                let (s, c) = angle.sin_cos();
+                let a = row[base + j];
+                let b = row[base + j + half];
+                row[base + j] = a * c - b * s;
+                row[base + j + half] = b * c + a * s;
+            }
+        }
+    });
+}
+
+/// Causal sliding-window attention over `[T, heads*head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
+                 frames: usize, heads: usize, head_dim: usize, window: usize) {
+    let stride = heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    out.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
+        let start = if t + 1 > window { t + 1 - window } else { 0 };
+        let span = t + 1 - start;
+        let mut scores = vec![0.0f32; span];
+        for (h, head) in (0..heads).enumerate() {
+            let qo = head * head_dim;
+            let mut maxs = f32::NEG_INFINITY;
+            for (j, kpos) in (start..=t).enumerate() {
+                let ko = kpos * stride + qo;
+                let mut acc = 0.0f32;
+                for i in 0..head_dim {
+                    acc += q[t * stride + qo + i] * k[ko + i];
+                }
+                scores[j] = acc * scale;
+                maxs = maxs.max(scores[j]);
+            }
+            let sum: f32 = scores.iter_mut().map(|s| { *s = (*s - maxs).exp(); *s }).sum();
+            let inv = 1.0 / sum;
+            for i in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (j, kpos) in (start..=t).enumerate() {
+                    acc += scores[j] * inv * v[kpos * stride + qo + i];
+                }
+                row[h * head_dim + i] = acc;
+            }
+        }
+    });
+}
+
+/// Depthwise causal conv1d (`groups == channels`).
+pub fn conv1d_depthwise(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
+                       channels: usize, ks: usize, pad: usize, t_in: usize, t_out: usize) {
+    y.par_chunks_mut(t_out).enumerate().take(channels).for_each(|(c, out)| {
+        for (t, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for k in 0..ks {
+                let src = t as isize + k as isize - pad as isize;
+                if src >= 0 && (src as usize) < t_in {
+                    acc += x[c * t_in + src as usize] * w[c * ks + k];
+                }
+            }
+            *slot = acc + b[c];
+        }
+    });
+}
+
+/// Transposed conv1d with `[in, out, kernel]` weights, trimmed to `t_in * stride`.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
+                        cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
+    let t_out = t_in * stride;
+    y.par_chunks_mut(t_out).enumerate().take(cout).for_each(|(co, out)| {
+        for (j, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for k in 0..ks {
+                let num = j as isize - k as isize;
+                if num < 0 || num as usize % stride != 0 {
+                    continue;
+                }
+                let t = num as usize / stride;
+                if t >= t_in {
+                    continue;
+                }
+                for ci in 0..cin {
+                    acc += x[ci * t_in + t] * w[(ci * cout + co) * ks + k];
+                }
+            }
+            *slot = acc + b[co];
+        }
+    });
+}
+
+/// Exact GELU: `0.5 x (1 + erf(x / sqrt 2))`.
+pub fn gelu(x: &mut [f32]) {
+    x.par_iter_mut().for_each(|v| {
+        *v = 0.5 * *v * (1.0 + erf(*v * std::f32::consts::FRAC_1_SQRT_2));
+    });
+}
+
+/// Abramowitz & Stegun 7.1.26, max error ~1.5e-7 (matches the WGSL version).
+fn erf(v: f32) -> f32 {
+    let sign = if v >= 0.0 { 1.0 } else { -1.0 };
+    let ax = v.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592)
+            * t
+            * (-ax * ax).exp();
+    sign * y
+}

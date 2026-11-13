@@ -9,6 +9,9 @@
 //! on wgpu and on the CPU twin.
 
 pub mod quantizer;
+pub mod seanet;
+pub mod transformer;
+pub mod upsample;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;

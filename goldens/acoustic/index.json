@@ -92,6 +92,21 @@
     109440
    ]
   },
+  "codes_short": {
+   "file": "codes_short.bin",
+   "dtype": "int64",
+   "shape": [
+    8,
+    16
+   ]
+  },
+  "pcm_short": {
+   "file": "pcm_short.bin",
+   "dtype": "float32",
+   "shape": [
+    15360
+   ]
+  },
   "final_audio": {
    "file": "final_audio.bin",
    "dtype": "float32",

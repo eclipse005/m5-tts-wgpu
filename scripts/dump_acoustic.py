@@ -155,6 +155,13 @@ def main():
     print(f"replay vs api decode: n={min(replay.size, api.size)} max|diff|="
           f"{np.abs(replay[: min(replay.size, api.size)] - api[: min(replay.size, api.size)]).max():.3e}")
 
+    # Short decode: the naive SEANet companion kernel in the Rust port hits the
+    # Windows TDR watchdog on the full 109 440-sample tail, so the GPU pipeline is
+    # gated on a short slice as well.
+    short = codes[:8]
+    wavs_short, _ = gen._audio_tokenizer.decode({"audio_codes": [torch.from_numpy(short).long()]})
+    pcm_short = np.asarray(wavs_short[0], dtype=np.float32).reshape(-1)
+
     index = {
         "text": args.text,
         "prompt_text": args.prompt_text,
@@ -167,6 +174,8 @@ def main():
             "prompt_codes": save("prompt_codes", prompt_codes, out),
             "codes": save("codes", codes, out),
             "pcm": save("pcm", pcm, out),
+            "codes_short": save("codes_short", short, out),
+            "pcm_short": save("pcm_short", pcm_short, out),
             "final_audio": save("final_audio", audio.numpy(), out),
             "codec_quantized": save("codec_quantized", stage["quantized"].numpy(), out),
             "codec_pre_conv": save("codec_pre_conv", stage["pre_conv"].numpy(), out),
