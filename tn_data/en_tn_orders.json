@@ -1,0 +1,15 @@
+{
+ "date": [
+  "preserve_order",
+  "text",
+  "day",
+  "month",
+  "year"
+ ],
+ "money": [
+  "integer_part",
+  "fractional_part",
+  "quantity",
+  "currency_maj"
+ ]
+}

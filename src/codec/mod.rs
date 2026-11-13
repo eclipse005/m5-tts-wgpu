@@ -1,0 +1,166 @@
+//! Qwen 12 Hz speech codec (`ASLP-lab/M5-TTS-Audio-Tokenizer`).
+//!
+//! Decode path, mirroring `Qwen3TTSTokenizerV2Decoder.forward`:
+//! codes -> RVQ split dequantise -> `pre_conv` -> `pre_transformer` ->
+//! upsample (x2 transposed conv + ConvNeXt) -> SEANet decoder -> PCM.
+//!
+//! The encode path (reference audio -> codes) lives in `encode.rs` and shares the
+//! weight map. Both graph halves call [`crate::ops`] only, so the same code runs
+//! on wgpu and on the CPU twin.
+
+pub mod quantizer;
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::device::{Device, Tensor};
+use crate::ops::{self, Conv1d};
+use crate::weights::Weights;
+
+/// `decoder_config` / `encoder_config` of the codec's `config.json`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodecConfig {
+    pub codebook_dim: usize,
+    pub codebook_size: usize,
+    pub latent_dim: usize,
+    pub decoder_dim: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub num_quantizers: usize,
+    pub upsample_rates: Vec<usize>,
+    pub upsampling_ratios: Vec<usize>,
+    pub sliding_window: usize,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    pub layer_scale_initial_scale: f64,
+}
+
+#[derive(Deserialize)]
+struct CodecFile {
+    decoder_config: CodecConfig,
+    #[serde(default)]
+    #[allow(dead_code)]
+    input_sample_rate: usize,
+    #[serde(default)]
+    encode_downsample_rate: usize,
+}
+
+impl CodecConfig {
+    /// Frames per second of the codec (12.5 Hz for the Qwen 12 Hz tokenizer).
+    pub fn frame_rate(&self, encode_downsample_rate: usize) -> f64 {
+        encode_downsample_rate as f64
+    }
+}
+
+/// A codec bundle: parsed config plus device-resident weights.
+pub struct Codec {
+    pub cfg: CodecConfig,
+    pub sample_rate: usize,
+    /// Codec frame rate in Hz (24000 / `encode_downsample_rate`).
+    pub frame_rate: f64,
+    dev: Device,
+    weights: Weights,
+    /// Device tensors are created once per name; the SEANet stack alone is ~450
+    /// tensors per decode otherwise.
+    cache: RefCell<HashMap<String, Tensor>>,
+}
+
+impl Codec {
+    pub fn load(dir: &Path, dev: Device, sample_rate: usize) -> Result<Self> {
+        let text = std::fs::read_to_string(dir.join("config.json"))
+            .with_context(|| format!("read {}/config.json", dir.display()))?;
+        let file: CodecFile = serde_json::from_str(&text).context("parse codec config.json")?;
+        let weights = Weights::load(&dir.join("model.safetensors"))?;
+        let frame_rate = file.decoder_config.frame_rate(file.encode_downsample_rate);
+        Ok(Self {
+            cfg: file.decoder_config,
+            sample_rate,
+            frame_rate,
+            dev,
+            weights,
+            cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.dev
+    }
+
+    /// Device tensor for `name`, validated against `shape` (row-major).
+    pub fn tensor(&self, name: &str, shape: [usize; 2]) -> Result<Tensor> {
+        if let Some(t) = self.cache.borrow().get(name) {
+            if t.shape() != shape {
+                bail!("{name}: cached shape {:?} != {shape:?}", t.shape());
+            }
+            return Ok(t.clone());
+        }
+        let entry = self.weights.get(name)?;
+        if entry.shape.iter().product::<usize>() != shape[0] * shape[1] {
+            bail!("{name}: checkpoint shape {:?} does not flatten to {shape:?}", entry.shape);
+        }
+        let tensor = self.dev.tensor(shape, &entry.to_f32()?)?;
+        self.cache.borrow_mut().insert(name.to_string(), tensor.clone());
+        Ok(tensor)
+    }
+
+    /// 1-D parameter as a `[len, 1]` tensor (kernels take 2-D shapes).
+    pub fn vector(&self, name: &str, len: usize) -> Result<Tensor> {
+        self.tensor(name, [len, 1])
+    }
+
+    /// The fifteen acoustic codebooks stacked into one table, built once.
+    ///
+    /// `rvq_rest` stores one tensor per codebook; concatenating them on the host
+    /// keeps a decode at one bind group per group instead of fifteen.
+    pub fn acoustic_tables(&self) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let rest = cfg.num_quantizers - 1;
+        let dim = cfg.codebook_dim / 2;
+        if let (Some(t), Some(u)) = (self.cache.borrow().get("rvq_rest.tables"),
+                                     self.cache.borrow().get("rvq_rest.usage")) {
+            return Ok((t.clone(), u.clone()));
+        }
+        let mut tables = vec![0.0f32; rest * cfg.codebook_size * dim];
+        let mut usage = vec![0.0f32; rest * cfg.codebook_size];
+        for k in 0..rest {
+            let table = self.tensor(
+                &format!("decoder.quantizer.rvq_rest.vq.layers.{k}._codebook.embedding_sum"),
+                [cfg.codebook_size, dim])?;
+            let start = k * cfg.codebook_size * dim;
+            tables[start..start + cfg.codebook_size * dim].copy_from_slice(&self.dev.read(&table)?);
+            let u = self.vector(
+                &format!("decoder.quantizer.rvq_rest.vq.layers.{k}._codebook.cluster_usage"),
+                cfg.codebook_size)?;
+            let start = k * cfg.codebook_size;
+            usage[start..start + cfg.codebook_size].copy_from_slice(&self.dev.read(&u)?);
+        }
+        let tables = self.dev.tensor([rest * cfg.codebook_size, dim], &tables)?;
+        let usage = self.dev.tensor([rest * cfg.codebook_size, 1], &usage)?;
+        self.cache.borrow_mut().insert("rvq_rest.tables".into(), tables.clone());
+        self.cache.borrow_mut().insert("rvq_rest.usage".into(), usage.clone());
+        Ok((tables, usage))
+    }
+
+    /// `decoder.quantizer.*` dequantise + `pre_conv`, i.e. everything before the
+    /// transformer. Returns `[frames, latent_dim]` (time-major), which is the
+    /// layout `pre_transformer` consumes.
+    pub fn pre_transformer_input(&self, codes: &[u32], frames: usize) -> Result<Tensor> {
+        let mut quantized = quantizer::dequantize(self, codes, frames)?; // [codebook_dim, frames]
+        let cfg = &self.cfg;
+        let mut projected = self.dev.zeros([cfg.latent_dim, frames])?;
+        let weight = self.tensor("decoder.pre_conv.conv.weight", [cfg.latent_dim, cfg.codebook_dim * 3])?;
+        let bias = self.vector("decoder.pre_conv.conv.bias", cfg.latent_dim)?;
+        let conv = Conv1d::causal(cfg.codebook_dim, cfg.latent_dim, 3, frames);
+        ops::conv1d(&self.dev, &quantized, &weight, &bias, &mut projected, &conv)?;
+        let mut time_major = self.dev.zeros([frames, cfg.latent_dim])?;
+        ops::transpose(&self.dev, &projected, &mut time_major)?;
+        quantized = time_major.clone();
+        Ok(time_major)
+    }
+}

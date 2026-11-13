@@ -1,0 +1,27 @@
+{
+ "cardinal": [
+  "negative",
+  "integer"
+ ],
+ "date": [
+  "day",
+  "month",
+  "year"
+ ],
+ "decimal": [
+  "negative",
+  "integer_part",
+  "fractional_part",
+  "quantity"
+ ],
+ "fraction": [
+  "negative",
+  "integer_part",
+  "numerator",
+  "denominator"
+ ],
+ "ordinal": [
+  "integer",
+  "morphosyntactic_features"
+ ]
+}

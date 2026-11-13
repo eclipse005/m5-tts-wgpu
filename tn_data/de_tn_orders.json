@@ -1,0 +1,33 @@
+{
+ "date": [
+  "day",
+  "month",
+  "year"
+ ],
+ "measure": [
+  "kind",
+  "prefix",
+  "negative",
+  "integer",
+  "integer_part",
+  "fractional_part",
+  "quantity",
+  "numerator",
+  "denominator",
+  "units"
+ ],
+ "money": [
+  "kind",
+  "negative",
+  "integer_part",
+  "fractional_part",
+  "quantity",
+  "currency"
+ ],
+ "time": [
+  "hours",
+  "minutes",
+  "seconds",
+  "zone"
+ ]
+}

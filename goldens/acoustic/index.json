@@ -1,0 +1,296 @@
+{
+ "text": "你好，欢迎使用我们的语音合成模型，今天天气很好。",
+ "prompt_text": "猪携带该疾病，然后通过蚊子传染给人类。",
+ "seed": 1234,
+ "sample_rate": 24000,
+ "frame_numbers": [
+  88,
+  89,
+  90,
+  91,
+  92,
+  93,
+  94,
+  95,
+  96,
+  97,
+  98,
+  99,
+  100,
+  101,
+  102,
+  103,
+  104,
+  105,
+  106,
+  107,
+  108,
+  109,
+  110,
+  111,
+  112,
+  113,
+  114,
+  115,
+  116,
+  117,
+  118,
+  119,
+  120,
+  121,
+  122,
+  123,
+  124,
+  125,
+  126,
+  127,
+  128,
+  129,
+  130,
+  131,
+  132,
+  133,
+  134,
+  135,
+  136,
+  137,
+  138,
+  139,
+  140,
+  141,
+  142,
+  143,
+  144
+ ],
+ "temperatures": [
+  0.9
+ ],
+ "topk": [
+  10
+ ],
+ "tensors": {
+  "prompt_codes": {
+   "file": "prompt_codes.bin",
+   "dtype": "int64",
+   "shape": [
+    43,
+    16
+   ]
+  },
+  "codes": {
+   "file": "codes.bin",
+   "dtype": "int64",
+   "shape": [
+    57,
+    16
+   ]
+  },
+  "pcm": {
+   "file": "pcm.bin",
+   "dtype": "float32",
+   "shape": [
+    109440
+   ]
+  },
+  "final_audio": {
+   "file": "final_audio.bin",
+   "dtype": "float32",
+   "shape": [
+    105120
+   ]
+  },
+  "codec_quantized": {
+   "file": "codec_quantized.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    512,
+    57
+   ]
+  },
+  "codec_pre_conv": {
+   "file": "codec_pre_conv.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    57,
+    1024
+   ]
+  },
+  "codec_transformer": {
+   "file": "codec_transformer.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    57,
+    1024
+   ]
+  },
+  "codec_upsample": {
+   "file": "codec_upsample.bin",
+   "dtype": "float32",
+   "shape": [
+    1,
+    1024,
+    228
+   ]
+  },
+  "frame0_tokens": {
+   "file": "frame0_tokens.bin",
+   "dtype": "int64",
+   "shape": [
+    1513
+   ]
+  },
+  "frame0_pos": {
+   "file": "frame0_pos.bin",
+   "dtype": "int64",
+   "shape": [
+    89
+   ]
+  },
+  "frame0_h": {
+   "file": "frame0_h.bin",
+   "dtype": "float32",
+   "shape": [
+    512
+   ]
+  },
+  "frame0_c0_logits": {
+   "file": "frame0_c0_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci1_logits": {
+   "file": "frame0_ci1_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci2_logits": {
+   "file": "frame0_ci2_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci3_logits": {
+   "file": "frame0_ci3_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci4_logits": {
+   "file": "frame0_ci4_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci5_logits": {
+   "file": "frame0_ci5_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci6_logits": {
+   "file": "frame0_ci6_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci7_logits": {
+   "file": "frame0_ci7_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci8_logits": {
+   "file": "frame0_ci8_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci9_logits": {
+   "file": "frame0_ci9_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci10_logits": {
+   "file": "frame0_ci10_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci11_logits": {
+   "file": "frame0_ci11_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci12_logits": {
+   "file": "frame0_ci12_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci13_logits": {
+   "file": "frame0_ci13_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci14_logits": {
+   "file": "frame0_ci14_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  },
+  "frame0_ci15_logits": {
+   "file": "frame0_ci15_logits.bin",
+   "dtype": "float32",
+   "shape": [
+    2051
+   ]
+  }
+ },
+ "frame0_tokens_shape": [
+  1,
+  89,
+  17
+ ],
+ "frame0_sample_c0": 440,
+ "frame0_sample": [
+  440,
+  1327,
+  1356,
+  1210,
+  1441,
+  219,
+  1049,
+  1656,
+  1020,
+  1858,
+  1779,
+  1378,
+  1556,
+  737,
+  872,
+  1175
+ ]
+}

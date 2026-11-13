@@ -1,0 +1,38 @@
+{
+ "date": [
+  "era",
+  "year",
+  "month",
+  "day",
+  "weekday",
+  "range_start"
+ ],
+ "fraction": [
+  "negative",
+  "integer_part",
+  "denominator",
+  "numerator",
+  "particle"
+ ],
+ "measure": [
+  "negative",
+  "integer_part",
+  "denominator",
+  "numerator",
+  "particle",
+  "integer",
+  "fractional_part",
+  "units"
+ ],
+ "money": [
+  "integer_part",
+  "currency_maj",
+  "minor_part"
+ ],
+ "time": [
+  "suffix",
+  "hours",
+  "minutes",
+  "seconds"
+ ]
+}
