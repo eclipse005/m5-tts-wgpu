@@ -6,6 +6,17 @@
 
 use rayon::prelude::*;
 
+/// Below this many elements a rayon fork costs more than the loop it parallelises
+/// (measured: a fork is ~10-20 us, a 2k-element elementwise pass is ~2 us). The
+/// LM's per-frame ops sit far below this line, which is why a frame of ~1160 ops
+/// spent most of its time on fork-join rather than arithmetic.
+const PAR_MIN: usize = 8192;
+
+#[inline]
+fn wide_enough(n: usize) -> bool {
+    n >= PAR_MIN
+}
+
 /// `y[m,n] = sum_k x[m,k] * w[n,k] + bias[n]`, weight rows are `[out, in]`.
 pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, k): (usize, usize, usize)) {
     // `ops` validates shapes; the assertion documents the contract.
@@ -203,12 +214,25 @@ pub fn snake_beta(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize, t
 
 /// `y = a + b`.
 pub fn add(a: &[f32], b: &[f32], y: &mut [f32]) {
-    y.par_iter_mut().zip(a.par_iter().zip(b.par_iter())).with_min_len(16).for_each(|(o, (x, z))| *o = x + z);
+    if wide_enough(y.len()) {
+        y.par_iter_mut().zip(a.par_iter().zip(b.par_iter())).with_min_len(16)
+            .for_each(|(o, (x, z))| *o = x + z);
+    } else {
+        for ((o, x), z) in y.iter_mut().zip(a).zip(b) {
+            *o = x + z;
+        }
+    }
 }
 
 /// `y += x` (residual connections in the codec).
 pub fn residual(y: &mut [f32], x: &[f32]) {
-    y.par_iter_mut().zip(x.par_iter()).with_min_len(16).for_each(|(o, v)| *o += v);
+    if wide_enough(y.len()) {
+        y.par_iter_mut().zip(x.par_iter()).with_min_len(16).for_each(|(o, v)| *o += v);
+    } else {
+        for (o, v) in y.iter_mut().zip(x) {
+            *o += v;
+        }
+    }
 }
 
 /// RVQ dequantise-and-sum: `out[d,t] = sum_k table[k][code[t,k]][d] / clamp(usage, eps)`.
@@ -245,19 +269,25 @@ pub fn transpose(x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
 
 /// Row-wise RMSNorm.
 pub fn rms_norm(x: &[f32], w: &[f32], y: &mut [f32], rows: usize, cols: usize, eps: f32) {
-    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+    let body = |(r, out): (usize, &mut [f32])| {
         let row = &x[r * cols..(r + 1) * cols];
         let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
         let inv = 1.0 / (mean_sq + eps).sqrt();
         for c in 0..cols {
             out[c] = row[c] * inv * w[c];
         }
-    });
+    };
+    // One row (the LM's decode case) has nothing to parallelise.
+    if wide_enough(rows * cols) {
+        y.par_chunks_mut(cols).enumerate().for_each(body);
+    } else {
+        y.chunks_mut(cols).enumerate().for_each(body);
+    }
 }
 
 /// Row-wise LayerNorm with affine parameters.
 pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32], rows: usize, cols: usize, eps: f32) {
-    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+    let body = |(r, out): (usize, &mut [f32])| {
         let row = &x[r * cols..(r + 1) * cols];
         let mean = row.iter().sum::<f32>() / cols as f32;
         let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
@@ -265,41 +295,59 @@ pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32], rows: usize, c
         for c in 0..cols {
             out[c] = (row[c] - mean) * inv * w[c] + b[c];
         }
-    });
+    };
+    if wide_enough(rows * cols) {
+        y.par_chunks_mut(cols).enumerate().for_each(body);
+    } else {
+        y.chunks_mut(cols).enumerate().for_each(body);
+    }
 }
 
 /// `y = silu(gate) * up`.
 pub fn silu_mul(gate: &[f32], up: &[f32], y: &mut [f32]) {
-    y.par_iter_mut().zip(gate.par_iter().zip(up.par_iter())).with_min_len(16).for_each(|(o, (g, u))| {
-        *o = (g / (1.0 + (-g).exp())) * u;
-    });
+    let body = |(o, (g, u)): (&mut f32, (&f32, &f32))| *o = (g / (1.0 + (-g).exp())) * u;
+    if wide_enough(y.len()) {
+        y.par_iter_mut().zip(gate.par_iter().zip(up.par_iter())).with_min_len(16).for_each(body);
+    } else {
+        y.iter_mut().zip(gate.iter().zip(up)).for_each(body);
+    }
 }
 
 /// In-place per-channel scale on `[rows, cols]`.
 pub fn scale_cols(x: &mut [f32], scale: &[f32], cols: usize) {
-    x.par_chunks_mut(cols).with_min_len(1).for_each(|row| {
+    let body = |row: &mut [f32]| {
         for (c, v) in row.iter_mut().enumerate() {
             *v *= scale[c];
         }
-    });
+    };
+    if wide_enough(x.len()) {
+        x.par_chunks_mut(cols).with_min_len(1).for_each(body);
+    } else {
+        x.chunks_mut(cols).for_each(body);
+    }
 }
 
 /// `y = a + scale[c] * b`.
 pub fn add_scaled(a: &[f32], b: &[f32], scale: &[f32], y: &mut [f32], cols: usize) {
-    y.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+    let mut body = |(r, out): (usize, &mut [f32])| {
         let a = &a[r * cols..(r + 1) * cols];
         let b = &b[r * cols..(r + 1) * cols];
         for c in 0..cols {
             out[c] = a[c] + scale[c] * b[c];
         }
-    });
+    };
+    if wide_enough(y.len()) {
+        y.par_chunks_mut(cols).enumerate().for_each(body);
+    } else {
+        y.chunks_mut(cols).enumerate().for_each(body);
+    }
 }
 
 /// Rotary position embedding, rotate-half form.
 pub fn rope(x: &mut [f32], frames: usize, heads: usize, head_dim: usize, theta: f32) {
     let half = head_dim / 2;
     let stride = heads * head_dim;
-    x.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
+    let body = |(t, row): (usize, &mut [f32])| {
         for h in 0..heads {
             let base = h * head_dim;
             for j in 0..half {
@@ -312,7 +360,12 @@ pub fn rope(x: &mut [f32], frames: usize, heads: usize, head_dim: usize, theta: 
                 row[base + j + half] = b * c + a * s;
             }
         }
-    });
+    };
+    if wide_enough(x.len()) {
+        x.par_chunks_mut(stride).enumerate().take(frames).for_each(body);
+    } else {
+        x.chunks_mut(stride).enumerate().take(frames).for_each(body);
+    }
 }
 
 /// Causal sliding-window attention over `[T, heads*head_dim]`.
@@ -485,7 +538,7 @@ pub fn attention_decode(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
 pub fn rope_tabled(x: &mut [f32], cos: &[f32], sin: &[f32], frames: usize, heads: usize, head_dim: usize) {
     let half = head_dim / 2;
     let stride = heads * head_dim;
-    x.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
+    let body = |(t, row): (usize, &mut [f32])| {
         for h in 0..heads {
             let base = h * head_dim;
             for j in 0..half {
@@ -497,7 +550,12 @@ pub fn rope_tabled(x: &mut [f32], cos: &[f32], sin: &[f32], frames: usize, heads
                 row[base + j + half] = b * c + a * s;
             }
         }
-    });
+    };
+    if wide_enough(x.len()) {
+        x.par_chunks_mut(stride).enumerate().take(frames).for_each(body);
+    } else {
+        x.chunks_mut(stride).enumerate().take(frames).for_each(body);
+    }
 }
 
 /// Grouped-query KV repeat.
