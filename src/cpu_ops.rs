@@ -506,6 +506,59 @@ pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
     }
 }
 
+/// ConvTranspose1d with `ks == 2*stride` (every codec upsampling block) computed
+/// as `stride` kernel-2 causal convolutions sharing the input, then an interleave.
+///
+/// Output sample `t = m*stride + q` only reads input samples `m` and `m-1` with
+/// kernel taps `q` and `q+stride`, so phase `q` is a contiguous stride-1 conv over
+/// the whole input. That reuses the tuned `conv1d` kernels (~280 GFLOP/s) instead
+/// of the hand-rolled scatter loop (~80), at the cost of one extra full-size
+/// intermediate plus an interleave pass — a clear win at every block size.
+pub fn conv_transpose1d_phased(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
+                               cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
+    debug_assert_eq!(ks, 2 * stride, "phased form needs ks == 2*stride, got {ks}/{stride}");
+    let t_out = t_in * stride;
+    // conv1d row `q*cout + co` = [x[m-1] taps | x[m] taps] = [W[ci,co,q+stride] | W[ci,co,q]].
+    let mut w2 = vec![0.0f32; cout * stride * cin * 2];
+    for q in 0..stride {
+        for co in 0..cout {
+            let dst = (q * cout + co) * cin * 2;
+            for ci in 0..cin {
+                let src = (ci * cout + co) * ks;
+                w2[dst + ci * 2] = w[src + q + stride];
+                w2[dst + ci * 2 + 1] = w[src + q];
+            }
+        }
+    }
+    let b2: Vec<f32> = (0..cout * stride).map(|row| b[row % cout]).collect();
+    let mut tmp = vec![0.0f32; cout * stride * t_in];
+    conv1d(x, &w2, &b2, &mut tmp, (cin, cout * stride, 2, 1, 1, 1, t_in, t_in));
+
+    // `y[co, m*stride + q] = tmp[q*cout + co, m]`. Reads go one phase plane at a
+    // time; a small staging tile keeps both sides' streams contiguous instead of
+    // striding `t_in` floats between successive elements.
+    if stride == 1 {
+        y.copy_from_slice(&tmp);
+        return;
+    }
+    const TILE: usize = 64;
+    y.par_chunks_mut(t_out).enumerate().for_each(|(co, row)| {
+        let mut stage = vec![0.0f32; stride * TILE];
+        for m0 in (0..t_in).step_by(TILE) {
+            let len = TILE.min(t_in - m0);
+            for q in 0..stride {
+                let src = &tmp[(q * cout + co) * t_in + m0..][..len];
+                stage[q * TILE..q * TILE + len].copy_from_slice(src);
+            }
+            for m in 0..len {
+                for q in 0..stride {
+                    row[(m0 + m) * stride + q] = stage[q * TILE + m];
+                }
+            }
+        }
+    });
+}
+
 /// Exact GELU: `0.5 x (1 + erf(x / sqrt 2))`.
 pub fn gelu(x: &mut [f32]) {
     x.par_iter_mut().with_min_len(16).for_each(|v| {

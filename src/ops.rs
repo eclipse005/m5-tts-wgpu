@@ -313,8 +313,15 @@ pub fn conv_transpose1d(dev: &Device, x: &Tensor, w: &Tensor, bias: &Tensor, y: 
     match dev {
         Device::Gpu(gpu) => gpu_ops::conv_transpose1d(gpu, x.gpu_buffer()?, w.gpu_buffer()?, bias.gpu_buffer()?,
                                                       y.gpu_buffer()?, cin, cout, ks, stride, t_in),
-        Device::Cpu => cpu_ops::conv_transpose1d(x.cpu_slice()?, w.cpu_slice()?, bias.cpu_slice()?,
-                                                 y.cpu_slice_mut()?, cin, cout, ks, stride, t_in),
+        Device::Cpu => {
+            if ks == 2 * stride {
+                cpu_ops::conv_transpose1d_phased(x.cpu_slice()?, w.cpu_slice()?, bias.cpu_slice()?,
+                                                 y.cpu_slice_mut()?, cin, cout, ks, stride, t_in);
+            } else {
+                cpu_ops::conv_transpose1d(x.cpu_slice()?, w.cpu_slice()?, bias.cpu_slice()?,
+                                          y.cpu_slice_mut()?, cin, cout, ks, stride, t_in);
+            }
+        }
     }
     Ok(())
 }
