@@ -640,17 +640,23 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32], k: usize) -> f32 {
 /// x86); `M5_NO_SIMD=1` forces it so the fallback stays tested — it is the path a
 /// non-AVX2 machine runs, not dead code.
 fn avx2_available() -> bool {
-    if std::env::var_os("M5_NO_SIMD").is_some() {
-        return false;
-    }
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-    {
-        false
-    }
+    // Detected once: this is called inside per-row loops (millions of times per
+    // frame), and `env::var_os` takes the process environment lock — putting the
+    // `M5_NO_SIMD` check here uncached made the LM 9x slower.
+    static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        if std::env::var_os("M5_NO_SIMD").is_some() {
+            return false;
+        }
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+        {
+            false
+        }
+    })
 }
 
 /// `acc += window[k*dilation + j] * w[k]` for the whole time block, 8 lanes at a
@@ -1060,8 +1066,45 @@ fn bf16_pair(bytes: &[u8]) -> (f32, f32) {
     )
 }
 
-/// `dot(x, bf16 weight row)` where `bytes` is the row's raw bf16 data.
+/// `dot(x, bf16 weight row)`, eight weights per FMA when AVX2 is available.
 fn dot_bf16(x: &[f32], bytes: &[u8], k: usize) -> f32 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        if avx2_available() {
+            // SAFETY: guarded by `avx2_available()`.
+            return unsafe { dot_bf16_avx2(x, bytes, k) };
+        }
+    }
+    dot_bf16_scalar(x, bytes, k)
+}
+
+/// bf16 -> f32 is a 16-bit shift, so eight weights widen with one instruction pair
+/// and feed one FMA; the scalar version does two conversions per pair.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_avx2(x: &[f32], bytes: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 8 <= k {
+        let raw = _mm_loadu_si128(bytes.as_ptr().add(i * 2) as *const __m128i);
+        let weights = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+        let activations = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(activations, weights, acc);
+        i += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum: f32 = lanes.iter().sum();
+    while i < k {
+        let bits = u16::from_le_bytes([*bytes.get_unchecked(i * 2), *bytes.get_unchecked(i * 2 + 1)]);
+        sum += *x.get_unchecked(i) * f32::from_bits((bits as u32) << 16);
+        i += 1;
+    }
+    sum
+}
+
+fn dot_bf16_scalar(x: &[f32], bytes: &[u8], k: usize) -> f32 {
     let mut acc = 0.0f32;
     let mut i = 0usize;
     while i + 2 <= k {
