@@ -38,6 +38,9 @@ pub struct Gpu {
     pending: RefCell<Vec<Pending>>,
     pipelines: RefCell<HashMap<String, wgpu::ComputePipeline>>,
     pub stats: RefCell<Stats>,
+    /// Upload bytes per call-site label, so a profiling run can show where the
+    /// PCIe traffic actually comes from (`M5_PROFILE=1`).
+    pub upload_labels: RefCell<HashMap<String, u64>>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -46,6 +49,21 @@ pub struct Stats {
     pub submits: u64,
     pub bytes_uploaded: u64,
     pub bytes_readback: u64,
+}
+
+impl Gpu {
+    /// Snapshot of the counters (dispatches, submits, transfer bytes).
+    pub fn snapshot(&self) -> Stats {
+        *self.stats.borrow()
+    }
+
+    /// Block until everything queued so far has executed. `flush` alone only
+    /// submits — profiling laps need the wait too, or elapsed measures command
+    /// recording, not execution.
+    pub fn sync(&self) {
+        self.flush();
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+    }
 }
 
 fn backend_name(backend: wgpu::Backend) -> &'static str {
@@ -112,6 +130,7 @@ impl Gpu {
             pending: RefCell::new(Vec::new()),
             pipelines: RefCell::new(HashMap::new()),
             stats: RefCell::new(Stats::default()),
+            upload_labels: RefCell::new(HashMap::new()),
         })
     }
 
@@ -131,6 +150,7 @@ impl Gpu {
             usage: Self::storage_usage(),
         });
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
+        *self.upload_labels.borrow_mut().entry(label.to_string()).or_insert(0) += (data.len() * 4) as u64;
         buffer
     }
 

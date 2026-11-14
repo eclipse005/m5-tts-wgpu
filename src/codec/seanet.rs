@@ -57,7 +57,10 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     let [cin, frames] = x.shape();
     let profile = std::env::var("M5_PROFILE_DEEP").is_ok();
     let mut phase = std::time::Instant::now();
+    // GPU work is queued, not executed: drain it before reading the clock so a
+    // stage's elapsed includes its own execution (flush is a no-op on CPU).
     let lap = |name: &str, phase: &mut std::time::Instant| {
+        if let crate::device::Device::Gpu(gpu) = dev { gpu.sync(); }
         if profile { eprintln!("        {name}: {:.3}s", phase.elapsed().as_secs_f64()); }
         *phase = std::time::Instant::now();
     };
@@ -127,10 +130,10 @@ impl Codec {
         if let Some(t) = trace.as_deref_mut() {
             t.push(("snake".to_string(), self.device().copy(&h)?));
         }
-        if profile { eprintln!("      final snake: {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("      final snake: {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let mut pcm = causal_conv(self, &h, "decoder.decoder.6.conv.weight",
                                   "decoder.decoder.6.conv.bias", 1, 7, 1)?;
-        if profile { eprintln!("      final conv: {:.3}s", phase.elapsed().as_secs_f64()); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("      final conv: {:.3}s", phase.elapsed().as_secs_f64()); }
 
         // `wav.clamp(min=-1, max=1)`: the reference's own saturation, which is also
         // where its occasional click comes from.
@@ -150,19 +153,19 @@ impl Codec {
         let mut phase = std::time::Instant::now();
 
         let quantized = self.dequantize(codes, frames)?; // [codebook_dim, frames]
-        if profile { eprintln!("    quantise {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("    quantise {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let h = causal_conv(self, &quantized, "decoder.pre_conv.conv.weight",
                                 "decoder.pre_conv.conv.bias", cfg.latent_dim, 3, 1)?;
 
         let mut time_major = dev.zeros([frames, cfg.latent_dim])?;
         ops::transpose(dev, &h, &mut time_major)?;
-        if profile { eprintln!("    pre_conv {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("    pre_conv {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let transformed = self.transformer(&time_major)?;
-        if profile { eprintln!("    pre_transformer {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("    pre_transformer {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         let mut channels_major = dev.zeros([cfg.latent_dim, frames])?;
         ops::transpose(dev, &transformed, &mut channels_major)?;
         let upsampled = self.upsample(&channels_major)?;
-        if profile { eprintln!("    upsample {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
+        if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("    upsample {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }
         // Channels-first stays. A channels-last rewrite (seanet_cl, same math,
         // SNR 112 dB) measures 2.66 s against 2.03 s here on the same input: at
         // these sizes the tail is DRAM-bound, so the better arithmetic intensity of

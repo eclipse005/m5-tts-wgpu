@@ -120,6 +120,7 @@ impl Pipeline {
         let profile = std::env::var("M5_PROFILE").is_ok();
         let mut phase = std::time::Instant::now();
         let lap = |name: &str, phase: &mut std::time::Instant| {
+            if let Device::Gpu(gpu) = self.codec.device() { gpu.sync(); }
             if profile { eprintln!("    encode/{name}: {:.3}s", phase.elapsed().as_secs_f64()); }
             *phase = std::time::Instant::now();
         };
@@ -219,12 +220,14 @@ impl Pipeline {
                 }
                 frame_noise.push(draw);
             }
+            if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_noise += lap.elapsed().as_secs_f64();
             // The reference allows EOS only after `min_tokens` (6) frames.
             let allow_eos = frame > 6;
             let lap = Instant::now();
             let sampled = self.lm.depth_codes(&last, 0, &frame_noise, args.temperature,
                                               args.topk, allow_eos)?;
+            if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_depth += lap.elapsed().as_secs_f64();
             if sampled.iter().all(|token| *token == 0) {
                 break; // EOS
@@ -240,6 +243,7 @@ impl Pipeline {
             let next = self.lm.embed_generated(&codes)?;
             last = self.lm.backbone_step(&next, &mut kv, position)?;
             position += 1;
+            if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_step += lap.elapsed().as_secs_f64();
         }
         let generated_frames = generated.len() / CODEBOOKS;
@@ -275,7 +279,22 @@ impl Pipeline {
         }
         let audio = host[trim_front..host.len() - trim_back].to_vec();
 
-        if profile { eprintln!("  codec decode: {:.3}s", phase.elapsed().as_secs_f64()); }
+        if profile {
+            if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
+            eprintln!("  codec decode: {:.3}s", phase.elapsed().as_secs_f64());
+            if let Device::Gpu(gpu) = self.lm.device() {
+                let st = gpu.snapshot();
+                eprintln!("  gpu stats: {} dispatches, {} submits, uploaded {:.1} MB, readback {:.1} MB",
+                          st.dispatches, st.submits,
+                          st.bytes_uploaded as f64 / 1e6, st.bytes_readback as f64 / 1e6);
+                let mut labels: Vec<(String, u64)> = gpu.upload_labels.borrow().iter()
+                    .map(|(k, v)| (k.clone(), *v)).collect();
+                labels.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+                for (label, bytes) in labels.iter().take(8) {
+                    eprintln!("    upload {}: {:.1} MB", label, *bytes as f64 / 1e6);
+                }
+            }
+        }
         Ok(Synthesis {
             codes: all_codes,
             frames,
