@@ -78,7 +78,9 @@ pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
     // Measured on this machine: a fixed 128-sample block beats cache-sized blocks
     // (212 vs 47 GFLOP/s). Smaller blocks pay the staging cost far more often than
     // they gain from L1 residency.
-    let bt: usize = 128;
+    // A/B'd via seanet_probe variant 1 at the block-4 shape (same-process):
+    // 128 -> 107 ms, 512 -> ~78 ms: staging forks amortise, windows stay < L2.
+    let bt: usize = 512;
     let span = (ks - 1) * dilation + 1;
     for t0 in (0..t_out).step_by(bt) {
         let tn = bt.min(t_out - t0);
