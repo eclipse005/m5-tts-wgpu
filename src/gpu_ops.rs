@@ -265,6 +265,21 @@ pub fn sample_topk_offset(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buff
     gpu.dispatch_params("sample_topk_f32", shaders::SAMPLE_TOPK_F32, "main", &[(0, logits), (1, noise), (2, out)], &params, (1, 1, 1));
 }
 
+/// Register-blocked channels-last conv (8x8 per thread). Same contract as
+/// `conv1d_cl`; dispatched by the codec for stride <= 2 shapes.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_reg8(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: &Buffer, y: &Buffer,
+                   cin: usize, cout: usize, ks: usize, dilation: usize, stride: usize,
+                   pad: usize, t_in: usize, t_out: usize) {
+    let params = gpu.params_u32(&[
+        cin as u32, cout as u32, ks as u32, dilation as u32,
+        stride as u32, pad as u32, t_in as u32, t_out as u32,
+    ]);
+    let groups = (t_out.div_ceil(64) as u32, cout.div_ceil(64) as u32, 1);
+    gpu.dispatch_params("conv1d_reg8", shaders::CONV1D_REG8_F32, "main",
+                        &[(0, x), (1, w), (2, bias), (3, y)], &params, groups);
+}
+
 /// Phased transposed conv (weights pre-packed as `[(co*stride+q)*taps*cin + tap*cin + ci]`).
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose_phased(gpu: &Gpu, x: &Buffer, w2: &Buffer, bias: &Buffer, y: &Buffer,

@@ -750,6 +750,662 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 "#;
 
+/// Register-blocked channels-last conv: 8 timesteps x 8 output channels per
+/// thread (64 named accumulators), 16 staged input channels per chunk. The
+/// previous staged kernel read its staged window through a runtime-indexed
+/// local array, which spilled to local memory; with named registers the inner
+/// loop is 64 FMAs against 8 shared + 8 coalesced global loads. Same bindings
+/// and packed weights as CONV1D_REG_GPU (channels-last x, [(tap*cin+ci)*cout+co]).
+pub const CONV1D_REG8_F32: &str = r#"
+// 0=cin 1=cout 2=ks 3=dilation 4=stride 5=pad 6=t_in 7=t_out
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 8>;
+
+const TT: u32 = 64u;
+const CT: u32 = 64u;
+const CI: u32 = 16u;
+const WIN_MAX: u32 = 64u * 8u + 64u;
+
+var<workgroup> stage: array<f32, 16 * 576>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t0 = wid.x * TT;
+    let co0 = wid.y * CT;
+    let t_base = t0 + lid.y * 8u;
+    let c_base = co0 + lid.x * 8u;
+    let span = (p[2] - 1u) * p[3] + 1u;
+    let win_len = TT * p[4] + span;
+
+    var a00: f32 = 0.0;
+    var a01: f32 = 0.0;
+    var a02: f32 = 0.0;
+    var a03: f32 = 0.0;
+    var a04: f32 = 0.0;
+    var a05: f32 = 0.0;
+    var a06: f32 = 0.0;
+    var a07: f32 = 0.0;
+    var a10: f32 = 0.0;
+    var a11: f32 = 0.0;
+    var a12: f32 = 0.0;
+    var a13: f32 = 0.0;
+    var a14: f32 = 0.0;
+    var a15: f32 = 0.0;
+    var a16: f32 = 0.0;
+    var a17: f32 = 0.0;
+    var a20: f32 = 0.0;
+    var a21: f32 = 0.0;
+    var a22: f32 = 0.0;
+    var a23: f32 = 0.0;
+    var a24: f32 = 0.0;
+    var a25: f32 = 0.0;
+    var a26: f32 = 0.0;
+    var a27: f32 = 0.0;
+    var a30: f32 = 0.0;
+    var a31: f32 = 0.0;
+    var a32: f32 = 0.0;
+    var a33: f32 = 0.0;
+    var a34: f32 = 0.0;
+    var a35: f32 = 0.0;
+    var a36: f32 = 0.0;
+    var a37: f32 = 0.0;
+    var a40: f32 = 0.0;
+    var a41: f32 = 0.0;
+    var a42: f32 = 0.0;
+    var a43: f32 = 0.0;
+    var a44: f32 = 0.0;
+    var a45: f32 = 0.0;
+    var a46: f32 = 0.0;
+    var a47: f32 = 0.0;
+    var a50: f32 = 0.0;
+    var a51: f32 = 0.0;
+    var a52: f32 = 0.0;
+    var a53: f32 = 0.0;
+    var a54: f32 = 0.0;
+    var a55: f32 = 0.0;
+    var a56: f32 = 0.0;
+    var a57: f32 = 0.0;
+    var a60: f32 = 0.0;
+    var a61: f32 = 0.0;
+    var a62: f32 = 0.0;
+    var a63: f32 = 0.0;
+    var a64: f32 = 0.0;
+    var a65: f32 = 0.0;
+    var a66: f32 = 0.0;
+    var a67: f32 = 0.0;
+    var a70: f32 = 0.0;
+    var a71: f32 = 0.0;
+    var a72: f32 = 0.0;
+    var a73: f32 = 0.0;
+    var a74: f32 = 0.0;
+    var a75: f32 = 0.0;
+    var a76: f32 = 0.0;
+    var a77: f32 = 0.0;
+
+    let chunks = (p[0] + CI - 1u) / CI;
+    for (var c0 = 0u; c0 < chunks; c0 = c0 + 1u) {
+        for (var i = tid; i < CI * win_len; i = i + 64u) {
+            let ci_local = i / win_len;
+            let j = i % win_len;
+            let ci = c0 * CI + ci_local;
+            var value = 0.0;
+            if (ci < p[0]) {
+                let src = i32(t0 * p[4]) + i32(j) - i32(p[5]);
+                if (src >= 0 && src < i32(p[6])) {
+                    value = x[u32(src) * p[0] + ci];
+                }
+            }
+            stage[ci_local * win_len + j] = value;
+        }
+        workgroupBarrier();
+
+        for (var ci_local = 0u; ci_local < CI; ci_local = ci_local + 1u) {
+            let ci = c0 * CI + ci_local;
+            if (ci >= p[0]) { continue; }
+            for (var tap = 0u; tap < p[2]; tap = tap + 1u) {
+                let x0 = stage[ci_local * win_len + (lid.y * 8u + 0u) * p[4] + tap * p[3]];
+                let x1 = stage[ci_local * win_len + (lid.y * 8u + 1u) * p[4] + tap * p[3]];
+                let x2 = stage[ci_local * win_len + (lid.y * 8u + 2u) * p[4] + tap * p[3]];
+                let x3 = stage[ci_local * win_len + (lid.y * 8u + 3u) * p[4] + tap * p[3]];
+                let x4 = stage[ci_local * win_len + (lid.y * 8u + 4u) * p[4] + tap * p[3]];
+                let x5 = stage[ci_local * win_len + (lid.y * 8u + 5u) * p[4] + tap * p[3]];
+                let x6 = stage[ci_local * win_len + (lid.y * 8u + 6u) * p[4] + tap * p[3]];
+                let x7 = stage[ci_local * win_len + (lid.y * 8u + 7u) * p[4] + tap * p[3]];
+                let wbase = (tap * p[0] + ci) * p[1] + c_base;
+                let w0 = w[wbase];
+                let w1 = w[wbase + 1u];
+                let w2 = w[wbase + 2u];
+                let w3 = w[wbase + 3u];
+                let w4 = w[wbase + 4u];
+                let w5 = w[wbase + 5u];
+                let w6 = w[wbase + 6u];
+                let w7 = w[wbase + 7u];
+                a00 = a00 + x0 * w0;
+                a01 = a01 + x0 * w1;
+                a02 = a02 + x0 * w2;
+                a03 = a03 + x0 * w3;
+                a04 = a04 + x0 * w4;
+                a05 = a05 + x0 * w5;
+                a06 = a06 + x0 * w6;
+                a07 = a07 + x0 * w7;
+                a10 = a10 + x1 * w0;
+                a11 = a11 + x1 * w1;
+                a12 = a12 + x1 * w2;
+                a13 = a13 + x1 * w3;
+                a14 = a14 + x1 * w4;
+                a15 = a15 + x1 * w5;
+                a16 = a16 + x1 * w6;
+                a17 = a17 + x1 * w7;
+                a20 = a20 + x2 * w0;
+                a21 = a21 + x2 * w1;
+                a22 = a22 + x2 * w2;
+                a23 = a23 + x2 * w3;
+                a24 = a24 + x2 * w4;
+                a25 = a25 + x2 * w5;
+                a26 = a26 + x2 * w6;
+                a27 = a27 + x2 * w7;
+                a30 = a30 + x3 * w0;
+                a31 = a31 + x3 * w1;
+                a32 = a32 + x3 * w2;
+                a33 = a33 + x3 * w3;
+                a34 = a34 + x3 * w4;
+                a35 = a35 + x3 * w5;
+                a36 = a36 + x3 * w6;
+                a37 = a37 + x3 * w7;
+                a40 = a40 + x4 * w0;
+                a41 = a41 + x4 * w1;
+                a42 = a42 + x4 * w2;
+                a43 = a43 + x4 * w3;
+                a44 = a44 + x4 * w4;
+                a45 = a45 + x4 * w5;
+                a46 = a46 + x4 * w6;
+                a47 = a47 + x4 * w7;
+                a50 = a50 + x5 * w0;
+                a51 = a51 + x5 * w1;
+                a52 = a52 + x5 * w2;
+                a53 = a53 + x5 * w3;
+                a54 = a54 + x5 * w4;
+                a55 = a55 + x5 * w5;
+                a56 = a56 + x5 * w6;
+                a57 = a57 + x5 * w7;
+                a60 = a60 + x6 * w0;
+                a61 = a61 + x6 * w1;
+                a62 = a62 + x6 * w2;
+                a63 = a63 + x6 * w3;
+                a64 = a64 + x6 * w4;
+                a65 = a65 + x6 * w5;
+                a66 = a66 + x6 * w6;
+                a67 = a67 + x6 * w7;
+                a70 = a70 + x7 * w0;
+                a71 = a71 + x7 * w1;
+                a72 = a72 + x7 * w2;
+                a73 = a73 + x7 * w3;
+                a74 = a74 + x7 * w4;
+                a75 = a75 + x7 * w5;
+                a76 = a76 + x7 * w6;
+                a77 = a77 + x7 * w7;
+            }
+        }
+        workgroupBarrier();
+    }
+
+    // Epilogue: bias + bounds-checked store, 8x8 per thread (channels-last y).
+        {
+            let t = t_base + 0u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a00 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a01 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a02 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a03 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a04 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a05 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a06 + b[co];
+            }
+        }
+        {
+            let t = t_base + 0u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a07 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a10 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a11 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a12 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a13 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a14 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a15 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a16 + b[co];
+            }
+        }
+        {
+            let t = t_base + 1u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a17 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a20 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a21 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a22 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a23 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a24 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a25 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a26 + b[co];
+            }
+        }
+        {
+            let t = t_base + 2u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a27 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a30 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a31 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a32 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a33 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a34 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a35 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a36 + b[co];
+            }
+        }
+        {
+            let t = t_base + 3u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a37 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a40 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a41 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a42 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a43 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a44 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a45 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a46 + b[co];
+            }
+        }
+        {
+            let t = t_base + 4u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a47 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a50 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a51 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a52 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a53 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a54 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a55 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a56 + b[co];
+            }
+        }
+        {
+            let t = t_base + 5u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a57 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a60 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a61 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a62 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a63 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a64 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a65 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a66 + b[co];
+            }
+        }
+        {
+            let t = t_base + 6u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a67 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 0u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a70 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 1u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a71 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 2u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a72 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 3u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a73 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 4u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a74 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 5u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a75 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 6u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a76 + b[co];
+            }
+        }
+        {
+            let t = t_base + 7u;
+            let co = c_base + 7u;
+            if (t < p[7] && co < p[1]) {
+                y[t * p[1] + co] = a77 + b[co];
+            }
+        }
+}
+"#;
+
 /// GEMV with a residual add in the epilogue: `y[r] = dot(w[r], x) + res[r]`.
 pub const GEMV_ADD_F32: &str = r#"
 // 0=n 1=k

@@ -26,8 +26,8 @@ fn causal_conv(codec: &Codec, x: &Tensor, weight_name: &str, bias_name: &str,
         let x_cl = gpu.empty("conv1d.x_cl", frames * cin);
         crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, &x_cl, cin, frames);
         let y_cl = gpu.empty("conv1d.y_cl", frames * cout);
-        crate::gpu_ops::conv1d_cl(gpu, &x_cl, packed.gpu_buffer()?, bias.gpu_buffer()?, &y_cl,
-                                  cin, cout, ks, dilation, 1, (ks - 1) * dilation, frames, frames);
+        crate::gpu_ops::conv1d_reg8(gpu, &x_cl, packed.gpu_buffer()?, bias.gpu_buffer()?, &y_cl,
+                                    cin, cout, ks, dilation, 1, (ks - 1) * dilation, frames, frames);
         crate::gpu_ops::transpose(gpu, &y_cl, out.gpu_buffer()?, frames, cout);
         return Ok(out);
     }
