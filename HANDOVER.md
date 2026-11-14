@@ -299,8 +299,19 @@ noise 行偏移；2-token prefill 设备端拼接）+ **submit 税发现**（每
 ~0.5ms 驱动延迟；M5_MAX_PENDING=100000 单独一项就 RTF 3.77→3.02）+ params 池 +
 layout 缓存（dispatch 28.7→~10µs 组合实测；非线性残差未解，探针数据在 gpu_probe a-g）。
 PCIe 上传 2.7GB 的 33MB/帧部分待 depth 融合时一并处理。
-下一步：depth 层融合 18→4 dispatch/层（1700→450 dispatch/帧，在位 74ms/帧 → 目标
-~20-25）→ block4 单元占用率 → 共享内存版转置卷积 → bf16 上卡。
+**depth 层融合已落地**（fb244aa）：18→6 dispatch/层（gemv_add / norm_gateup /
+silu_down / 轻量 rope+cache+attention，rope 全表一次上卡按 position 索引，
+scratch 池免分配）。depth 161 → 69 ms/帧。过程中 parity 门拦下三个 bug
+（kv_rows 来源、参数重排后的 head_dim 错位、非法 select）。
+
+**诚实结论**：depth 在 GPU 上是 dispatch 受限——每层 6 个 pipeline 轮换的 dispatch
+在位 ~120µs/个（探针单 pipeline 背靠背只有 26µs），kernel 本身合计 ~100µs/层。
+要再降只能更激进的 kernel 合并或持久绑定设计；本卡+驱动下 depth 的 GPU 路径
+（69ms/帧）仍落后 CPU 融合路径（24ms/帧）约 3 倍。`M5_DEPTH_HOST=1` 可切回
+CPU depth（混合模式 RTF ~2.1 vs 全 GPU 2.65）。
+
+下一步：block4 单元占用率 → 共享内存版转置卷积 → bf16 上卡 → depth 的
+pipeline-switching 剖析（6-pipeline 轮换 vs 单 pipeline 的 120 vs 26µs 之差）。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
