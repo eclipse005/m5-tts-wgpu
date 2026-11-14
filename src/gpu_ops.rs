@@ -162,6 +162,48 @@ pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
     gpu.dispatch_params("copy_f32", shaders::COPY_F32, "main", &[(0, x), (1, y)], &params, grid(len));
 }
 
+/// Fused decode-step attention block (one workgroup per query head).
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_attend_f32(gpu: &Gpu, qkv: &Buffer, cache_k: &Buffer, cache_v: &Buffer,
+                      attended: &Buffer, cos: &Buffer, sin: &Buffer, position: usize,
+                      heads: usize, q_rows: usize) {
+    let kv_rows = q_rows / 4;  // heads / kv_heads == 4 in the LM geometry
+    let params = gpu.params_u32(&[
+        q_rows as u32, kv_rows as u32, 64u32, position as u32, heads as u32,
+    ]);
+    gpu.dispatch_params("qkv_attend_f32", shaders::QKV_ATTEND_F32, "main",
+                        &[(0, qkv), (1, cache_k), (2, cache_v), (3, attended),
+                          (4, cos), (5, sin)],
+                        &params, (heads as u32, 1, 1));
+}
+
+/// GEMV with the residual add fused into the epilogue.
+pub fn gemv_add_f32(gpu: &Gpu, x: &Buffer, w: &Buffer, res: &Buffer, y: &Buffer,
+                    n: usize, k: usize) {
+    let params = gpu.params_u32(&[n as u32, k as u32]);
+    gpu.dispatch_params("gemv_add_f32", shaders::GEMV_ADD_F32, "main",
+                        &[(0, x), (1, w), (2, res), (3, y)],
+                        &params, (n.div_ceil(8) as u32, 1, 1));
+}
+
+/// RMSNorm fused into the gate+up projection (one dispatch).
+pub fn norm_gateup_f32(gpu: &Gpu, x: &Buffer, norm_w: &Buffer, gate_w: &Buffer,
+                       up_w: &Buffer, y: &Buffer, inter: usize, hidden: usize, eps: f32) {
+    let params = gpu.params_u32(&[inter as u32, hidden as u32, eps.to_bits()]);
+    gpu.dispatch_params("norm_gateup_f32", shaders::NORM_GATEUP_F32, "main",
+                        &[(0, x), (1, norm_w), (2, gate_w), (3, up_w), (4, y)],
+                        &params, ((2 * inter as u32).div_ceil(64).max(1), 1u32, 1u32));
+}
+
+/// silu-mul fused into the down projection with the residual add.
+pub fn silu_down_f32(gpu: &Gpu, gate_up: &Buffer, down_w: &Buffer, x1: &Buffer, out: &Buffer,
+                     inter: usize, hidden: usize) {
+    let params = gpu.params_u32(&[inter as u32, hidden as u32]);
+    gpu.dispatch_params("silu_down_f32", shaders::SILU_DOWN_F32, "main",
+                        &[(0, gate_up), (1, down_w), (2, x1), (3, out)],
+                        &params, ((hidden as u32).div_ceil(8).max(1), 1u32, 1u32));
+}
+
 /// Copy `rows` rows of `src` into `dst` at row `offset`.
 pub fn write_rows(gpu: &Gpu, dst: &Buffer, src: &Buffer, cols: usize, offset: usize, rows: usize) {
     let params = gpu.params_u32(&[cols as u32, offset as u32, rows as u32, 0]);

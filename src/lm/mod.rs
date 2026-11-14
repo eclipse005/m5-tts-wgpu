@@ -62,6 +62,13 @@ pub struct Lm {
     /// depth decoder needs a different per-codebook transpose each step.
     audio_head: Vec<f32>,
     text_vocab: usize,
+    /// Fixed decode-step scratch on the GPU (attended/x1/gate_up/out) so the
+    /// fused layer does not allocate four buffers per layer step - in situ each
+    /// allocation cost ~250 us, which was the whole depth pass.
+    pub gpu_scratch: RefCell<Option<crate::lm::backbone::GpuLayerScratch>>,
+    /// Full rope table [2048, head_dim] on the device, uploaded once: the fused
+    /// layer indexes it by position instead of re-uploading cos/sin per step.
+    pub gpu_rope: RefCell<Option<(std::rc::Rc<Tensor>, std::rc::Rc<Tensor>)>>,
 }
 
 impl Lm {
@@ -100,6 +107,8 @@ impl Lm {
             audio_emb,
             audio_head,
             text_vocab,
+            gpu_scratch: RefCell::new(None),
+            gpu_rope: RefCell::new(None),
         })
     }
 

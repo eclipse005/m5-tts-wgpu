@@ -13,6 +13,17 @@ use crate::ops;
 
 /// Per-layer KV cache, already expanded to `heads` (GQA is resolved on write, so
 /// decode does not re-expand 360 rows every frame).
+/// Fixed decode-step scratch buffers for the fused GPU layer (see
+/// `llama_layer_gpu_fused_step`): allocated once, reused every layer step.
+pub struct GpuLayerScratch {
+    pub attended: Tensor,
+    pub normed: Tensor,
+    pub qkv: Tensor,
+    pub x1: Tensor,
+    pub gate_up: Tensor,
+    pub x_out: Tensor,
+}
+
 pub struct KvCache {
     k: Vec<Tensor>,
     v: Vec<Tensor>,
@@ -208,19 +219,28 @@ impl Lm {
     /// and writes rows at `position`, a step attends over the cache.
     #[allow(clippy::too_many_arguments)]
     pub fn llama_layer(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32], sin: &[f32],
-                       kv: Option<(&mut KvCache, usize, bool)>) -> Result<Tensor> {
+                       mut kv: Option<(&mut KvCache, usize, bool)>) -> Result<Tensor> {
         let dev = self.device();
         // CPU decode (one row, cache present): the fused path is ~2x faster than
-        // fourteen fork-joins. Prefill and the GPU keep the generic path.
+        // fourteen fork-joins. Prefill keeps the generic path.
         let fused = std::env::var("M5_NO_FUSED").is_err();
-        if fused && !dev.is_gpu() && x.shape()[0] == 1 {
-            if let Some((cache, position, false)) = kv {
-                // bf16 checkpoints (VoiceClone) keep their weights in bf16: half the
-                // DRAM traffic for the same, bit-identical result.
-                if std::env::var("M5_NO_BF16").is_err() {
-                    return self.llama_layer_cpu_step_bf16(prefix, index, x, cos, sin, cache, position);
+        if fused && x.shape()[0] == 1 {
+            // reborrow: the generic path below still needs `kv`
+            if let Some((cache, position, false)) = kv.as_mut() {
+                if dev.is_gpu() {
+                    // capacity guard: the fused attention holds its scores in
+                    // workgroup memory (1024 rows)
+                    if cache.capacity <= 1024 {
+                        return self.llama_layer_gpu_fused_step(prefix, index, x, cache, *position);
+                    }
+                } else {
+                    // bf16 checkpoints (VoiceClone) keep their weights in bf16: half the
+                    // DRAM traffic for the same, bit-identical result.
+                    if std::env::var("M5_NO_BF16").is_err() {
+                        return self.llama_layer_cpu_step_bf16(prefix, index, x, cos, sin, cache, *position);
+                    }
+                    return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, *position);
                 }
-                return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position);
             }
         }
         let p = format!("{prefix}.layers.{index}");
@@ -444,6 +464,104 @@ impl Lm {
     /// bf16 variant of [`Lm::llama_layer_cpu_step`]: identical math, half the
     /// weight bytes. Only used when every weight of the layer is stored bf16
     /// (VoiceClone); CustomVoice stays on the f32 path.
+    fn llama_layer_gpu_fused_step(&self, prefix: &str, index: usize, x: &Tensor,
+                                  cache: &mut KvCache, position: usize) -> Result<Tensor> {
+        let dev = self.device();
+        let gpu = dev.gpu()?;
+        let p = format!("{prefix}.layers.{index}");
+        let q_dim = HEADS * HEAD_DIM;
+
+        // Scratch pool: allocated once, reused every layer step. `x_out` doubles
+        // as the next layer's input (K1 reads it only after K4 overwrites it).
+        if self.gpu_scratch.borrow().is_none() {
+            let s = GpuLayerScratch {
+                attended: dev.zeros([1, q_dim])?,
+                normed: dev.zeros([1, HIDDEN])?,
+                qkv: dev.zeros([1, q_dim + 2 * KV_HEADS * HEAD_DIM])?,
+                x1: dev.zeros([1, HIDDEN])?,
+                gate_up: dev.zeros([1, 2 * INTERMEDIATE])?,
+                x_out: dev.zeros([1, HIDDEN])?,
+            };
+            *self.gpu_scratch.borrow_mut() = Some(s);
+        }
+        let mut scratch_guard = self.gpu_scratch.borrow_mut();
+        let scratch = scratch_guard.as_mut().expect("scratch initialised above");
+        let (cos_t, sin_t) = self.gpu_rope_tables()?;
+
+        let prof = std::env::var("M5_PROFILE_LAYER").is_ok();
+        let mut tick = std::time::Instant::now();
+        let lap = |name: &str, tick: &mut std::time::Instant| {
+            if prof {
+                gpu.sync();
+                eprintln!("      {name}: {:.0}us", tick.elapsed().as_secs_f64() * 1e6);
+            }
+            *tick = std::time::Instant::now();
+        };
+        lap("weights", &mut tick);
+
+        // RMS norm, then the fused [q; k; v] projection as one warp-per-row GEMV
+        // (768 rows): an earlier all-in-one kernel ran its dots uncoalesced on
+        // 8 workgroups and lost to this two-dispatch form.
+        let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+        crate::gpu_ops::rms_norm(gpu, x.gpu_buffer()?, input_norm.gpu_buffer()?,
+                          scratch.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
+        lap("rms", &mut tick);
+        let qkv_w = self.qkv_weight(prefix, index)?;
+        crate::gpu_ops::linear(gpu, scratch.normed.gpu_buffer()?, qkv_w.gpu_buffer()?, None,
+                        scratch.qkv.gpu_buffer()?, 1, q_dim + 2 * KV_HEADS * HEAD_DIM, HIDDEN);
+        lap("qkv", &mut tick);
+        {
+            let (cache_k, cache_v) = (&mut cache.k[index], &mut cache.v[index]);
+            crate::gpu_ops::qkv_attend_f32(gpu, scratch.qkv.gpu_buffer()?,
+                                           cache_k.gpu_buffer()?, cache_v.gpu_buffer()?,
+                                           scratch.attended.gpu_buffer()?,
+                                           cos_t.gpu_buffer()?, sin_t.gpu_buffer()?, position,
+                                           HEADS, q_dim);
+        }
+        lap("attn", &mut tick);
+
+        let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
+        crate::gpu_ops::gemv_add_f32(gpu, scratch.attended.gpu_buffer()?, o_w.gpu_buffer()?,
+                              x.gpu_buffer()?, scratch.x1.gpu_buffer()?, HIDDEN, q_dim);
+        lap("o+res", &mut tick);
+
+        let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+        let gate_w = self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        let up_w = self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        crate::gpu_ops::norm_gateup_f32(gpu, scratch.x1.gpu_buffer()?, post_norm.gpu_buffer()?,
+                                 gate_w.gpu_buffer()?, up_w.gpu_buffer()?,
+                                 scratch.gate_up.gpu_buffer()?, INTERMEDIATE, HIDDEN, 1e-5);
+        lap("gateup", &mut tick);
+
+        let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
+        crate::gpu_ops::silu_down_f32(gpu, scratch.gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
+                               scratch.x1.gpu_buffer()?, scratch.x_out.gpu_buffer()?,
+                               INTERMEDIATE, HIDDEN);
+        lap("down", &mut tick);
+        // handle clone: Tensor is not Clone (the CPU variant owns a Vec)
+        // handle clone: Tensor is not Clone (the CPU variant owns a Vec)
+        Ok(Tensor::Gpu(scratch.x_out.gpu_buffer()?.clone(), [1, HIDDEN]))
+    }
+
+    /// Full rope table ([2048, head_dim] cos/sin) on the GPU device, uploaded
+    /// once: the fused attention kernel indexes it by position instead of the
+    /// per-step cos/sin uploads (two buffer allocations per layer step).
+    fn gpu_rope_tables(&self) -> Result<(Rc<Tensor>, Rc<Tensor>)> {
+        if self.gpu_rope.borrow().is_none() {
+            let positions: Vec<usize> = (0..2048).collect();
+            let (cos, sin) = rope_table(&positions);
+            let ct = Rc::new(self.device().tensor([2048, HEAD_DIM], &cos)?);
+            let st = Rc::new(self.device().tensor([2048, HEAD_DIM], &sin)?);
+            *self.gpu_rope.borrow_mut() = Some((ct, st));
+        }
+        let pair = {
+            let b = self.gpu_rope.borrow();
+            let pair = b.as_ref().expect("rope tables initialised above");
+            (pair.0.clone(), pair.1.clone())
+        };
+        Ok(pair)
+    }
+
     fn llama_layer_cpu_step_bf16(&self, prefix: &str, index: usize, x: &Tensor, cos: &[f32],
                                  sin: &[f32], cache: &mut KvCache, position: usize) -> Result<Tensor> {
         let dev = self.device();
