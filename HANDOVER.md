@@ -5,6 +5,11 @@
 
 最后更新：见 `git log -1`。当前 HEAD 的提交信息会告诉你最后一步动了什么。
 
+**2025-11 本轮成果**（提交 603eb7c..4e49264）：RTF 从 1.21 → **0.95**（对 Python 1.36 快 30%），
+三步：①修好 6.3 的 9 倍回归（根因是 `env::var_os` 环境锁）；②发现逐元素算子本身不慢、
+慢的是每个 op 新分配大张量的双重分配（lazy 零页修复）；③转置卷积分相分解为 kernel-2 卷积。
+新增探针：`examples/mem_probe.rs`（内存原语）、`examples/seanet_probe.rs`（残差单元拆解）。
+
 ---
 
 ## 1. 这是什么
@@ -163,6 +168,9 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 |---|---|
 | **bf16 权重留在内存里，kernel 内展开** | VoiceClone 权重本来就是 bf16；lift 成 f32 会让每帧权重流量翻倍。展开是精确移位，结果逐位一致。CustomVoice 是 f32，走 f32 路径 |
 | **CPU decode 用融合层**（norm+QKV / o+残差 / norm+gate·up / silu+down） | 一层从 14 次 fork 降到 5 次；`M5_NO_FUSED=1` 可关闭对照 |
+| **CPU `zeros` 用懒提交零页，`copy` 并行分块** | 旧实现 `to_vec()` 把 72MB 逐页提交一遍（31ms/张量，单线程）；`vec![0.0; n]` 本身 0ms，页错误摊进写它的算子（452b528） |
+| **转置卷积分相分解**（`conv_transpose1d_phased`） | ks=2r 精确等价于 r 个 kernel-2 因果卷积 + 一次交错写；复用 conv1d 的 280 GFLOP/s，替换 80 GFLOP/s 的 scatter 循环（37469b1） |
+| **Snake 用 libm `sin`，不用 fast_sin** | snake 是带宽受限，sin 精度免费；fast_sin 掉 23dB SNR（4e49264） |
 | **通用路径用 slice-zip 写法** | 等长 slice 的 `zip`/`chunks` 让编译器在**任何架构**的基线 ISA 上自动向量化（x86 SSE2 / ARM NEON）。标量卷积因此从 51.7 → 198 GFLOP/s，只比手写 AVX2 慢 23% |
 | **channels-last 未采用**（`seanet_cl.rs` 保留但未接线） | 单独基准 339 vs 248 GFLOP/s，但真实尺寸下 2.66s vs 2.03s 更慢：这里是 DRAM 带宽受限 |
 | **单元级时间块融合未采用** | 同进程 A/B 只快 2% |
@@ -173,8 +181,9 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 ### 5.3 环境变量（诊断用）
 
 `M5_PROFILE=1`（pipeline/codec 分阶段计时）、`M5_PROFILE_DEEP=1`（block 级）、
-`M5_PROFILE_LAYER=1`（融合层内部）、`M5_NO_SIMD=1`（强制通用路径）、`M5_NO_FUSED=1`、
-`M5_NO_BF16=1`、`M5_MAX_PENDING=N`、`M5_TN_DIR`、`M5_MODEL`、`M5_CODEC`、`RAYON_NUM_THREADS`。
+`M5_PROFILE_LAYER=1`（融合层内部，f32 与 bf16 都有）、`M5_NO_SIMD=1`（强制通用路径）、
+`M5_NO_FUSED=1`、`M5_NO_BF16=1`、`M5_MAX_PENDING=N`、`M5_TN_DIR`、`M5_MODEL`、
+`M5_CODEC`、`RAYON_NUM_THREADS`。
 
 ---
 
@@ -199,40 +208,63 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 
 ### 6.2 最后一次可信的对齐状态
 
-* 端到端 parity：**帧数相同、codes 0 mismatch、SNR 108~112 dB**（`parity_pipeline`）
+* 端到端 parity（提交 4e49264，`parity_pipeline`）：帧数相同、**codes 0 mismatch**、
+  **CPU SNR 109.4 dB / GPU 108.2 dB**
 * 两个 SIMD 模式下 9 个测试套件全绿
 
-### 6.3 已知未解问题（接手第一件事）
+### 6.3 已解问题与新发现的机制（都实测过，别重蹈覆辙）
 
-**`depth_bench` 的 bf16 路径从 27.6 ms/帧退化到约 275 ms/帧**，而同一时刻：
+**① 9 倍回归已修复**（603eb7c）：`depth_bench` 27.6→275 ms/帧的根因**不是** `dot_bf16_avx2`，
+而是 `avx2_available()` 里每次调用 `env::var_os`——它抢进程环境锁，而这个函数在逐行
+循环里每帧被调几百万次。检测缓存进 `OnceLock` 后恢复 26.8 ms/帧。教训：**热循环里
+永远不要摸环境变量**（`M5_NO_SIMD` 这类开关必须在首次调用时缓存）。
 
-* `conv_bench` 仍然 244 GFLOP/s（AVX2）
-* `gemm_bench` m=512 仍然 81 GFLOP/s
-* f32 路径也是 ~267 ms/帧
+**② 大张量分配曾是隐藏大头**（452b528）：`add`/`snake` 本身 40+ GB/s，慢的是
+`Device::Cpu::zeros` 的双重分配——`vec![0.0; n]`（0ms，Windows 懒提交零页）再 `to_vec()`
+把 72MB 逐页提交一遍（~31ms，单线程）。修复后：
+* `zeros` 直接返回 alloc_zeroed vec，页错误摊进写它的算子（rayon 并行）；
+* `copy` 分块并行；`snake_beta` CPU 走 `snake_beta_into` 单遍免拷贝。
+残差单元在 block4 尺寸从 205→82 µs。**教训：先量算子还是量分配**（`examples/mem_probe.rs`）。
 
-也就是说**只有包含了新增 `dot_bf16_avx2`（HEAD 提交）之后的 LM 融合路径变慢**，
-但微基准里 `rms_norm_gemv_bf16` 的 SIMD 与标量两版都在 315~333 µs（都远慢于应有的 ~50 µs）。
-嫌疑顺序：`dot_bf16` 的分派层破坏了内联/向量化 → `rms_norm_gemv_bf16` → 整条融合层。
-处理建议：`git revert HEAD`（只回退 bf16 AVX2 点积这一提交）后重测 `depth_bench`，
-如果恢复到 27.6 ms/帧，就是这个改动的问题；如果没恢复，用 `perf` 或分阶段计时继续查
-（`src/lm/backbone.rs` 里的 `M5_PROFILE_LAYER=1` 会打印每层 5 个阶段的耗时）。
+**③ 转置卷积分相分解**（37469b1）：`ks=2r` 的 ConvTranspose 精确等价于 r 个共享输入的
+kernel-2 因果卷积（输出 t=m·r+q 只读 x[m]、x[m-1] 和 tap q、q+r）——相位 q 是一整条
+连续 stride-1 卷积，直接复用 conv1d 的 280 GFLOP/s 机器，再加一次分块交错写。
+四次尝试 AVX2 化旧 scatter 循环都失败的原因现在清楚了：**换掉循环结构，而不是向量化它**。
+
+**④ fast_sin 会掉 23dB SNR**（4e49264）：fast_sin 进生产路径后 CPU SNR 109.4→85.0
+（gate ≥60 仍绿、codes 仍 0 mismatch，但没必要）。`mem_probe` 证明 snake 是带宽受限，
+libm sin 与 fast_sin 整段耗时相同——**精度白扔，性能白赚**。快正弦函数已删。
+
+**⑤ depth 解码器的预取实验（已回退，别盲目重试）**：depth 每帧把 38MB bf16 权重
+（5 层 × 7.6MB）从 DRAM 重流一遍（26.8 ms/帧 ≈ 21 GB/s），因为 L3 只有 30MB 装不下、
+且 15 个 codebook 严格串行零时间局部性。试过：单线程 `_mm_prefetch` worker 预取下一层
+qkv+o——单线程 prefetch 流只有 ~13 GB/s（MLP 受限），7.6MB 要 585µs > 层步 330µs；
+只预取 1.3MB 的 qkv+o 时 best-of-5 33.0 vs 35.5 ms，**差值在噪声带内，不满足入库标准**。
+GEMV min_len 16→64 也无稳定收益。要再攻这个点：先在安静窗口复测（本机负载 20~45% 波动），
+方向是多线程预取池或与 gateup/down 的带宽窗口重叠，收益上限 ~7 ms/帧。
+`M5_PROFILE_LAYER=1` 现在对 bf16 融合层也能打印五段耗时（gateup 121 / down 71 /
+qkv 58 / o 50 / attn 30 µs，见 55f5a80）。
 
 GPU 端：codec 的 GPU 路径仍是 channels-first + 朴素卷积；已实现的
 `conv1d_cl`（打包权重 + 8×4 寄存器分块）已验证正确（≤2e-5），速度 120~185 GFLOP/s，
-但**还没接进 codec 的 GPU 路径**。
+但**还没接进 codec 的 GPU 路径**。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
 
-### 6.4 参考实现在这台机器的基线
+### 6.4 与参考实现的对比（配对基准，best-of-3，提交 4e49264）
 
-| | RTF |
-|---|---|
-| PyTorch CPU（AVX2 / oneDNN） | 1.22 ~ 1.29（不同时刻） |
-| PyTorch CPU（`ATEN_CPU_CAPABILITY=default`，无 AVX） | 1.61 ~ 1.76 |
-| PyTorch CUDA（P104，fp32） | 0.77 |
+| | RTF | 说明 |
+|---|---|---|
+| **Rust AVX2** | **0.94 ~ 0.95** | 比 Python AVX2 快 ~30%，已破实时 |
+| Rust 通用（无 AVX2） | 1.10 | 比 Python 通用快 ~31% |
+| PyTorch CPU（AVX2 / oneDNN） | 1.36 | 同会话实测 |
+| PyTorch CPU（无 AVX） | 1.59 ~ 1.82 | 同会话实测 |
+| PyTorch CUDA（P104，fp32） | 0.77 | 仍是 GPU 目标的参照 |
 
 PyTorch 对 ISA 只敏感 17%（它 101 ms/帧里主要是逐帧 kernel 调度开销）；
 我们曾对 ISA 敏感 4.4 倍，现在 codec 只差 15%，与原版同量级。
 
-单帧对比（同一会话、同样受后台干扰）：**LM 生成 27.6 ms/帧 vs 原版 101 ms/帧**。
+单帧对比（同一会话、同样受后台干扰）：**LM 生成 ~31 ms/帧 vs 原版 101 ms/帧**
+（depth 26.8 + backbone ~4）。本轮 RTF 三级跳的会话内读数：1.21 → 1.02（分配修复）
+→ 0.93（转置卷积）→ 0.95（libm sin 回退后复测）。
 
 ### 6.5 GPU 硬件事实（别再重复测）
 
@@ -252,16 +284,18 @@ cuDNN 在同一张卡上能让 codec 解码跑 0.2s（≈790 GMAC/s = 75% 上限
 
 ## 7. 优化建议（**仅供参考**，按性价比排序）
 
-1. **先解决 6.3 的回归**。所有性能结论都要在修复后重测，否则在优化噪声。
-2. **codec 解码的 block4**（96ch × 108000 采样，41 MB 张量 > 30 MB L3）是唯一低于
-   PyTorch 的地方（98 vs 232 GFLOP/s）。正确做法是保持 `[C, T]` 布局、按**时间块**并行 k=1 卷积
-   （我试过时间主序 `[tn, channels]` 的方案，转置开销吃掉了收益）。
-3. **转置卷积向量化**：现状标量 76~89 GFLOP/s。我三次尝试（slice-zip 去 `if`、AVX2 4×4）都慢
-   10~20 倍，未定位。建议先看 `examples/transpose_probe.rs` 的基线，再用 `cargo asm` 确认编译器
-   是否真的没向量化。**注意**：`ops_parity::conv_transpose_matches_naive_reference` 已经覆盖
-   多 q-block / 非 4 倍通道数，任何改动必须让它保持绿。
+1. **depth 解码器的权重流**（LM 现在是最大头，~45% 端到端）：26.8 ms/帧 ≈ 38MB 权重 /
+   DRAM 带宽，L3 30MB 装不下、codebook 严格串行。可行方向：多线程预取池（单线程
+   prefetch 只有 ~13 GB/s，试过不够，见 6.3⑤）、或把 gateup+down 的带宽窗口与
+   qkv/o 的延迟重叠。收益上限 ~7 ms/帧。**动手前先在安静窗口（负载 <15%）复测**，
+   本机负载 20~45% 波动能吞掉这个量级的信号。
+2. **LM 在位的每帧开销**：depth_bench 26.8 ms/帧 vs 端到端 31~34 ms/帧，差的 4~7ms
+   是 backbone 步 + 采样 + KV 写。还没逐段profile过，先量再动手。
+3. **codec block4 残差单元已近 kernel 峰值**（~250-290 GFLOP/s vs conv_bench 244），
+   剩余空间有限。下一个 codec 目标是 upsample（0.17s）与 pre_transformer（0.15s）。
 4. **GPU 8×8 寄存器分块**（权重复用 8 次/字节）→ 目标 ≥400 GFLOP/s。然后把
    `conv1d_cl` 接进 codec 的 GPU 路径（需要 GPU 版的 snake / 转置卷积 CL kernel）。
+   CPU 的分相转置卷积（37469b1）值得原样搬到 GPU。
 5. **torch RNG 对齐**：现在 CLI 的 `--seed` 用自研 xoshiro PRNG（可复现，但与
    `torch.manual_seed` 不同流）。要做到"同 seed 与参考逐 token 相同"，需要复刻 torch CPU 的
    MT19937 + `exponential_`（golden 里 `noise_all` 是参考的真实抽样，可用于校验）。
