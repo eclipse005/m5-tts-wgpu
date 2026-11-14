@@ -84,6 +84,10 @@ impl Kernel {
         } else {
             gpu.record(&self.pipe, &bind, workgroups);
         }
+        // The first dispatch of a new pipeline triggers the driver's lazy
+        // compilation - drain immediately so it cannot pile up with other new
+        // pipelines in one batch (P104 faults the device that way).
+        gpu.prime_if_needed(&self.name);
     }
 }
 
@@ -121,6 +125,11 @@ pub struct Gpu {
     max_pending: usize,
     pending: RefCell<Vec<Pending>>,
     pipelines: RefCell<HashMap<String, (wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
+    /// Pipelines not yet exercised by a completed submit: the driver compiles
+    /// them lazily at first use, and a batch full of new pipelines + a resident
+    /// encoder faults the P104 (ming-3.0-tts gpu.rs cold-buffer notes). Such
+    /// dispatches flush and drain immediately.
+    unprimed: RefCell<HashMap<String, ()>>,
     pub stats: RefCell<Stats>,
     /// Upload bytes per call-site label, so a profiling run can show where the
     /// PCIe traffic actually comes from (`M5_PROFILE=1`).
@@ -289,6 +298,7 @@ impl Gpu {
             max_pending,
             pending: RefCell::new(Vec::new()),
             pipelines: RefCell::new(HashMap::new()),
+            unprimed: RefCell::new(HashMap::new()),
             stats: RefCell::new(Stats::default()),
             upload_labels: RefCell::new(HashMap::new()),
             params_pool: RefCell::new(ParamsPool { buffers: Vec::new(), next: 0 }),
@@ -367,15 +377,27 @@ impl Gpu {
     }
 
     /// Allocate a storage buffer and upload `data`.
+    ///
+    /// create + queue.write_buffer, NOT mapped_at_creation: the P104's driver
+    /// fails the creation-time map under memory pressure/fragmentation
+    /// ("Buffer is invalid" at get_mapped_range); the staged write_buffer path
+    /// is what ming-3.0-tts uses on the same card.
     pub fn upload(&self, label: &str, data: &[f32]) -> Buffer {
-        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage: Self::storage_usage(),
-        });
+        let buffer = self.storage((data.len() * 4) as u64, label);
+        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
         *self.upload_labels.borrow_mut().entry(label.to_string()).or_insert(0) += (data.len() * 4) as u64;
         buffer
+    }
+
+    /// The raw storage allocation (create_buffer, no mapping).
+    pub fn storage(&self, size: u64, label: &str) -> Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: Self::storage_usage(),
+            mapped_at_creation: false,
+        })
     }
 
     /// Allocate an uninitialised storage buffer for `len` f32.
@@ -512,7 +534,19 @@ impl Gpu {
         self.pipelines
             .borrow_mut()
             .insert(key.to_string(), (pipeline.clone(), layout.clone()));
+        self.unprimed.borrow_mut().insert(key.to_string(), ());
         (pipeline, layout)
+    }
+
+    /// Drain now if the given pipeline has never been through a submit: its
+    /// first dispatch triggers the driver's lazy compilation, which must not
+    /// pile up with other new pipelines in one batch on the P104.
+    fn prime_if_needed(&self, key: &str) {
+        if self.unprimed.borrow_mut().remove(key).is_some() {
+            self.flush();
+            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("prime poll");
+            self.in_flight.set(0);
+        }
     }
 
     /// dispatch_params with a pre-built pipeline + layout: probe variant.

@@ -361,13 +361,14 @@ arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + ro
 3. ✅RO→RW 冲突根因确认：**池复用的 buffer 跨 pass 的 RO→RW**——
    M5_NO_POOL_REUSE 下 arena 路径完全正确（codes 逐值一致）。
 4. ✅depth 持久 scratch/ring 改专用非池化分配（fresh，2KB 级，永不回收）。
-5. ⚠️当前剩余（本轮实测）：depth 瞬态 ring 全覆盖已落地（last/logits/
-   embedding 走持久 ring ✓）；audio_head_matrix + embedding table 改
-   tensor_fresh 常驻（非池化，永不回收）✓。**全 pipeline 仍 OOM/invalid**：
-   codec 解码的 72MB 级 buffer 在 deferred 回收列表中堆积（256-dispatch
-   batch 间 ~2.9GB deferred）→ VRAM 耗尽 → device lost 级联。batch 64 也
-   仍 OOM。方向：①codec 的 per-op 输出改为持久 double-buffer ring（ming
-   模式，彻底消除 deferred 堆积）；②或 deferred 按字节压力提前 drain。
+5. ⚠️当前剩余（最终诊断）：depth 瞬态 ring 全覆盖 ✓；常驻表 tensor_fresh ✓；
+   arena kernel 的 lazy-compile priming ✓（新 pipeline 首 dispatch 后立即
+   flush+drain）。**全 pipeline 仍 device-lost 级联**：prefill 的 146-dispatch
+   submit 在 encoder 常驻（~840MB）时超过 P104 冷启动阈值（ming 记录阈值
+   降至 ~16 dispatch）→ device fault → 后续全 invalid。**修复方向明确**：
+   prefill/所有长 batch 的提交也走 priming（每 ~16 dispatch drain 一次直到
+   进程度过冷启动期），或按 ming 的做法把 encoder 常驻下的阈值降到 16。
+   batch 上限 256 与 in-flight=4 已按 ming 校准。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
