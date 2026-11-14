@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::path::Path;
 
+use crate::cpu_ops;
 use crate::device::{Device, Tensor};
 use crate::ops::{self, Conv1d};
 use crate::weights::Weights;
@@ -184,6 +185,22 @@ impl Codec {
     /// 1-D parameter as a `[len, 1]` tensor (kernels take 2-D shapes).
     pub fn vector(&self, name: &str, len: usize) -> Result<Rc<Tensor>> {
         self.tensor(name, [len, 1])
+    }
+
+    /// Channels-last packed weight `[(tap*cin + ci) * cout + co]` (cached).
+    ///
+    /// The staged channels-last conv kernel needs this layout; the checkpoint
+    /// stores `[cout, cin, ks]`. Packing is a one-time host pass per weight.
+    pub fn packed_conv1d(&self, name: &str, cout: usize, cin: usize, ks: usize) -> Result<Rc<Tensor>> {
+        let key = format!("packed.{name}");
+        if let Some(t) = self.cache.borrow().get(&key) {
+            return Ok(t.clone());
+        }
+        let raw = self.weights.get_f32(name)?;
+        let packed = crate::cpu_ops::pack_conv_weights(&raw, cout, cin, ks);
+        let tensor = Rc::new(self.dev.tensor([ks * cin, cout], &packed)?);
+        self.cache.borrow_mut().insert(key, tensor.clone());
+        Ok(tensor)
     }
 
     /// The fifteen acoustic codebooks stacked into one table, built once.

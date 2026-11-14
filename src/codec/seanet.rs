@@ -18,6 +18,19 @@ fn causal_conv(codec: &Codec, x: &Tensor, weight_name: &str, bias_name: &str,
     let weight = codec.tensor(weight_name, [cout, cin * ks])?;
     let bias = codec.vector(bias_name, cout)?;
     let mut out = dev.zeros([cout, frames])?;
+    if let Device::Gpu(gpu) = dev {
+        // Channels-last detour: the staged CL kernel is 3-5x faster than the
+        // naive tiled one at these shapes, and on the P104 the two transposes
+        // cost ~1 ms per 72 MB pass - noise against the kernel time.
+        let packed = codec.packed_conv1d(weight_name, cout, cin, ks)?;
+        let x_cl = gpu.empty("conv1d.x_cl", frames * cin);
+        crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, &x_cl, cin, frames);
+        let y_cl = gpu.empty("conv1d.y_cl", frames * cout);
+        crate::gpu_ops::conv1d_cl(gpu, &x_cl, packed.gpu_buffer()?, bias.gpu_buffer()?, &y_cl,
+                                  cin, cout, ks, dilation, 1, (ks - 1) * dilation, frames, frames);
+        crate::gpu_ops::transpose(gpu, &y_cl, out.gpu_buffer()?, frames, cout);
+        return Ok(out);
+    }
     let conv = Conv1d::causal(cin, cout, ks, frames).dilated(dilation);
     ops::conv1d(dev, x, &weight, &bias, &mut out, &conv)?;
     Ok(out)
