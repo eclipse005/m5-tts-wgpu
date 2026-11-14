@@ -326,9 +326,27 @@ GFLOP/s ≈ 1.1s + snake + 转置 + pre_transformer/quantise ~0.75s + 在位开�
 depth 65.7 ms/帧 = 3.6s（dispatch 受限：6 dispatch × 75 层 × ~146µs 在位），
 encode ~0.9s，prefill 0.3s。
 
-下一步：①残差单元 snake/conv 交错时的 L2 行为与更大分块；②depth dispatch
-税的根治（更激进合并或持久绑定）；③bf16 上卡；④pre_transformer GEMM 分块。
-混合模式（M5_DEPTH_HOST=1）RTF ~1.9-2.0。
+下一步 = **移植 ming-3.0-tts-wgpu 的已验证 GPU 架构**（D:\ming-3.0-tts-wgpu，
+同款 P104，RTF 0.60 > CUDA——它踩平了我们所有的坑）：
+
+1. **uniform arena + 动态偏移**（gpu.rs:267 arena、398 alloc_uniform、454
+   submit_pending：一个 4096×256B uniform buffer，flush 时一次 write_buffer，
+   dispatch 用 `set_bind_group(0, &bind, &[offset])` 选槽）——消灭每 dispatch
+   的 params buffer；kernel 的 params binding 声明 has_dynamic_offset。
+2. **Kernel + run_cached**（nn.rs:107-190）：bind group 按 u64 key 缓存
+   （layer<<8|slot），持久 scratch + 不可变权重跨步存活——DiT 24 层 × 17
+   dispatch 零对象创建。我们的 depth 5 层 × 6 kernel 完全同构：每层一套
+   持久 scratch（5 套），bind group 按 (layer, kernel) 缓存一次。
+3. **可靠性常数**（gpu.rs:80-99）：batch 上限 256（≥1024 TDR 掉卡）、
+   **首 submit ≤ 8 dispatch 且 drain**（P104 冷启动 >50 直接 device lost）、
+   in-flight = 4（前 3 个已移植 ✓）。
+4. **required_limits: adapter.limits()**（gpu.rs:226）——取满适配器上限。
+5. in-flight 管线（✅已移植）：flush 后非阻塞 poll，CPU 录制与 GPU 执行重叠。
+
+RO→RW pass hazard 的修正认识：wgpu 只禁止**同一 dispatch** 内双绑定；跨
+dispatch 的 RW→RO→RW 在同一 pass 内是合法的（ming DiT 每步都在这么跑）——
+之前 mega-pass 的验证错误是池别名导致的单 dispatch 双绑定。所以持久 scratch
++ arena 是安全的，之前回退 scratch 的理由不再成立（在 arena 架构下恢复）。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
