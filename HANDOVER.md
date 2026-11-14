@@ -284,11 +284,17 @@ GPU 端：codec 的 GPU 路径仍是 channels-first + 朴素卷积；已实现�
 批量提交；bf16 shader 内移位解码；大权重直读布局（消重排）；lazy 零页 → GPU buffer 池。
 
 **执行顺序**：①✅计时基建（Gpu::sync = flush+poll；stats + upload_labels 打印）→
-②卷积 kernel 重写：残差单元 naive conv1d（32 GFLOP/s → 目标 ≥400，10.5s → ≤1s）+
-转置卷积分相（16-25 → ≥300，2.5s → ~0.15s）→ ③conv1d_cl 接线/替代 + epilogue 融合
-→ ④depth device 路径融合（18→4 dispatch/层，去回读）→ ⑤backbone/prefill/encode 复用
-→ ⑥bf16 上卡 + buffer 池。每步过双设备 parity 门（ops_parity / parity_codec /
-parity_pipeline）。
+②✅causal_conv CL 绕行（残差单元 32→~100 GFLOP/s，10.5→3.7s；c166fee）→
+③✅转置卷积分相 kernel（16-25→~80 GFLOP/s，2.5→1.13s；5d11439；两个失败变体见提交注记：
+runtime-indexed 局部数组会溢出 local memory、浅链 8 累加器无收益）→
+④depth device 路径融合（161→8-12 ms/帧：4 dispatch/层 + 全帧单批提交 + 仅 1 次回读，
+最大剩余项 8.9s）→ ⑤block4 单元占用率（96ch = 1.5 个 CT-tile，0.47s/个）→
+⑥pre_transformer GEMM → ⑦8×8 分块/共享内存版转置卷积（当前单累加器 80 GFLOP/s，
+共享内存 staging 是 CL conv 120-185 的同构路线）→ ⑧bf16 上卡 + buffer 池。
+每步过双设备 parity 门（ops_parity / parity_codec / parity_pipeline）。
+
+**GPU 进度**：RTF 5.22 → **3.77**（codec 解码 11.3 → 6.25s）。PCIe 上传 2.7GB 的
+33MB/帧部分待 depth 融合时一并处理。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
