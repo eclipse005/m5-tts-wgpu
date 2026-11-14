@@ -310,8 +310,25 @@ scratch 池免分配）。depth 161 → 69 ms/帧。过程中 parity 门拦下�
 （69ms/帧）仍落后 CPU 融合路径（24ms/帧）约 3 倍。`M5_DEPTH_HOST=1` 可切回
 CPU depth（混合模式 RTF ~2.1 vs 全 GPU 2.65）。
 
-下一步：block4 单元占用率 → 共享内存版转置卷积 → bf16 上卡 → depth 的
-pipeline-switching 剖析（6-pipeline 轮换 vs 单 pipeline 的 120 vs 26µs 之差）。
+**buffer 池已落地**（4700cd6）——"没做的大块"就是它：每个 codec op 新分配 36-72MB
+Vulkan buffer 再销毁，分配器碎化后每周期 ~70ms，每 decode ~50 次 = ~3.5s。
+Tensor::Gpu 现在携带设备句柄，drop 时归还按长度分池（deferred：batch 打开时
+延迟到 flush 后入池，避免 wgpu 同 pass 内 RO→RW hazard——顺带发现了 mega-pass
+(100k dispatch) 与任何 buffer 复用根本不兼容，默认 batch 改 64）。
+RTF 2.56 → 2.21，codec 解码 6.1 → 4.8s。
+同轮：8×8 寄存器分块 conv（341→384 GFLOP/s，注意生成 kernel 时清零块曾误入
+cin-chunk 循环导致 silent garbage，parity_codec 拦截）；snake kernel 的
+pow(sin,2)→s·s + 预 exp 表（每元素 2 次 exp→零次）；tiled transpose（两侧合并）。
+encoder 的 CL 绕行实测变慢已回退（窄通道形状不划算）。
+
+**当前 GPU 分解**（98 帧样例，RTF 2.21）：codec 4.8s（残差单元 12 个 conv @384
+GFLOP/s ≈ 1.1s + snake + 转置 + pre_transformer/quantise ~0.75s + 在位开销），
+depth 65.7 ms/帧 = 3.6s（dispatch 受限：6 dispatch × 75 层 × ~146µs 在位），
+encode ~0.9s，prefill 0.3s。
+
+下一步：①残差单元 snake/conv 交错时的 L2 行为与更大分块；②depth dispatch
+税的根治（更激进合并或持久绑定）；③bf16 上卡；④pre_transformer GEMM 分块。
+混合模式（M5_DEPTH_HOST=1）RTF ~1.9-2.0。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
