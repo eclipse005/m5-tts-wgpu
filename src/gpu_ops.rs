@@ -185,8 +185,8 @@ pub fn a_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffe
               zero: &Buffer, y: &Buffer, n: usize, kk: usize) {
     // FUSED_GEMV body semantics: {rows(m), cols(n), k, has_bias}
     let uni: [u32; 4] = [1, n as u32, kk as u32, 0];
-    k.run(gpu, key, &uni, &[x, w, zero, y],
-          ((n as u32).div_ceil(8), 1u32, 1u32));
+    k.run_params(gpu, key, &uni, &[x, w, zero, y],
+                 ((n as u32).div_ceil(8), 1u32, 1u32));
 }
 
 #[allow(clippy::too_many_arguments)]

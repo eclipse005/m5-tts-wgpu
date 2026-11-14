@@ -634,32 +634,47 @@ impl Lm {
             silu_mul: gpu.kernel_params("d.silu_mul", crate::shaders::SILU_MUL_F32, "ro,ro,rw"),
             zero1: dev.tensor([1, 1], &[0.0])?,
         };
+        // All persistent depth buffers are FRESH (non-pooled) allocations: the
+        // pool's recycled buffers carry their previous pass's read-only usage
+        // state, and the depth scratch is written (RW) in its first pass - a
+        // cross-pass RO->RW that wgpu-core rejects. Fresh buffers have no
+        // history; they are 2 KB each and live for the whole run.
+        let gpu_rc = match dev {
+            crate::device::Device::Gpu(g) => std::rc::Rc::clone(g),
+            _ => unreachable!("depth arena is GPU-only"),
+        };
+        let fresh = |len: usize| -> Tensor {
+            let raw = gpu.empty("depth-scratch", len);
+            Tensor::Gpu(crate::device::GpuBuffer {
+                raw,
+                gpu: std::rc::Rc::clone(&gpu_rc),
+                owned: false,
+            }, [1, len])
+        };
         let mut layers = Vec::with_capacity(DEPTH_LAYERS);
         for _ in 0..DEPTH_LAYERS {
             layers.push(RefCell::new(DepthLayerGpuScratch {
-                x_in: dev.zeros([1, HIDDEN])?,
-                normed: dev.zeros([1, HIDDEN])?,
-                q: dev.zeros([1, q_rows()])?,
-                k: dev.zeros([1, KV_HEADS * HEAD_DIM])?,
-                v: dev.zeros([1, KV_HEADS * HEAD_DIM])?,
-                k_full: dev.zeros([1, q_rows()])?,
-                v_full: dev.zeros([1, q_rows()])?,
-                attended: dev.zeros([1, q_rows()])?,
-                projected: dev.zeros([1, HIDDEN])?,
-                x1: dev.zeros([1, HIDDEN])?,
-                normed2: dev.zeros([1, HIDDEN])?,
-                gate: dev.zeros([1, INTERMEDIATE])?,
-                up: dev.zeros([1, INTERMEDIATE])?,
-                act: dev.zeros([1, INTERMEDIATE])?,
-                mlp: dev.zeros([1, HIDDEN])?,
-                x_out: dev.zeros([1, HIDDEN])?,
+                x_in: fresh(HIDDEN),
+                normed: fresh(HIDDEN),
+                q: fresh(q_rows()),
+                k: fresh(KV_HEADS * HEAD_DIM),
+                v: fresh(KV_HEADS * HEAD_DIM),
+                k_full: fresh(q_rows()),
+                v_full: fresh(q_rows()),
+                attended: fresh(q_rows()),
+                projected: fresh(HIDDEN),
+                x1: fresh(HIDDEN),
+                normed2: fresh(HIDDEN),
+                gate: fresh(INTERMEDIATE),
+                up: fresh(INTERMEDIATE),
+                act: fresh(INTERMEDIATE),
+                mlp: fresh(HIDDEN),
+                x_out: fresh(HIDDEN),
             }));
         }
-        let norm_out = [dev.zeros([1, HIDDEN])?, dev.zeros([1, HIDDEN])?];
-        let ring = (0..16).map(|_| dev.zeros([1, HIDDEN])).collect::<Result<Vec<_>>>()?;
-        let logits_ring = (0..4)
-            .map(|_| dev.zeros([1, crate::lm::AUDIO_VOCAB]))
-            .collect::<Result<Vec<_>>>()?;
+        let norm_out = [fresh(HIDDEN), fresh(HIDDEN)];
+        let ring = (0..16).map(|_| fresh(HIDDEN)).collect::<Vec<_>>();
+        let logits_ring = (0..4).map(|_| fresh(AUDIO_VOCAB)).collect::<Vec<_>>();
         let d = std::rc::Rc::new(DepthGpu {
             kernels,
             layers,

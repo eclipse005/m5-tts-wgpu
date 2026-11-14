@@ -149,9 +149,6 @@ impl Lm {
             Some(d) => d.next_logits()?,
             None => self.device().zeros([1, AUDIO_VOCAB])?,
         };
-        if std::env::var_os("M5_DISPATCH_TRACE").is_some() {
-            eprintln!("      [head_logits] last={:?} logits={:?}", last.shape(), logits.shape());
-        }
         ops::linear(self.device(), &last, &weight, None, &mut logits)?;
         Ok(logits)
     }

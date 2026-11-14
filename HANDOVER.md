@@ -354,16 +354,18 @@ scratch 不跨 pass 复用；我们的 depth 5 层 × 30 dispatch 需要每层�
 arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + rope 全表 +
 双缓冲 norm_out 已落地，per-dispatch-sync 追踪下数值逐位正确；默认路径仍是
 已验证的 6-dispatch 形式（69ms/帧），arena 路径在 M5_DEPTH_ARENA=1 之后。
-**开放问题（调查记录，91077a9 + 后续）**：arena 路径稳态 wgpu 报
-`pooled.417.512` RO→RW 冲突。已实测排除：①参数语义（a_rms 曾把 eps 当列数
-→ 1.7s 的越界循环，已修，修后 rms 输出与参考**逐位一致**，每层每步验证）；
-②缓存组身份（30 个缓存组全部只绑持久 scratch/权重）；③pass 边界（per-layer
-sync、projection 后 sync 均仍复现）；④池别名（recycle-on-drop 改为 owned
-标记，handle 克隆不回收）。**每 dispatch sync（M5_DISPATCH_TRACE）下完全
-正确**——冲突需要 ≥2 dispatch 同 pass。静态扫描单层 6 dispatch 无 RO→RW 对；
-疑点收敛到池/handle 与缓存组的深层交互，需要 wgpu-core 级追踪。预算允许的
-下一步：在 M5_DUMP_RMS 式逐张量 dump 的基础上扩到全部 6 kernel 的输出对比，
-或给 wgpu-core 打点。
+**arena 路径调查（5d04692 → 31fdf02 → 本轮）**：
+1. ✅a_rms 参数语义 bug：eps_bits 传到列数槽 → 每 dispatch 1.7s 的越界循环
+   （每层首 kernel 1.7s 之谜的谜底）；修后 rms 输出与参考逐位一致（每层每步验证）。
+2. ✅a_gemv 漏改 run_params（仍是 run）——run_params/params_dyn 追踪直接定位。
+3. ✅RO→RW 冲突根因确认：**池复用的 buffer 跨 pass 的 RO→RW**——
+   M5_NO_POOL_REUSE 下 arena 路径完全正确（codes 逐值一致）。
+4. ✅depth 持久 scratch/ring 改专用非池化分配（fresh，2KB 级，永不回收）。
+5. ⚠️当前剩余：fresh 小 buffer 的驱动 slab 累积曾致 OOM（64KB 粒度 × 每帧
+   ~2500 个）；audio_head_matrix 的 write_buffer 在部分生命周期下报 invalid。
+   方向：depth 瞬态全部走持久 ring（已做 last/logits/embedding），把
+   audio_head_matrix 的 4.2MB 表改为常驻 + 复查 fresh 生命周期，或对池回收
+   加 "上次用途" 标记只复用 RW-last 的 buffer。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。

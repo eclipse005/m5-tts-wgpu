@@ -58,6 +58,7 @@ impl Device {
             Device::Gpu(gpu) => Tensor::Gpu(GpuBuffer {
                 raw: gpu.upload_pooled(data),
                 gpu: Rc::clone(gpu),
+                owned: true,
             }, shape),
             Device::Cpu => Tensor::Cpu(data.to_vec(), shape),
         })
@@ -188,18 +189,28 @@ impl Tokens {
 pub struct GpuBuffer {
     pub raw: wgpu::Buffer,
     pub gpu: Rc<Gpu>,
+    /// false for handles sharing a persistent buffer: their drop must NOT
+    /// recycle (the owner scratch still uses the buffer, and a pooled
+    /// reassignment would create a read/write conflict in a later pass).
+    pub owned: bool,
 }
 
 impl GpuBuffer {
     /// A fresh Tensor handle sharing this pooled buffer (cheap: handle clone).
     pub fn tensor(&self, shape: [usize; 2]) -> Tensor {
-        Tensor::Gpu(GpuBuffer { raw: self.raw.clone(), gpu: Rc::clone(&self.gpu) }, shape)
+        Tensor::Gpu(GpuBuffer {
+            raw: self.raw.clone(),
+            gpu: Rc::clone(&self.gpu),
+            owned: false,
+        }, shape)
     }
 }
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        self.gpu.recycle_on_drop(self.raw.size() as usize / 4, self.raw.clone());
+        if self.owned {
+            self.gpu.recycle_on_drop(self.raw.size() as usize / 4, self.raw.clone());
+        }
     }
 }
 
