@@ -178,15 +178,14 @@ impl Lm {
         let mut projected = dev.zeros([1, HIDDEN])?;
         ops::linear(dev, last_h, &projection, None, &mut projected)?;
 
-        // The sampler reads `noise[cb]`; expose rows through 1-row tensors.
-        let noise_host = dev.read(noise)?;
-        let noise_row = |cb: usize| -> Result<Tensor> {
-            dev.tensor([1, AUDIO_VOCAB], &noise_host[cb * AUDIO_VOCAB..(cb + 1) * AUDIO_VOCAB])
-        };
+        // The sampler reads one row of the full noise buffer by offset: binding
+        // it once avoids a host round-trip per codebook (each read flushes the
+        // submit batch, ~0.5 ms a time on this card).
+        let noise_buffer = noise.gpu_buffer()?;
         let sample = |logits: &Tensor, cb: usize, allow: bool, slot: usize| -> Result<()> {
-            let row = noise_row(cb)?;
-            gpu_ops::sample_topk(gpu, logits.gpu_buffer()?, row.gpu_buffer()?, &token_buffer,
-                                 AUDIO_VOCAB, topk, temperature, allow, slot);
+            gpu_ops::sample_topk_offset(gpu, logits.gpu_buffer()?, noise_buffer, &token_buffer,
+                                        AUDIO_VOCAB, topk, temperature, allow, slot,
+                                        cb * AUDIO_VOCAB);
             Ok(())
         };
         sample(&logits, 0, allow_eos, 0)?;
@@ -198,12 +197,10 @@ impl Lm {
         let mut e0_proj = dev.zeros([1, HIDDEN])?;
         ops::linear(dev, &e0, &projection, None, &mut e0_proj)?;
         let mut frame = dev.zeros([2, HIDDEN])?;
-        {
-            let mut host = dev.read(&projected)?;
-            host.extend_from_slice(&dev.read(&e0_proj)?);
-            let joined = dev.tensor([2, HIDDEN], &host)?;
-            frame = dev.copy(&joined)?;
-        }
+        // Concatenate on the device: two readbacks here cost ~1 ms of submit
+        // latency per frame for 4 KB of data.
+        gpu_ops::write_rows(gpu, frame.gpu_buffer()?, projected.gpu_buffer()?, HIDDEN, 0, 1);
+        gpu_ops::write_rows(gpu, frame.gpu_buffer()?, e0_proj.gpu_buffer()?, HIDDEN, 1, 1);
         let (cos, sin) = rope_table(&[0, 1]);
         let mut kv = KvCache::new(dev, DEPTH_LAYERS, CODEBOOKS + 2)?;
         let mut hidden = dev.copy(&frame)?;

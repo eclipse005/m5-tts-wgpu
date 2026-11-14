@@ -248,9 +248,20 @@ pub fn embed_sum(gpu: &Gpu, table: &Buffer, tokens: &Buffer, out: &Buffer,
 pub fn sample_topk(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buffer,
                    vocab: usize, topk: usize, temperature: f32, allow_eos: bool,
                    out_offset: usize) {
+    sample_topk_offset(gpu, logits, noise, out, vocab, topk, temperature, allow_eos,
+                       out_offset, 0);
+}
+
+/// Same, reading the exponential draws from `noise[noise_offset..]` so one
+/// `[CODEBOOKS, vocab]` buffer can stay bound for a whole frame.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_topk_offset(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buffer,
+                          vocab: usize, topk: usize, temperature: f32, allow_eos: bool,
+                          out_offset: usize, noise_offset: usize) {
     let params = gpu.upload_u32("sample_topk.params",
                                &[vocab as u32, topk as u32, temperature.to_bits(),
-                                 ((out_offset as u32) << 1) | allow_eos as u32]);
+                                 ((out_offset as u32) << 1) | allow_eos as u32,
+                                 noise_offset as u32]);
     gpu.dispatch("sample_topk_f32", shaders::SAMPLE_TOPK_F32, "main",
                  &[(0, logits), (1, noise), (2, out), (3, &params)], (1, 1, 1));
 }

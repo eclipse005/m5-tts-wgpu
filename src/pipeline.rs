@@ -225,8 +225,22 @@ impl Pipeline {
             // The reference allows EOS only after `min_tokens` (6) frames.
             let allow_eos = frame > 6;
             let lap = Instant::now();
-            let sampled = self.lm.depth_codes(&last, 0, &frame_noise, args.temperature,
-                                              args.topk, allow_eos)?;
+            let sampled = if let Device::Gpu(gpu) = self.lm.device() {
+                // Device path: sampling, embedding and the whole depth pass run
+                // on the card; one token readback per frame instead of sixteen
+                // logits round-trips (each one flushes the submit batch).
+                let mut flat = Vec::with_capacity(CODEBOOKS * AUDIO_VOCAB);
+                for row in &frame_noise {
+                    flat.extend_from_slice(row);
+                }
+                let noise_t = self.lm.device().tensor([CODEBOOKS, AUDIO_VOCAB], &flat)?;
+                gpu.sync();
+                self.lm.depth_codes_device(&last, &noise_t, args.temperature,
+                                           args.topk, allow_eos)?
+            } else {
+                self.lm.depth_codes(&last, 0, &frame_noise, args.temperature,
+                                    args.topk, allow_eos)?
+            };
             if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_depth += lap.elapsed().as_secs_f64();
             if sampled.iter().all(|token| *token == 0) {

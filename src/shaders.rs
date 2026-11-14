@@ -876,11 +876,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// Parallel max/sum over 256 lanes; the final scans are serial in lane 0, which is
 /// a few microseconds and still far cheaper than a host round-trip.
 pub const SAMPLE_TOPK_F32: &str = r#"
-// 0=vocab 1=topk 2=temperature(bits) 3=allow_eos*2 + out_offset
+// 0=vocab 1=topk 2=temperature(bits) 3=allow_eos*2 + out_offset 4=noise row offset
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> noise: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<u32>;
-@group(0) @binding(3) var<storage, read> p: array<u32, 4>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 5>;
 var<workgroup> part: array<f32, 256>;
 
 fn score(i: u32) -> f32 {
@@ -966,7 +966,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         for (var j = 0u; j < vocab; j = j + 1u) {
             let v = score(j);
             if (v >= cutoff) {
-                let ratio = (exp(v - maxv) / total) / noise[j];
+                let ratio = (exp(v - maxv) / total) / noise[p[4] + j];
                 if (ratio > best_ratio) { best_ratio = ratio; best_i = j; }
             }
         }

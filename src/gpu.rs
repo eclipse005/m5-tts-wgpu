@@ -41,6 +41,24 @@ pub struct Gpu {
     /// Upload bytes per call-site label, so a profiling run can show where the
     /// PCIe traffic actually comes from (`M5_PROFILE=1`).
     pub upload_labels: RefCell<HashMap<String, u64>>,
+    /// Parameter-block ring for per-dispatch params: one buffer, sliding
+    /// offsets. A fresh Vulkan buffer per dispatch cost ~20 us in driver
+    /// allocation once thousands were alive at submit (gpu_probe decomp).
+    params_ring: RefCell<ParamsRing>,
+}
+
+/// A parameter block carved out of the shared ring.
+#[derive(Clone)]
+pub struct Params {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub size: u64,
+}
+
+struct ParamsRing {
+    buffer: Buffer,
+    offset: u64,
+    capacity: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -55,6 +73,11 @@ impl Gpu {
     /// Snapshot of the counters (dispatches, submits, transfer bytes).
     pub fn snapshot(&self) -> Stats {
         *self.stats.borrow()
+    }
+
+    /// The raw wgpu device (diagnostics / probes).
+    pub fn raw_device(&self) -> &wgpu::Device {
+        &self.device
     }
 
     /// Block until everything queued so far has executed. `flush` alone only
@@ -121,6 +144,12 @@ impl Gpu {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8);
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params-ring"),
+            size: 1 << 20,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             device,
             queue,
@@ -131,6 +160,11 @@ impl Gpu {
             pipelines: RefCell::new(HashMap::new()),
             stats: RefCell::new(Stats::default()),
             upload_labels: RefCell::new(HashMap::new()),
+            params_ring: RefCell::new(ParamsRing {
+                buffer: params_buffer,
+                offset: 0,
+                capacity: 1 << 20,
+            }),
         })
     }
 
@@ -173,13 +207,58 @@ impl Gpu {
         })
     }
 
+    /// Carve a parameter block out of the shared ring: one Vulkan buffer for
+    /// every dispatch's params instead of one allocation per dispatch.
+    pub fn params_u32(&self, data: &[u32]) -> Params {
+        let size = (data.len() * 4) as u64;
+        let mut ring = self.params_ring.borrow_mut();
+        if ring.offset + size > ring.capacity {
+            self.flush();
+            ring.offset = 0;
+        }
+        let offset = ring.offset;
+        ring.offset += size;
+        self.queue.write_buffer(&ring.buffer, offset, bytemuck::cast_slice(data));
+        self.stats.borrow_mut().bytes_uploaded += size;
+        Params { buffer: ring.buffer.clone(), offset, size }
+    }
+
+    /// dispatch() with the params block bound as a ring slice.
+    pub fn dispatch_params(&self, key: &str, shader: &str, entry: &str,
+                           bindings: &[(u32, &Buffer)], params: &Params,
+                           workgroups: (u32, u32, u32)) {
+        let pipeline = self.pipeline(key, shader, entry);
+        let layout = pipeline.get_bind_group_layout(0);
+        let mut entries: Vec<BindGroupEntry<'_>> = bindings
+            .iter()
+            .map(|(binding, buffer)| BindGroupEntry {
+                binding: *binding,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect();
+        entries.push(BindGroupEntry {
+            binding: entries.len() as u32,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &params.buffer,
+                offset: params.offset,
+                size: Some(params.size.try_into().expect("non-zero params")),
+            }),
+        });
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(key),
+            layout: &layout,
+            entries: &entries,
+        });
+        self.reuse(key, &pipeline, &group, workgroups);
+    }
+
     /// Upload into an existing buffer (uniforms / small params).
     pub fn write(&self, buffer: &Buffer, data: &[f32]) {
         self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
     }
 
-    fn pipeline(&self, key: &str, shader: &str, entry: &str) -> wgpu::ComputePipeline {
+    pub fn pipeline(&self, key: &str, shader: &str, entry: &str) -> wgpu::ComputePipeline {
         if let Some(p) = self.pipelines.borrow().get(key) {
             return p.clone();
         }
@@ -203,6 +282,21 @@ impl Gpu {
             .borrow_mut()
             .insert(key.to_string(), pipeline.clone());
         pipeline
+    }
+
+    /// Record a dispatch from a pre-built pipeline + bind group: the probe path
+    /// that separates object-creation cost from plain recording.
+    pub fn reuse(&self, _key: &str, pipeline: &wgpu::ComputePipeline,
+                 group: &wgpu::BindGroup, workgroups: (u32, u32, u32)) {
+        self.pending.borrow_mut().push(Pending {
+            pipeline: pipeline.clone(),
+            group: group.clone(),
+            workgroups,
+        });
+        self.stats.borrow_mut().dispatches += 1;
+        if self.pending.borrow().len() >= self.max_pending {
+            self.flush();
+        }
     }
 
     /// Record one dispatch into the current batch.
