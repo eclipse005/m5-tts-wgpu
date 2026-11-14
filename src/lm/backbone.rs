@@ -568,6 +568,9 @@ impl Lm {
         crate::gpu_ops::silu_down_f32(gpu, gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
                                x1.gpu_buffer()?, x_out.gpu_buffer()?,
                                INTERMEDIATE, HIDDEN);
+        // the residual chain (x_out RW -> next layer's RO -> RW) trips wgpu's
+        // exclusive read_write rule within a pass: end the pass per layer
+        gpu.sync();
         lap("down", &mut tick);
         // A fresh handle over the pooled scratch buffer (the scratch outlives
         // the returned tensor, and the next layer's K4 overwrites it anyway).
@@ -669,6 +672,10 @@ impl Lm {
                                     s.gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
                                     s.x1.gpu_buffer()?, s.x_out.gpu_buffer()?,
                                     INTERMEDIATE, HIDDEN);
+        // hazard bisect: sync after the first M5_SYNC_N dispatches of the layer
+        let n = std::env::var("M5_SYNC_N").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        if n >= 1 { gpu.sync(); }
+        let _ = (n, &s);
         Ok(())
     }
 

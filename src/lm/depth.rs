@@ -260,6 +260,7 @@ impl Lm {
                 gpu_ops::linear(gpu, embedding.gpu_buffer()?, projection.gpu_buffer()?, None,
                                 l0.x_in.gpu_buffer()?, 1, HIDDEN, HIDDEN);
             }
+            gpu.sync(); // pass boundary before the layer's kernels
             for layer in 0..DEPTH_LAYERS {
                 self.llama_layer_depth_arena("decoder", layer, position, &mut kv, &d)?;
                 gpu.sync();

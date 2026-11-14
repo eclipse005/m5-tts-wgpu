@@ -354,10 +354,16 @@ scratch 不跨 pass 复用；我们的 depth 5 层 × 30 dispatch 需要每层�
 arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + rope 全表 +
 双缓冲 norm_out 已落地，per-dispatch-sync 追踪下数值逐位正确；默认路径仍是
 已验证的 6-dispatch 形式（69ms/帧），arena 路径在 M5_DEPTH_ARENA=1 之后。
-**开放问题**：稳态下 wgpu 仍报某 pooled buffer RO→RW——已排除池别名、参数
-语义、缓存组身份；怀疑与 RW 独占的 pass 级验证有关，需要用 double-buffer
-的纯 RW→RO 形式重排残差链（x_in/x_out 每层交替），或每层结束 pass（当前
-sync 方案，~0.5ms/层 × 75 = 37ms/帧 开销，接近 CPU 路径——需要先量）。
+**开放问题（调查记录，91077a9 + 后续）**：arena 路径稳态 wgpu 报
+`pooled.417.512` RO→RW 冲突。已实测排除：①参数语义（a_rms 曾把 eps 当列数
+→ 1.7s 的越界循环，已修，修后 rms 输出与参考**逐位一致**，每层每步验证）；
+②缓存组身份（30 个缓存组全部只绑持久 scratch/权重）；③pass 边界（per-layer
+sync、projection 后 sync 均仍复现）；④池别名（recycle-on-drop 改为 owned
+标记，handle 克隆不回收）。**每 dispatch sync（M5_DISPATCH_TRACE）下完全
+正确**——冲突需要 ≥2 dispatch 同 pass。静态扫描单层 6 dispatch 无 RO→RW 对；
+疑点收敛到池/handle 与缓存组的深层交互，需要 wgpu-core 级追踪。预算允许的
+下一步：在 M5_DUMP_RMS 式逐张量 dump 的基础上扩到全部 6 kernel 的输出对比，
+或给 wgpu-core 打点。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
