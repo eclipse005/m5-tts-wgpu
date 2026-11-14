@@ -48,22 +48,26 @@ pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, 
         }
         return;
     }
-    let row = |r: usize| -> Vec<f32> {
+    let row = |r: usize, out: &mut [f32]| {
         let xr = &x[r * k..(r + 1) * k];
-        (0..n)
-            .map(|c| {
-                let wr = &w[c * k..(c + 1) * k];
-                let mut acc = 0.0f32;
-                for i in 0..k {
-                    acc += xr[i] * wr[i];
-                }
-                acc + bias.map(|b| b[c]).unwrap_or(0.0)
-            })
-            .collect()
+        // AVX2 dots per output column: the scalar inner loop ran the codec's
+        // pre_transformer GEMMs at ~70 GFLOP/s. Weights (<= 12 MB at these
+        // shapes) re-read from L3 per row, which L3 bandwidth absorbs.
+        let vectorised = avx2_available();
+        for (c, slot) in out.iter_mut().enumerate() {
+            let wr = &w[c * k..(c + 1) * k];
+            let dot = if vectorised {
+                // SAFETY: guarded by `avx2_available()`.
+                unsafe { dot_avx2(xr, wr, k) }
+            } else {
+                xr.iter().zip(wr).map(|(a, b)| a * b).sum()
+            };
+            *slot = dot + bias.map(|b| b[c]).unwrap_or(0.0);
+        }
     };
     y.par_chunks_mut(n)
         .enumerate()
-        .for_each(|(r, out)| out.copy_from_slice(&row(r)));
+        .for_each(|(r, out)| row(r, out));
 }
 
 /// Causal conv1d, `[channels, time]`, `y = conv(x) + bias`.
@@ -75,11 +79,9 @@ pub fn linear(x: &[f32], w: &[f32], bias: Option<&[f32]>, y: &mut [f32], (m, n, 
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
               (cin, cout, ks, dilation, stride, pad, t_in, t_out): (usize, usize, usize, usize, usize, usize, usize, usize)) {
-    // Measured on this machine: a fixed 128-sample block beats cache-sized blocks
-    // (212 vs 47 GFLOP/s). Smaller blocks pay the staging cost far more often than
-    // they gain from L1 residency.
     // A/B'd via seanet_probe variant 1 at the block-4 shape (same-process):
-    // 128 -> 107 ms, 512 -> ~78 ms: staging forks amortise, windows stay < L2.
+    // 128 -> 107 ms, 512 -> 60 ms (406 GFLOP/s): staging forks amortise while
+    // the staged window (96 ch x 518 x 4 B = 200 KB) stays under L2.
     let bt: usize = 512;
     let span = (ks - 1) * dilation + 1;
     for t0 in (0..t_out).step_by(bt) {
