@@ -255,7 +255,40 @@ qkv 58 / o 50 / attn 30 µs，见 55f5a80）。
 
 GPU 端：codec 的 GPU 路径仍是 channels-first + 朴素卷积；已实现的
 `conv1d_cl`（打包权重 + 8×4 寄存器分块）已验证正确（≤2e-5），速度 120~185 GFLOP/s，
-但**还没接进 codec 的 GPU 路径**。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
+但**还没接进 codec 的 GPU 路径**。
+
+## 6.6 wgpu 阶段计划（2025-11 定稿，全 GPU 路线）
+
+**决策**：除调度外一切都在 GPU 上跑，不从 CPU 优势里借性能（0.75 依赖 20 核/51.8GB/s，
+换 8 核机器会退化到 ~1.4）。P104-100（Vulkan，PCIe x1 = 0.6GB/s，无 tensor core）。
+
+**实测基线**（98 帧样例，RTF 5.22 vs CPU 0.87）：depth 169.2 ms/帧（9.3s）、backbone
+14.5 ms/帧（0.8s）、codec 解码 11.26s、encode+prefill ~1.1s。
+
+**根因（已定位）**：
+1. 转置卷积 naive scatter ≈ 2.4 GFLOP/s（upsample 段 0.245s / ~0.6 GMAC 反推），
+   4 个 block 共 ~20 GMAC ≈ **7s**——与 block 计时和(2.85s) vs seanet 总账(10.4s) 的缺口吻合。
+   注意 GPU 分段计时是异步的（record≠执行），现有分解不可信，先修计时。
+2. depth 走 host path：每 codebook logits 回读（flush 批队列）→ 16 次同步/帧；每层步
+   18 dispatch × 75 层步 ≈ 1350 dispatch ≈ 13ms 纯提交税。device path 存在但更慢(130 vs 60ms)。
+3. naive conv1d ~115-128 GFLOP/s（不算灾难）；conv1d_cl（120-185，已验证）未接线。
+4. pre_transformer 0.36s：小 GEMM 吃不满 86 GFLOP/s 的 GEMM kernel。
+
+**理论天花板（融合后）**：depth 8-12 ms/帧（4 dispatch/层 + bf16 上卡 + 全帧单批提交 +
+仅 1 次回读）+ backbone 2-3 ms/帧 + codec 0.6-1.0s（cuDNN 同卡 0.2s 是存在性证明）
++ encode 0.15-0.25s → **RTF 0.40-0.55**，好于 CPU 0.75 和 CUDA 0.77 约一倍。
+
+**CPU 机理 → GPU 平移表**：分相转置卷积 → WGSL kernel；qkv_attend per-head 融合 →
+一 dispatch 一 WG=head；snake/残差进 conv epilogue；BT=512 的道理 = dispatch 最小化 +
+批量提交；bf16 shader 内移位解码；大权重直读布局（消重排）；lazy 零页 → GPU buffer 池。
+
+**执行顺序**：①计时基建（flush-per-lap + gpu.stats）→ ②转置卷积 GPU 重写（分相+8×8，
+≥300 GFLOP/s）→ ③conv1d_cl 接线 + epilogue 融合 → ④depth device 路径融合（18→4
+dispatch/层，去回读）→ ⑤backbone/prefill/encode 复用 → ⑥bf16 上卡 + buffer 池。
+每步过双设备 parity 门（ops_parity / parity_codec / parity_pipeline）。
+
+**风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
+下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
 
 ### 6.4 与参考实现的对比（配对基准，best-of-3，提交 4e49264）
 
