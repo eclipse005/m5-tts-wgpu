@@ -321,10 +321,10 @@ cin-chunk 循环导致 silent garbage，parity_codec 拦截）；snake kernel �
 pow(sin,2)→s·s + 预 exp 表（每元素 2 次 exp→零次）；tiled transpose（两侧合并）。
 encoder 的 CL 绕行实测变慢已回退（窄通道形状不划算）。
 
-**当前 GPU 分解**（98 帧样例，RTF 2.21）：codec 4.8s（残差单元 12 个 conv @384
-GFLOP/s ≈ 1.1s + snake + 转置 + pre_transformer/quantise ~0.75s + 在位开销），
-depth 65.7 ms/帧 = 3.6s（dispatch 受限：6 dispatch × 75 层 × ~146µs 在位），
-encode ~0.9s，prefill 0.3s。
+**当前 GPU 分解**（98 帧样例，RTF 2.39-2.40 @ 提交 5d04692）：codec ~4.8s（残差
+单元 12 个 conv @384 GFLOP/s + snake/转置/pre_transformer/quantise ~0.75s + 在位
+开销），depth ~3.6s（dispatch 受限：6 dispatch × 75 层），encode ~0.9s，prefill
+0.3s。双模式 9 套全绿；codes 0 mismatch；SNR 109.4dB。
 
 下一步 = **移植 ming-3.0-tts-wgpu 的已验证 GPU 架构**（D:\ming-3.0-tts-wgpu，
 同款 P104，RTF 0.60 > CUDA——它踩平了我们所有的坑）：
