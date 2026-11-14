@@ -5,13 +5,18 @@
 
 最后更新：见 `git log -1`。当前 HEAD 的提交信息会告诉你最后一步动了什么。
 
-**2025-11 本轮成果**（提交 603eb7c 起）：RTF 1.21 → **0.75**（配对 best-of-3，对 Python CPU 1.36
-快 45%，**已追平 Python CUDA 的 0.77**）。八步：①修好 9 倍回归（`env::var_os` 环境锁）；
-②大张量双重分配 → lazy 零页；③转置卷积分相分解；④大权重转置卷积直读原布局（block1 6.2x）；
-⑤snake_conv1d/conv1d 时间块 128→512（fork 摊销，block4 单元 -43%）；⑥GEMM 路径 AVX2 化
-（pre_transformer -37%）；⑦libm sin 保住 SNR 109dB；⑧depth 预取实验失败复盘。
-新增探针：`mem_probe`（内存原语）、`seanet_probe`（残差单元/BT A/B）、`bw_probe`（带宽标定
-51.8 GB/s @20 线程）、`tconv_probe`、`gemv_prefetch_probe`。
+**2025-11 本轮成果**（提交 603eb7c 起）：RTF 1.21 → **0.75-0.87**（配对 best-of-3 0.75，对
+Python CPU 1.36 快 45%，**纯 CPU 已追平 Python CUDA 的 0.77**）。十步：①修好 9 倍回归
+（`env::var_os` 环境锁）；②大张量双重分配 → lazy 零页；③转置卷积分相分解；④大权重转置卷积
+直读原布局（block1 6.2x，512 GFLOP/s）；⑤snake_conv1d/conv1d 时间块 128→512（fork 摊销，
+block4 单元 -43%，406-466 GFLOP/s）；⑥GEMM 路径 AVX2 化（pre_transformer -37%）；
+⑦norm+qkv+rope+KV+attention 按 head 融合（depth 26.8→25.2 ms/帧）；⑧libm sin 保住 SNR
+109dB；⑨depth 预取实验失败复盘；⑩带宽标定 51.8 GB/s @20 线程（读数天花板）。
+新增探针：`mem_probe`、`seanet_probe`（双形状 BT A/B）、`bw_probe`、`tconv_probe`、
+`gemv_prefetch_probe`。
+剩余预算（4.3s 音频样例）：depth ~1.4s（48%）> codec 解码 ~1.45s > encode ~0.33s。
+CPU 已近本架构上限：depth 的 570MB/帧权重流是硬地板（L3 30MB 装不下、串行零重用），
+再压只剩 fork 微调（~5%）。下一阶段按计划转 wgpu。
 
 ---
 
