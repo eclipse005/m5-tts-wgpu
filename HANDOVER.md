@@ -293,8 +293,14 @@ runtime-indexed 局部数组会溢出 local memory、浅链 8 累加器无收益
 共享内存 staging 是 CL conv 120-185 的同构路线）→ ⑧bf16 上卡 + buffer 池。
 每步过双设备 parity 门（ops_parity / parity_codec / parity_pipeline）。
 
-**GPU 进度**：RTF 5.22 → **3.77**（codec 解码 11.3 → 6.25s）。PCIe 上传 2.7GB 的
-33MB/帧部分待 depth 融合时一并处理。
+**GPU 进度**：RTF 5.22 → **2.74**。分解：causal_conv CL 绕行（残差单元 -65%）+
+转置卷积分相（-55%）+ depth 走 device path（每帧 16 次回读 → 1 次；sample_topk 加
+noise 行偏移；2-token prefill 设备端拼接）+ **submit 税发现**（每次 submit+wait
+~0.5ms 驱动延迟；M5_MAX_PENDING=100000 单独一项就 RTF 3.77→3.02）+ params 池 +
+layout 缓存（dispatch 28.7→~10µs 组合实测；非线性残差未解，探针数据在 gpu_probe a-g）。
+PCIe 上传 2.7GB 的 33MB/帧部分待 depth 融合时一并处理。
+下一步：depth 层融合 18→4 dispatch/层（1700→450 dispatch/帧，在位 74ms/帧 → 目标
+~20-25）→ block4 单元占用率 → 共享内存版转置卷积 → bf16 上卡。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
