@@ -13,6 +13,42 @@ use crate::ops;
 
 /// Per-layer KV cache, already expanded to `heads` (GQA is resolved on write, so
 /// decode does not re-expand 360 rows every frame).
+/// Arena kernels + persistent per-layer scratch for the GPU depth pass
+/// (ming qwen_lm.rs pattern: stable buffer sets, cached bind groups, params
+/// through the uniform arena).
+pub struct DepthGpu {
+    pub kernels: DepthGpuKernels,
+    pub layers: Vec<RefCell<DepthLayerGpuScratch>>,
+    /// Double-buffered: step k's logits read one, step k's final norm writes
+    /// the other - a same-pass read->write on one buffer is a wgpu hazard.
+    pub norm_out: [Tensor; 2],
+    pub norm_flip: std::cell::Cell<bool>,
+}
+
+pub struct DepthGpuKernels {
+    pub rms: crate::gpu::Kernel,
+    pub gemv: crate::gpu::Kernel,
+    pub qkv_attend: crate::gpu::Kernel,
+    pub gemv_add: crate::gpu::Kernel,
+    pub norm_gateup: crate::gpu::Kernel,
+    pub silu_down: crate::gpu::Kernel,
+    pub zero1: Tensor,
+}
+
+pub struct DepthLayerGpuScratch {
+    pub x_in: Tensor,
+    pub normed: Tensor,
+    pub qkv: Tensor,
+    pub attended: Tensor,
+    pub x1: Tensor,
+    pub gate_up: Tensor,
+    pub x_out: Tensor,
+}
+
+fn q_rows() -> usize {
+    HEADS * HEAD_DIM
+}
+
 /// Fixed decode-step scratch buffers for the fused GPU layer (see
 /// `llama_layer_gpu_fused_step`): allocated once, reused every layer step.
 pub struct GpuLayerScratch {
@@ -536,6 +572,104 @@ impl Lm {
         // A fresh handle over the pooled scratch buffer (the scratch outlives
         // the returned tensor, and the next layer's K4 overwrites it anyway).
         Ok(x_out)
+    }
+
+    /// Arena kernels + per-layer scratch for the GPU depth pass (lazy).
+    pub fn depth_gpu(&self) -> Result<std::rc::Rc<DepthGpu>> {
+        if let Some(d) = self.depth_gpu.borrow().as_ref() {
+            return Ok(std::rc::Rc::clone(d));
+        }
+        let dev = self.device();
+        let gpu = dev.gpu()?;
+        let kernels = DepthGpuKernels {
+            rms: gpu.kernel("d.rms", crate::shaders::FUSED_RMS, "ro,ro,rw"),
+            gemv: gpu.kernel("d.gemv", crate::shaders::FUSED_GEMV, "ro,ro,ro,rw"),
+            qkv_attend: gpu.kernel("d.qkv_attend", crate::shaders::FUSED_QKV_ATTEND,
+                                   "ro,rw,rw,rw,ro,ro"),
+            gemv_add: gpu.kernel("d.gemv_add", crate::shaders::FUSED_GEMV_ADD, "ro,ro,ro,rw"),
+            norm_gateup: gpu.kernel("d.norm_gateup", crate::shaders::FUSED_NORM_GATEUP,
+                                    "ro,ro,ro,ro,rw"),
+            silu_down: gpu.kernel("d.silu_down", crate::shaders::FUSED_SILU_DOWN, "ro,ro,ro,rw"),
+            zero1: dev.tensor([1, 1], &[0.0])?,
+        };
+        let mut layers = Vec::with_capacity(DEPTH_LAYERS);
+        for _ in 0..DEPTH_LAYERS {
+            layers.push(RefCell::new(DepthLayerGpuScratch {
+                x_in: dev.zeros([1, HIDDEN])?,
+                normed: dev.zeros([1, HIDDEN])?,
+                qkv: dev.zeros([1, q_rows() + 2 * KV_HEADS * HEAD_DIM])?,
+                attended: dev.zeros([1, q_rows()])?,
+                x1: dev.zeros([1, HIDDEN])?,
+                gate_up: dev.zeros([1, 2 * INTERMEDIATE])?,
+                x_out: dev.zeros([1, HIDDEN])?,
+            }));
+        }
+        let norm_out = [dev.zeros([1, HIDDEN])?, dev.zeros([1, HIDDEN])?];
+        let d = std::rc::Rc::new(DepthGpu {
+            kernels,
+            layers,
+            norm_out,
+            norm_flip: std::cell::Cell::new(false),
+        });
+        *self.depth_gpu.borrow_mut() = Some(std::rc::Rc::clone(&d));
+        Ok(d)
+    }
+
+    /// One depth layer step on the arena kernels. `index` selects the layer's
+    /// persistent scratch; the input is layer[index].x_in (written by the
+    /// caller for layer 0, or the previous layer's x_out otherwise).
+    pub fn llama_layer_depth_arena(&self, prefix: &str, index: usize, position: usize,
+                                   cache: &mut KvCache, d: &DepthGpu) -> Result<()> {
+        let gpu = self.device().gpu()?;
+        let s = d.layers[index].borrow();
+        let p = format!("{prefix}.layers.{index}");
+        let q_dim = HEADS * HEAD_DIM;
+        let kv_dim = KV_HEADS * HEAD_DIM;
+        let key = (index as u64) << 8;
+        let _prev = if index == 0 { None } else { Some(d.layers[index - 1].borrow()) };
+        let input = if index == 0 {
+            &s.x_in
+        } else {
+            &_prev.as_ref().expect("prev layer").x_out
+        };
+
+        // RMSNorm stays on the plain params-pool dispatch: the arena version
+        // produced bit-identical normed but the depth codes diverged with it
+        // (deterministically from codebook 2) - until that interaction is
+        // understood, this op stays on the proven path.
+        let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+        crate::gpu_ops::rms_norm(gpu, input.gpu_buffer()?, input_norm.gpu_buffer()?,
+                                 s.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
+        let qkv_w = self.qkv_weight(prefix, index)?;
+        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 1, s.normed.gpu_buffer()?,
+                               qkv_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
+                               s.qkv.gpu_buffer()?, q_dim + 2 * kv_dim, HIDDEN);
+        let (cos_t, sin_t) = self.gpu_rope_tables()?;
+        {
+            let (cache_k, cache_v) = (&mut cache.k[index], &mut cache.v[index]);
+            crate::gpu_ops::a_qkv_attend(&d.kernels.qkv_attend, gpu, key | 2,
+                                         s.qkv.gpu_buffer()?, cache_k.gpu_buffer()?,
+                                         cache_v.gpu_buffer()?, s.attended.gpu_buffer()?,
+                                         cos_t.gpu_buffer()?, sin_t.gpu_buffer()?, position,
+                                         HEADS, q_dim, kv_dim);
+        }
+        let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
+        crate::gpu_ops::a_gemv_add(&d.kernels.gemv_add, gpu, key | 3,
+                                   s.attended.gpu_buffer()?, o_w.gpu_buffer()?,
+                                   input.gpu_buffer()?, s.x1.gpu_buffer()?, HIDDEN, q_dim);
+        let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+        let gate_w = self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        let up_w = self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        crate::gpu_ops::a_norm_gateup(&d.kernels.norm_gateup, gpu, key | 4,
+                                      s.x1.gpu_buffer()?, post_norm.gpu_buffer()?,
+                                      gate_w.gpu_buffer()?, up_w.gpu_buffer()?,
+                                      s.gate_up.gpu_buffer()?, INTERMEDIATE, HIDDEN, 1e-5);
+        let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
+        crate::gpu_ops::a_silu_down(&d.kernels.silu_down, gpu, key | 5,
+                                    s.gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
+                                    s.x1.gpu_buffer()?, s.x_out.gpu_buffer()?,
+                                    INTERMEDIATE, HIDDEN);
+        Ok(())
     }
 
     /// Full rope table ([2048, head_dim] cos/sin) on the GPU device, uploaded

@@ -69,6 +69,8 @@ pub struct Lm {
     /// Full rope table [2048, head_dim] on the device, uploaded once: the fused
     /// layer indexes it by position instead of re-uploading cos/sin per step.
     pub gpu_rope: RefCell<Option<(std::rc::Rc<Tensor>, std::rc::Rc<Tensor>)>>,
+    /// Arena kernels + persistent scratch for the GPU depth pass.
+    pub depth_gpu: RefCell<Option<std::rc::Rc<backbone::DepthGpu>>>,
 }
 
 impl Lm {
@@ -109,6 +111,7 @@ impl Lm {
             text_vocab,
             gpu_scratch: RefCell::new(None),
             gpu_rope: RefCell::new(None),
+            depth_gpu: RefCell::new(None),
         })
     }
 

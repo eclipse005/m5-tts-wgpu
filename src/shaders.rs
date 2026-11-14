@@ -1442,6 +1442,313 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Arena variant of RMS_NORM_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_RMS: &str = r#"
+// 0=rows 1=cols 2=eps(bits) 3=0
+struct P { a: u32, b: u32, c: u32, d: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = p.b;
+    let row = wid.x;
+    let lane = lid.x;
+    let base = row * cols;
+    var acc = 0.0;
+    var c = lane;
+    loop {
+        if (c >= cols) { break; }
+        let v = x[base + c];
+        acc = acc + v * v;
+        c = c + 64u;
+    }
+    partial[lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + partial[i]; }
+        let eps = bitcast<f32>(p.c);
+        partial[0] = inverseSqrt(total / f32(cols) + eps);
+    }
+    workgroupBarrier();
+    let inv = partial[0];
+    var c2 = lane;
+    loop {
+        if (c2 >= cols) { break; }
+        y[base + c2] = x[base + c2] * inv * w[c2];
+        c2 = c2 + 64u;
+    }
+}
+"#;
+
+/// Arena variant of GEMV_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_GEMV: &str = r#"
+// Shared with LINEAR_F32: 0=m 1=n 2=k 3=has_bias
+struct P { a: u32, b: u32, c: u32, d: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    let kdim = p.c;
+    var acc = 0.0;
+    if (row < p.b) {
+        let base = row * kdim;
+        var i = lane;
+        loop {
+            if (i >= kdim) { break; }
+            acc = acc + x[i] * w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.b) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        if (p.d == 1u) { sum = sum + b[row]; }
+        y[row] = sum;
+    }
+}
+"#;
+
+/// Arena variant of QKV_ATTEND_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_QKV_ATTEND: &str = r#"
+// 0=q_rows 1=kv_rows 2=head_dim 3=position 4=heads
+struct P { a: u32, b: u32, c: u32, d: u32, e: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> cache_k: array<f32>;
+@group(0) @binding(3) var<storage, read_write> cache_v: array<f32>;
+@group(0) @binding(4) var<storage, read_write> attended: array<f32>;
+@group(0) @binding(5) var<storage, read> cos_t: array<f32>;
+@group(0) @binding(6) var<storage, read> sin_t: array<f32>;
+var<workgroup> qs: array<f32, 64>;
+var<workgroup> ks: array<f32, 64>;
+var<workgroup> scores: array<f32, 1024>;
+var<workgroup> red123: array<f32, 1>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let hd = p.c;   // head_dim (p.b is kv_rows)
+    let t = lid.x;
+    let qo = head * hd;
+    let kvh = head / (p.a / p.b);  // heads / kv_heads
+
+    // Load this head's projected q and its kv head's k/v rows.
+    qs[t] = qkv[qo + t];
+    ks[t] = qkv[p.a + kvh * hd + t];
+    let vv = qkv[p.a + p.b + kvh * hd + t];
+
+    // Rotate-half rope inside the 64-dim head (t < 32 owns the (j, j+32) pair).
+    // The cos/sin table covers every position; this layer reads row `p.c`.
+    workgroupBarrier();
+    if (t < hd / 2u) {
+        let c = cos_t[p.d * hd + t];
+        let sn = sin_t[p.d * hd + t];
+        let ha = qs[t]; let hb = qs[t + hd / 2u];
+        qs[t] = ha * c - hb * sn;
+        qs[t + hd / 2u] = hb * c + ha * sn;
+        let ka = ks[t]; let kb = ks[t + hd / 2u];
+        ks[t] = ka * c - kb * sn;
+        ks[t + hd / 2u] = kb * c + ka * sn;
+    }
+    workgroupBarrier();
+
+    // Append to the cache at this position (expanded q-head layout, disjoint).
+    let off = p.d * p.a + qo;
+    cache_k[off + t] = ks[t];
+    cache_v[off + t] = vv;
+    workgroupBarrier();
+
+    // Attention over rows 0..=position: scores in shared, softmax in thread 0,
+    // weighted sum per thread over this head's value slice.
+    let len = p.d + 1u;
+    let scale = 1.0 / sqrt(f32(hd));
+    for (var j = t; j < len; j = j + 64u) {
+        var acc = 0.0;
+        for (var i = 0u; i < hd; i = i + 1u) { acc = acc + qs[i] * cache_k[j * p.a + qo + i]; }
+        scores[j] = acc * scale;
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        var maxs = -1e30;
+        for (var j = 0u; j < len; j = j + 1u) { maxs = max(maxs, scores[j]); }
+        var sum = 0.0;
+        for (var j = 0u; j < len; j = j + 1u) {
+            let e = exp(scores[j] - maxs);
+            scores[j] = e;
+            sum = sum + e;
+        }
+        red123[0u] = 1.0 / sum;
+    }
+    workgroupBarrier();
+    let inv_sum = red123[0u];
+    if (t < hd) {
+        var acc = 0.0;
+        for (var j = 0u; j < len; j = j + 1u) {
+            acc = acc + scores[j] * cache_v[j * p.a + qo + t];
+        }
+        attended[qo + t] = acc * inv_sum;
+    }
+}
+"#;
+
+/// Arena variant of GEMV_ADD_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_GEMV_ADD: &str = r#"
+// 0=n 1=k
+struct P { a: u32, b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> res: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p.a) {
+        let base = row * p.b;
+        var i = lane;
+        loop {
+            if (i >= p.b) { break; }
+            acc = acc + x[i] * w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.a) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        y[row] = sum + res[row];
+    }
+}
+"#;
+
+/// Arena variant of NORM_GATEUP_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_NORM_GATEUP: &str = r#"
+// 0=inter 1=hidden 2=eps_bits
+struct P { a: u32, b: u32, c: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(3) var<storage, read> gate_w: array<f32>;
+@group(0) @binding(4) var<storage, read> up_w: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+var<workgroup> normed: array<f32, 512>;
+var<workgroup> nred: array<f32, 256>;
+var<workgroup> wred: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let hidden = p.b;
+    let inter = p.a;
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+
+    // One norm per 64-row workgroup: 512 loads amortised over 8 warps x 8 rows.
+    var sq = 0.0;
+    for (var i = lid.x; i < hidden; i = i + 256u) { sq = sq + x[i] * x[i]; }
+    nred[lid.x] = sq;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var sum = 0.0;
+        for (var i = 0u; i < 256u; i = i + 1u) { sum = sum + nred[i]; }
+        nred[0u] = 1.0 / sqrt(sum / f32(hidden) + bitcast<f32>(p.c));
+    }
+    workgroupBarrier();
+    let inv = nred[0u];
+    for (var i = lid.x; i < hidden; i = i + 256u) {
+        normed[i] = x[i] * inv * norm_w[i];
+    }
+    workgroupBarrier();
+
+    // Eight warps x eight rows: warp `w` handles rows wg*64 + w + 8*r.
+    for (var r = 0u; r < 8u; r = r + 1u) {
+        let row = wid.x * 64u + warp + 8u * r;
+        if (row < 2u * inter) {
+            var acc = 0.0;
+            if (row < inter) {
+                let wrow = row * hidden;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    acc = acc + normed[i] * gate_w[wrow + i];
+                }
+            } else {
+                let wrow = (row - inter) * hidden;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    acc = acc + normed[i] * up_w[wrow + i];
+                }
+            }
+            wred[warp][lane] = acc;
+            workgroupBarrier();
+            if (lane == 0u) {
+                var sum = 0.0;
+                for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + wred[warp][i]; }
+                y[row] = sum;
+            }
+            workgroupBarrier();
+        }
+    }
+}
+"#;
+
+/// Arena variant of SILU_DOWN_F32: params at binding 0 (uniform, dynamic offset).
+pub const FUSED_SILU_DOWN: &str = r#"
+// 0=inter 1=hidden
+struct P { a: u32, b: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(2) var<storage, read> down_w: array<f32>;
+@group(0) @binding(3) var<storage, read> x1: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let inter = p.a;
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p.b) {
+        let base = row * inter;
+        var i = lane;
+        loop {
+            if (i >= inter) { break; }
+            let g = gate_up[i];
+            let u = gate_up[inter + i];
+            let act = g / (1.0 + exp(-g)) * u;
+            acc = acc + act * down_w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.b) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        out[row] = sum + x1[row];
+    }
+}
+"#;
+
 /// GEMV with a residual add in the epilogue: `y[r] = dot(w[r], x) + res[r]`.
 pub const GEMV_ADD_F32: &str = r#"
 // 0=n 1=k

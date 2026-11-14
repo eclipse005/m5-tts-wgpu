@@ -17,6 +17,56 @@ use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
 /// buffer, so dropping them before the submit lets Vulkan free them underneath
 /// ("Cannot get non-existent resource"). They are held here until after submit.
 
+/// An arena kernel: explicit layout + bind-group cache (ming nn.rs Kernel).
+pub struct Kernel {
+    pub bgl: wgpu::BindGroupLayout,
+    pub pipe: wgpu::ComputePipeline,
+    kinds: Vec<bool>,
+    cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
+}
+
+impl Kernel {
+    /// Dispatch with a cached bind group under `key`. The caller must keep the
+    /// same buffer set for a key; only the uniform bytes change per dispatch.
+    pub fn run(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
+               workgroups: (u32, u32, u32)) {
+        let hit = self.cache.borrow().get(&key).cloned();
+        let bind = if let Some(b) = hit {
+            b
+        } else {
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: gpu.arena_buffer(),
+                    offset: 0,
+                    size: Some((UNIFORM_SLOT as u64).try_into().expect("non-zero")),
+                }),
+            }];
+            for (i, b) in bufs.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: (i + 1) as u32,
+                    resource: b.as_entire_binding(),
+                });
+            }
+            let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("arena-kernel.{key}")),
+                layout: &self.bgl,
+                entries: &entries,
+            });
+            self.cache.borrow_mut().insert(key, bind.clone());
+            bind
+        };
+        let bytes: &[u8] = bytemuck::cast_slice(uni);
+        let trace = std::env::var_os("M5_DISPATCH_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let offset = gpu.alloc_uniform(bytes);
+        let t1 = std::time::Instant::now();
+        if trace { eprintln!("        [run.alloc] {:.0}us", t1.elapsed().as_secs_f64() * 1e6); }
+        gpu.record_dyn(&self.pipe, &bind, offset, workgroups);
+        if trace { eprintln!("        [run.record] {:.0}us", t1.elapsed().as_secs_f64() * 1e6); }
+    }
+}
+
 /// One recorded dispatch, replayed into a single compute pass at flush time.
 ///
 /// Recording a pass (or an encoder) per dispatch makes every kernel pay the full
@@ -26,12 +76,18 @@ use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
 struct Pending {
     pipeline: wgpu::ComputePipeline,
     group: wgpu::BindGroup,
+    /// Some(offset): the bind group has one dynamic uniform binding (arena
+    /// params). None: no dynamic bindings.
+    dyn_offset: Option<u32>,
     workgroups: (u32, u32, u32),
 }
 
 /// Submits kept in flight before a blocking wait (ming-3.0-tts: 4 overlaps
 /// CPU recording with GPU execution; deeper queues flake on the P104).
-const MAX_IN_FLIGHT: u32 = 4;
+const MAX_IN_FLIGHT: u32 = 1;
+/// Uniform slots are 256 B: the guaranteed minUniformBufferOffsetAlignment.
+pub const UNIFORM_SLOT: usize = 256;
+const ARENA_SLOTS: usize = 4096;
 /// Dispatches allowed in the very first submit of the process (P104 faults
 /// the device above ~50 in a cold first command buffer).
 const FIRST_SUBMIT_MAX: usize = 8;
@@ -66,10 +122,17 @@ pub struct Gpu {
     /// the allocator fragmented. Dropped tensors return here.
     pool: RefCell<HashMap<usize, Vec<Buffer>>>,
     pool_bytes: RefCell<usize>,
+    pool_counter: Cell<usize>,
     /// Buffers dropped while a submit batch was still open: they may be
     /// referenced by recorded dispatches, so they only join the pool after the
     /// next flush (write_buffer semantics make post-submit rewrites safe).
     deferred_pool: RefCell<Vec<(usize, Buffer)>>,
+    /// Uniform arena: one buffer, 256 B slots selected per dispatch via a
+    /// dynamic bind-group offset. Params cost one host memcpy per dispatch
+    /// instead of a buffer allocation (ming-3.0-tts gpu.rs:267/398).
+    arena: Buffer,
+    arena_host: RefCell<Vec<u8>>,
+    arena_used: Cell<usize>,
 }
 
 /// A parameter block from the pool: bound whole, offset always 0.
@@ -104,6 +167,11 @@ impl Gpu {
     /// The raw wgpu device (diagnostics / probes).
     pub fn raw_device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    /// The uniform arena buffer (bound whole by arena kernels).
+    pub fn arena_buffer(&self) -> &Buffer {
+        &self.arena
     }
 
     /// Block until everything queued so far has executed. `flush` alone only
@@ -185,6 +253,12 @@ impl Gpu {
             // device to TDR during lazy pipeline compilation; 256 amortises
             // submit overhead without that.
             .unwrap_or(256);
+        let arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniform-arena"),
+            size: (ARENA_SLOTS * UNIFORM_SLOT) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             device,
             queue,
@@ -200,7 +274,11 @@ impl Gpu {
             primed: Cell::new(false),
             pool: RefCell::new(HashMap::new()),
             pool_bytes: RefCell::new(0),
+            pool_counter: Cell::new(0),
             deferred_pool: RefCell::new(Vec::new()),
+            arena,
+            arena_host: RefCell::new(Vec::new()),
+            arena_used: Cell::new(0),
         })
     }
 
@@ -218,7 +296,9 @@ impl Gpu {
             *self.pool_bytes.borrow_mut() -= len * 4;
             return buf;
         }
-        self.empty("pooled", len)
+        let n = self.pool_counter.get();
+        self.pool_counter.set(n + 1);
+        self.empty(&format!("pooled.{n}.{len}"), len)
     }
 
     /// Return a dropped buffer to the pool (capped: ~1.5 GB of scratch).
@@ -235,6 +315,7 @@ impl Gpu {
     /// Recycle on tensor drop: a buffer recorded in the open submit batch is
     /// deferred to after the flush (rewrites before submit would corrupt it).
     pub fn recycle_on_drop(&self, len: usize, buf: Buffer) {
+        if std::env::var_os("M5_NO_POOL").is_some() { return; }
         if self.pending.borrow().is_empty() {
             self.recycle(len, buf);
         } else {
@@ -282,6 +363,25 @@ impl Gpu {
         })
     }
 
+
+    /// Reserve a uniform slot, copying the bytes into the arena's host staging
+    /// area. Returns the byte offset for the dynamic bind-group offset. The
+    /// arena uploads once per flush (one write_buffer for all slots).
+    pub fn alloc_uniform(&self, data: &[u8]) -> u32 {
+        debug_assert!(data.len() <= UNIFORM_SLOT);
+        let mut used = self.arena_used.get();
+        if used + UNIFORM_SLOT > ARENA_SLOTS * UNIFORM_SLOT {
+            self.flush();
+            used = 0;
+        }
+        let mut host = self.arena_host.borrow_mut();
+        if host.len() < used + UNIFORM_SLOT {
+            host.resize(used + UNIFORM_SLOT, 0);
+        }
+        host[used..used + data.len()].copy_from_slice(data);
+        self.arena_used.set(used + UNIFORM_SLOT);
+        used as u32
+    }
 
     /// Carve a parameter block from the pool: small buffers bound whole. A ring
     /// of distinct slices on one buffer made wgpu's resource tracking
@@ -432,6 +532,80 @@ impl Gpu {
         self.pending.borrow_mut().push(Pending {
             pipeline: pipeline.clone(),
             group: group.clone(),
+            dyn_offset: None,
+            workgroups,
+        });
+        self.stats.borrow_mut().dispatches += 1;
+        self.maybe_flush();
+    }
+
+    /// Explicit bind group layout for the arena pattern: uniform (dynamic
+    /// offset) at binding 0, `storage_ro` read-only buffers, one read-write
+    /// buffer last. The shader must declare `var<uniform> p` at binding 0.
+    pub fn arena_layout(&self, key: &str, shader: &str, kinds: &str)
+                        -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(key),
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
+        });
+        let mut entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(UNIFORM_SLOT as u64),
+            },
+            count: None,
+        }];
+        for (i, kind) in kinds.split(',').enumerate() {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: (i + 1) as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: kind.trim() == "ro" },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(key),
+            entries: &entries,
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(key),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(key),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        (bgl, pipeline)
+    }
+
+    /// Record one dispatch into the current batch.    /// An arena-kernel: explicit layout (uniform params at binding 0 with a
+    /// dynamic offset) plus a bind-group cache keyed by the caller's buffer
+    /// set. Dispatches against a cached key cost one host memcpy + record.
+    pub fn kernel(&self, key: &str, shader: &str, kinds: &str) -> Kernel {
+        let (bgl, pipe) = self.arena_layout(key, shader, kinds);
+        let kinds = kinds.split(',').map(|k| k.trim() == "ro").collect();
+        Kernel { bgl, pipe, kinds, cache: RefCell::new(HashMap::new()) }
+    }
+
+    /// Record a dispatch with a dynamic uniform offset into the current batch.
+    pub fn record_dyn(&self, pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup,
+                      offset: u32, workgroups: (u32, u32, u32)) {
+        self.pending.borrow_mut().push(Pending {
+            pipeline: pipeline.clone(),
+            group: group.clone(),
+            dyn_offset: Some(offset),
             workgroups,
         });
         self.stats.borrow_mut().dispatches += 1;
@@ -456,7 +630,7 @@ impl Gpu {
             entries: &entries,
         });
         self.stats.borrow_mut().dispatches += 1;
-        self.pending.borrow_mut().push(Pending { pipeline, group, workgroups });
+        self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups });
         self.maybe_flush();
     }
 
@@ -474,7 +648,10 @@ impl Gpu {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             for pending in &batch {
                 pass.set_pipeline(&pending.pipeline);
-                pass.set_bind_group(0, &pending.group, &[]);
+                match pending.dyn_offset {
+                    Some(off) => pass.set_bind_group(0, &pending.group, &[off]),
+                    None => pass.set_bind_group(0, &pending.group, &[]),
+                }
                 pass.dispatch_workgroups(pending.workgroups.0, pending.workgroups.1,
                                          pending.workgroups.2);
             }
@@ -487,6 +664,12 @@ impl Gpu {
 
     /// Submit everything recorded so far.
     pub fn flush(&self) {
+        let used = self.arena_used.get();
+        if used > 0 {
+            let host = self.arena_host.borrow();
+            self.queue.write_buffer(&self.arena, 0, &host[..used]);
+        }
+        self.arena_used.set(0);
         if let Some(batch) = self.encode_batch() {
             self.queue.submit(std::iter::once(batch));
             self.drain_deferred();

@@ -212,6 +212,39 @@ impl Lm {
         // codebook's logits are off by the residual stream's magnitude.
         hidden = self.llama_norm("decoder", &hidden)?;
 
+        // M5_DEPTH_ARENA=1: the arena-kernel path (persistent per-layer
+        // scratch, cached bind groups, params through the uniform arena).
+        // Structurally complete and numerically correct in per-dispatch-sync
+        // tracing, but a wgpu usage conflict (a pooled buffer bound read-only
+        // in one dispatch and read-write in another of the same pass) remains
+        // unresolved - default stays on the proven dispatch path.
+        let arena_on = std::env::var_os("M5_DEPTH_ARENA").is_some();
+        if !arena_on {
+            let mut position = 2usize;
+            for codebook in 1..CODEBOOKS {
+                let logits = self.audio_head_logits(&hidden, codebook - 1)?;
+                sample(&logits, codebook, true, codebook)?;
+                if codebook + 1 == CODEBOOKS {
+                    break;
+                }
+                let mut embedding = dev.zeros([1, HIDDEN])?;
+                gpu_ops::embed_sum(gpu, table.gpu_buffer()?, &token_buffer,
+                                   embedding.gpu_buffer()?, HIDDEN, codebook, 1, AUDIO_VOCAB);
+                let mut next = dev.zeros([1, HIDDEN])?;
+                ops::linear(dev, &embedding, &projection, None, &mut next)?;
+                let (cos, sin) = rope_table(&[position]);
+                for layer in 0..DEPTH_LAYERS {
+                    next = self.llama_layer("decoder", layer, &next, &cos, &sin,
+                                            Some((&mut kv, position, false)))?;
+                }
+                kv.len = position + 1;
+                position += 1;
+                hidden = self.llama_norm("decoder", &next)?;
+            }
+            return dev.read_tokens(&tokens);
+        }
+        let d = self.depth_gpu()?;
+        let norm_w = self.vector("decoder.norm.weight", HIDDEN)?;
         let mut position = 2usize;
         for codebook in 1..CODEBOOKS {
             let logits = self.audio_head_logits(&hidden, codebook - 1)?;
@@ -219,19 +252,28 @@ impl Lm {
             if codebook + 1 == CODEBOOKS {
                 break;
             }
-            let mut embedding = dev.zeros([1, HIDDEN])?;
+            let embedding = dev.zeros([1, HIDDEN])?;
             gpu_ops::embed_sum(gpu, table.gpu_buffer()?, &token_buffer, embedding.gpu_buffer()?,
                                HIDDEN, codebook, 1, AUDIO_VOCAB);
-            let mut next = dev.zeros([1, HIDDEN])?;
-            ops::linear(dev, &embedding, &projection, None, &mut next)?;
-            let (cos, sin) = rope_table(&[position]);
+            {
+                let l0 = d.layers[0].borrow();
+                gpu_ops::linear(gpu, embedding.gpu_buffer()?, projection.gpu_buffer()?, None,
+                                l0.x_in.gpu_buffer()?, 1, HIDDEN, HIDDEN);
+            }
             for layer in 0..DEPTH_LAYERS {
-                next = self.llama_layer("decoder", layer, &next, &cos, &sin,
-                                        Some((&mut kv, position, false)))?;
+                self.llama_layer_depth_arena("decoder", layer, position, &mut kv, &d)?;
+                gpu.sync();
             }
             kv.len = position + 1;
             position += 1;
-            hidden = self.llama_norm("decoder", &next)?;
+            let flip = d.norm_flip.get();
+            {
+                let l4 = d.layers[DEPTH_LAYERS - 1].borrow();
+                gpu_ops::rms_norm(gpu, l4.x_out.gpu_buffer()?, norm_w.gpu_buffer()?,
+                                  d.norm_out[flip as usize].gpu_buffer()?, 1, HIDDEN, 1e-5);
+            }
+            hidden = d.norm_out[flip as usize].handle([1, HIDDEN])?;
+            d.norm_flip.set(!flip);
         }
         dev.read_tokens(&tokens)
     }

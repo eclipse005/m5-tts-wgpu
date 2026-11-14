@@ -170,6 +170,57 @@ pub fn transpose_tiled(gpu: &Gpu, x: &Buffer, y: &Buffer, rows: usize, cols: usi
                         ((rows as u32).div_ceil(16).max(1), (cols as u32).div_ceil(16).max(1), 1u32));
 }
 
+// ---- arena kernels for the depth decode (ming nn.rs pattern) ----
+// Each takes a &Kernel (bind group cached per key), a numeric cache key and a
+// u32 params slice copied into the uniform arena.
+
+pub fn a_rms(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
+             y: &Buffer, hidden: usize, eps: f32) {
+    // FUSED_RMS body semantics: {rows, cols, eps_bits, pad}
+    let uni: [u32; 4] = [1, hidden as u32, eps.to_bits(), 0];
+    k.run(gpu, key, &uni, &[x, norm_w, y], (1, 1, 1));
+}
+
+pub fn a_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+              zero: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    // FUSED_GEMV body semantics: {rows(m), cols(n), k, has_bias}
+    let uni: [u32; 4] = [1, n as u32, kk as u32, 0];
+    k.run(gpu, key, &uni, &[x, w, zero, y],
+          ((n as u32).div_ceil(8), 1u32, 1u32));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn a_qkv_attend(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, qkv: &Buffer,
+                    cache_k: &Buffer, cache_v: &Buffer, attended: &Buffer,
+                    cos: &Buffer, sin: &Buffer, position: usize, heads: usize,
+                    q_rows: usize, kv_rows: usize) {
+    let uni: [u32; 5] = [q_rows as u32, kv_rows as u32, 64u32, position as u32, heads as u32];
+    k.run(gpu, key, &uni, &[qkv, cache_k, cache_v, attended, cos, sin],
+          (heads as u32, 1u32, 1u32));
+}
+
+pub fn a_gemv_add(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+                  res: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    let uni: [u32; 2] = [n as u32, kk as u32];
+    k.run(gpu, key, &uni, &[x, w, res, y],
+          ((n as u32).div_ceil(8), 1u32, 1u32));
+}
+
+pub fn a_norm_gateup(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
+                     gate_w: &Buffer, up_w: &Buffer, y: &Buffer, inter: usize, hidden: usize,
+                     eps: f32) {
+    let uni: [u32; 3] = [inter as u32, hidden as u32, eps.to_bits()];
+    k.run(gpu, key, &uni, &[x, norm_w, gate_w, up_w, y],
+          (((2 * inter) as u32).div_ceil(64).max(1), 1u32, 1u32));
+}
+
+pub fn a_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer,
+                   down_w: &Buffer, x1: &Buffer, y: &Buffer, inter: usize, hidden: usize) {
+    let uni: [u32; 2] = [inter as u32, hidden as u32];
+    k.run(gpu, key, &uni, &[gate_up, down_w, x1, y],
+          ((hidden as u32).div_ceil(8).max(1), 1u32, 1u32));
+}
+
 /// Fused decode-step attention block (one workgroup per query head).
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_attend_f32(gpu: &Gpu, qkv: &Buffer, cache_k: &Buffer, cache_v: &Buffer,
