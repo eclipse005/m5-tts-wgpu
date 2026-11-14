@@ -23,7 +23,11 @@ pub struct Kernel {
     pub pipe: wgpu::ComputePipeline,
     kinds: Vec<bool>,
     name: String,
-    cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
+    /// key -> (bind group, its own params buffer). The params buffer is written
+    /// per dispatch (queue.write_buffer, staged with the batch that reads it)
+    /// and bound whole at offset 0 - no arena slots, no dynamic offsets, no
+    /// cross-pass usage-state reuse.
+    cache: RefCell<HashMap<u64, (wgpu::BindGroup, Buffer)>>,
 }
 
 impl Kernel {
@@ -45,20 +49,10 @@ impl Kernel {
     }
 
     fn run_impl(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
-                workgroups: (u32, u32, u32), params_dyn: bool) {
-        let params = gpu.params_u32(uni);
-        let (resource, dyn_off) = if params_dyn {
-            (wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &params.buffer,
-                offset: params.offset,
-                size: Some(params.size.try_into().expect("non-zero params")),
-            }), params.offset as u32)
-        } else {
-            (params.buffer.as_entire_binding(), 0u32)
-        };
+                workgroups: (u32, u32, u32), _params_dyn: bool) {
         let hit = self.cache.borrow().get(&key).cloned();
-        let bind = if let Some(b) = hit {
-            b
+        let (bind, params_buffer) = if let Some(pair) = hit {
+            pair
         } else {
             let mut entries = Vec::with_capacity(bufs.len() + 1);
             for (i, b) in bufs.iter().enumerate() {
@@ -67,31 +61,27 @@ impl Kernel {
                     resource: b.as_entire_binding(),
                 });
             }
+            let params_buffer = gpu.empty(&format!("kernel.{}.params", self.name), 16);
             entries.push(wgpu::BindGroupEntry {
                 binding: bufs.len() as u32,
-                resource: resource.clone(),
+                resource: params_buffer.as_entire_binding(),
             });
             let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("kernel.{}", self.name)),
                 layout: &self.bgl,
                 entries: &entries,
             });
-            self.cache.borrow_mut().insert(key, bind.clone());
-            bind
+            self.cache.borrow_mut().insert(key, (bind.clone(), params_buffer.clone()));
+            (bind, params_buffer)
         };
-        if params_dyn {
-            gpu.record_dyn_off(&self.pipe, &bind, dyn_off, workgroups);
-        } else {
-            gpu.record(&self.pipe, &bind, workgroups);
-        }
-        // The first dispatch of a new pipeline triggers the driver's lazy
-        // compilation - drain immediately so it cannot pile up with other new
-        // pipelines in one batch (P104 faults the device that way).
-        gpu.prime_if_needed(&self.name);
+        // The params bytes land with the batch that reads them (write_buffer is
+        // staged per submit), and each (layer, op) owns its buffer exclusively.
+        gpu.write_u32(&params_buffer, uni);
+        gpu.record(&self.pipe, &bind, workgroups);
     }
 }
 
-/// One recorded dispatch, replayed into a single compute pass at flush time.
+/// One recorded dispatch, replayed into a single compute pass at flush time./// One recorded dispatch, replayed into a single compute pass at flush time.
 ///
 /// Recording a pass (or an encoder) per dispatch makes every kernel pay the full
 /// pipeline-drain latency; on this backend that dominated everything (measured
@@ -134,11 +124,13 @@ pub struct Gpu {
     /// Upload bytes per call-site label, so a profiling run can show where the
     /// PCIe traffic actually comes from (`M5_PROFILE=1`).
     pub upload_labels: RefCell<HashMap<String, u64>>,
-    /// Parameter-block pool for per-dispatch params: many small buffers bound
-    /// whole. A ring of distinct slices on one buffer made wgpu's resource
-    /// tracking superlinear (28 us/dispatch); whole bindings on reused buffers
-    /// stay on the fast path (~7 us). The pool flushes when it wraps.
-    params_pool: RefCell<ParamsPool>,
+    /// Parameter arena: ONE storage buffer, 256 B slots selected per dispatch
+    /// via a dynamic bind-group offset. Cached bind groups bind it whole, so
+    /// every dispatch reads its own slot (ming-3.0-tts uniform-arena pattern,
+    /// in storage address space so the existing shaders need no edits).
+    params_arena: Buffer,
+    params_host: RefCell<Vec<u8>>,
+    params_used: Cell<usize>,
     /// Submits in flight without a wait: a few queued submits let the CPU
     /// record the next batch while the GPU drains the previous one
     /// (ming-3.0-tts proved 4 is the sweet spot on this exact card).
@@ -172,11 +164,6 @@ pub struct Params {
     pub buffer: Buffer,
     pub offset: u64,
     pub size: u64,
-}
-
-struct ParamsPool {
-    buffers: Vec<Buffer>,
-    next: usize,
 }
 
 
@@ -290,6 +277,12 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let params_arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params-arena"),
+            size: (ARENA_SLOTS * UNIFORM_SLOT) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             device,
             queue,
@@ -301,7 +294,9 @@ impl Gpu {
             unprimed: RefCell::new(HashMap::new()),
             stats: RefCell::new(Stats::default()),
             upload_labels: RefCell::new(HashMap::new()),
-            params_pool: RefCell::new(ParamsPool { buffers: Vec::new(), next: 0 }),
+            params_arena,
+            params_host: RefCell::new(Vec::new()),
+            params_used: Cell::new(0),
             in_flight: Cell::new(0),
             primed: Cell::new(false),
             pool: RefCell::new(HashMap::new()),
@@ -439,35 +434,36 @@ impl Gpu {
         used as u32
     }
 
-    /// Carve a parameter block from the pool: small buffers bound whole. A ring
-    /// of distinct slices on one buffer made wgpu's resource tracking
-    /// superlinear (28 us/dispatch); whole bindings on reused buffers stay on
-    /// the fast path. The pool flushes when it wraps so no pending dispatch can
-    /// see its params overwritten.
+    /// Params slot as a standalone Params (static binding, offset/size baked
+    /// in) - for the one-shot dispatch_params path.
     pub fn params_u32(&self, data: &[u32]) -> Params {
-        const POOL: usize = 1024;
-        let size = (data.len() * 4) as u64;
-        let mut pool = self.params_pool.borrow_mut();
-        if pool.buffers.is_empty() {
-            for i in 0..POOL {
-                pool.buffers.push(self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("params.{i}")),
-                    size: 64,
-                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-        }
-        if pool.next >= POOL {
-            self.flush();
-            pool.next = 0;
-        }
-        let buffer = pool.buffers[pool.next].clone();
-        pool.next += 1;
-        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
-        self.stats.borrow_mut().bytes_uploaded += size;
-        Params { buffer, offset: 0, size }
+        let (buffer, offset, size) = self.alloc_params(data);
+        Params { buffer, offset, size }
     }
+
+    /// Carve a parameter slot from the shared storage arena. Returns the byte
+    /// offset for the dynamic bind-group offset; the arena uploads once per
+    /// flush (one write_buffer for all slots).
+    pub fn alloc_params(&self, data: &[u32]) -> (Buffer, u64, u64) {
+        const ALIGN: u64 = 32;  // min_storage_buffer_offset_alignment
+        let size = (data.len() * 4) as u64;
+        let cap = (ARENA_SLOTS * UNIFORM_SLOT) as u64;
+        let mut used = self.params_used.get();
+        if used as u64 + size + ALIGN > cap {
+            self.flush();
+            used = 0;
+        }
+        let offset = (used as u64 + ALIGN - 1) / ALIGN * ALIGN;
+        let mut host = self.params_host.borrow_mut();
+        if host.len() < offset as usize + size as usize {
+            host.resize(offset as usize + size as usize, 0);
+        }
+        host[offset as usize..offset as usize + size as usize]
+            .copy_from_slice(bytemuck::cast_slice(data));
+        self.params_used.set(offset as usize + size as usize);
+        (self.params_arena.clone(), offset, size)
+    }
+
 
     /// dispatch() with the params block bound as a ring slice.
     pub fn dispatch_params(&self, key: &str, shader: &str, entry: &str,
@@ -495,6 +491,12 @@ impl Gpu {
             entries: &entries,
         });
         self.reuse(key, &pipeline, &group, workgroups);
+    }
+
+    /// Upload u32 params into an existing buffer.
+    pub fn write_u32(&self, buffer: &Buffer, data: &[u32]) {
+        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
     }
 
     /// Upload into an existing buffer (uniforms / small params).
@@ -822,6 +824,12 @@ impl Gpu {
             self.queue.write_buffer(&self.arena, 0, &host[..used]);
         }
         self.arena_used.set(0);
+        let pused = self.params_used.get();
+        if pused > 0 {
+            let host = self.params_host.borrow();
+            self.queue.write_buffer(&self.params_arena, 0, &host[..pused]);
+        }
+        self.params_used.set(0);
         if let Some(batch) = self.encode_batch() {
             self.queue.submit(std::iter::once(batch));
             self.drain_deferred();
