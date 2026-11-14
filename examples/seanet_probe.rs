@@ -13,6 +13,7 @@
 use m5_tts_wgpu::cpu_ops;
 use m5_tts_wgpu::device::{Device, Tensor};
 use m5_tts_wgpu::ops::{self, Conv1d};
+use std::hint::black_box;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
@@ -80,6 +81,32 @@ fn main() -> anyhow::Result<()> {
                           (cin, cout, ks, 1, 1, ks - 1, t, t));
     let t5 = s.elapsed().as_secs_f64();
     println!("5. fused snake_conv (+res)       {:6.1} ms  {:6.1} GFLOP/s", t5 * 1e3, gflop(t5));
+
+    // Block-1 shape (768 ch x 3840): wide channels, small time — the BT sweet
+    // spot is different there than at block 4.
+    {
+        let (cin, t) = (768usize, 3840usize);
+        let macs1 = (cin * cin * ks * t) as f64;
+        let x1 = dev.tensor([cin, t], &(0..cin * t).map(|_| next()).collect::<Vec<f32>>())?;
+        let w1 = dev.tensor([cin, cin * ks], &(0..cin * cin * ks).map(|_| next()).collect::<Vec<f32>>())?;
+        let a1 = dev.tensor([cin, 1], &(0..cin).map(|_| next() * 0.1).collect::<Vec<f32>>())?;
+        let b1 = dev.tensor([cin, 1], &(0..cin).map(|_| next() * 0.1).collect::<Vec<f32>>())?;
+        let bias1 = dev.tensor([cin, 1], &(0..cin).map(|_| next() * 0.01).collect::<Vec<f32>>())?;
+        let r1 = dev.tensor([cin, t], &(0..cin * t).map(|_| next()).collect::<Vec<f32>>())?;
+        let _ = black_box((&x1, &w1));
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let s = Instant::now();
+            let mut yb = dev.zeros([cin, t])?;
+            cpu_ops::snake_conv1d(x1.cpu_slice()?, a1.cpu_slice()?, b1.cpu_slice()?, w1.cpu_slice()?,
+                                  bias1.cpu_slice()?, Some(r1.cpu_slice()?), yb.cpu_slice_mut()?,
+                                  (cin, cin, ks, 1, 1, ks - 1, t, t));
+            best = best.min(s.elapsed().as_secs_f64());
+            black_box(&yb);
+        }
+        println!("block1 fused (+res)              {:6.1} ms  {:6.1} GFLOP/s",
+                 best * 1e3, 2.0 * macs1 / best / 1e9);
+    }
 
     // Sanity: same-math variants must agree (y2 holds conv(snake(x)) from
     // variant 2; y5 must equal that plus the residual; y4 must equal y2).

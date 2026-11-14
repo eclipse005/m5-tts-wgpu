@@ -1277,13 +1277,17 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
                     residual: Option<&[f32]>, y: &mut [f32],
                     (cin, cout, ks, dilation, stride, pad, t_in, t_out):
                         (usize, usize, usize, usize, usize, usize, usize, usize)) {
-    const BT: usize = 128;
+    // A/B'd via examples/seanet_probe in one process, both production shapes:
+    // 128 samples per block made the per-block window staging and rayon forks
+    // ~45% of the kernel at block 4 (92 vs 52 ms) and block 1 is fastest here
+    // too (34 vs 29 ms, 1.1 TFLOP/s). 1024 plateaus.
+    let bt: usize = 512;
     let span = (ks - 1) * dilation + 1;
     let a: Vec<f32> = alpha.iter().map(|v| v.exp()).collect();
     let b: Vec<f32> = beta.iter().map(|v| v.exp() + 1e-9).collect();
 
-    for t0 in (0..t_out).step_by(BT) {
-        let tn = BT.min(t_out - t0);
+    for t0 in (0..t_out).step_by(bt) {
+        let tn = bt.min(t_out - t0);
         let start = t0 as isize * stride as isize - pad as isize;
         let len = (tn - 1) * stride + span;
         let mut window = vec![0.0f32; cin * len];
