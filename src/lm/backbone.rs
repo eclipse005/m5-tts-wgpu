@@ -456,28 +456,19 @@ impl Lm {
 
         let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
         let qkv_w = self.qkv_bf16(prefix, index);
-        let mut qkv = vec![0.0f32; q_dim + 2 * kv_dim];
+        let mut attended = vec![0.0f32; q_dim];
         match &qkv_w {
-            Some(w) => cpu_ops::rms_norm_gemv_bf16(&row, input_norm.cpu_slice()?, w, None, &mut qkv,
-                                                  HIDDEN, q_dim + 2 * kv_dim, 1e-5),
+            // norm + qkv + rope + cache append + attention in one fork: the four
+            // separate regions were ~25% of a layer step, mostly barrier latency
+            // on ~1.5 MMAC of work.
+            Some(w) => cpu_ops::qkv_attend_bf16(&row, input_norm.cpu_slice()?, w,
+                                                cache.k[index].cpu_slice_mut()?,
+                                                cache.v[index].cpu_slice_mut()?, &mut attended,
+                                                cos, sin, position, HEADS, KV_HEADS, HEAD_DIM,
+                                                HIDDEN, 1e-5),
             None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
         }
-        if profile { eprintln!("      qkv {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
-
-        let (q, rest) = qkv.split_at_mut(q_dim);
-        let (k, v) = rest.split_at_mut(kv_dim);
-        cpu_ops::rope_tabled(q, cos, sin, 1, HEADS, HEAD_DIM);
-        cpu_ops::rope_tabled(k, cos, sin, 1, KV_HEADS, HEAD_DIM);
-        let mut k_full = vec![0.0f32; q_dim];
-        let mut v_full = vec![0.0f32; q_dim];
-        cpu_ops::repeat_kv(k, &mut k_full, 1, KV_HEADS, HEADS, HEAD_DIM);
-        cpu_ops::repeat_kv(v, &mut v_full, 1, KV_HEADS, HEADS, HEAD_DIM);
-        cpu_ops::write_rows(cache.k[index].cpu_slice_mut()?, &k_full, q_dim, position);
-        cpu_ops::write_rows(cache.v[index].cpu_slice_mut()?, &v_full, q_dim, position);
-        let mut attended = vec![0.0f32; q_dim];
-        cpu_ops::attention_decode(q, cache.k[index].cpu_slice()?, cache.v[index].cpu_slice()?,
-                                 &mut attended, position + 1, HEADS, HEAD_DIM);
-        if profile { eprintln!("      attn {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
+        if profile { eprintln!("      qkv+attn {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
 
         let o_w = self.bf16_bytes(&format!("{p}.self_attn.o_proj.weight"));
         let mut x1 = vec![0.0f32; HIDDEN];

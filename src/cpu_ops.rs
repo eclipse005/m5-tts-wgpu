@@ -673,6 +673,112 @@ pub fn attention_decode(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
     });
 }
 
+/// Fused decode-step attention block: RMS-norm -> q/k/v projection -> rope ->
+/// KV-cache append -> attention, one parallel region over query heads.
+///
+/// The production chain paid four rayon barriers per layer for work totalling
+/// ~1.5 MMAC; this collapses the first three stages into one fork (one per head
+/// instead of per GEMV). The heads sharing a KV head re-project its 128 k/v rows
+/// (0.26 MMAC duplicated — far cheaper than a barrier). Cache layout, rope and
+/// score accumulation order are identical to [`rms_norm_gemv_bf16`] +
+/// [`rope_tabled`] + [`repeat_kv`] + [`write_rows`] + [`attention_decode`], so
+/// results are bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_attend_bf16(x: &[f32], norm_w: &[f32], qkv_w: &[u8], cache_k: &mut [f32],
+                       cache_v: &mut [f32], attended: &mut [f32], cos: &[f32], sin: &[f32],
+                       position: usize, heads: usize, kv_heads: usize, head_dim: usize,
+                       cols: usize, eps: f32) {
+    let q_rows = heads * head_dim;
+    let kv_rows = kv_heads * head_dim;
+    let stride = q_rows;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_per_head = heads / kv_heads;
+
+    let mut normed = vec![0.0f32; cols];
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+    let inv = 1.0 / (mean_sq + eps).sqrt();
+    for c in 0..cols {
+        normed[c] = x[c] * inv * norm_w[c];
+    }
+
+    // Split the cache: rows before `position` are read-only history, the current
+    // row is written per head at disjoint slots.
+    let len_hist = position;
+    let (hist_k, cur_k) = cache_k.split_at_mut(position * stride);
+    let (hist_v, cur_v) = cache_v.split_at_mut(position * stride);
+    attended.par_chunks_mut(head_dim).enumerate().take(heads)
+        .zip(cur_k.par_chunks_mut(head_dim)).zip(cur_v.par_chunks_mut(head_dim))
+        .for_each(|(((h, out), k_slot), v_slot)| {
+        let qo = h * head_dim;
+        let mut q = vec![0.0f32; head_dim];
+        for (i, qv) in q.iter_mut().enumerate() {
+            let row = (qo + i) * cols * 2;
+            *qv = dot_bf16(&normed, &qkv_w[row..row + cols * 2], cols);
+        }
+        // The four query heads sharing a KV head each re-project its rows.
+        let kvh = h / kv_per_head;
+        let mut k = vec![0.0f32; head_dim];
+        let mut v = vec![0.0f32; head_dim];
+        for (i, kvv) in k.iter_mut().enumerate() {
+            let row = (q_rows + kvh * head_dim + i) * cols * 2;
+            *kvv = dot_bf16(&normed, &qkv_w[row..row + cols * 2], cols);
+        }
+        for (i, kvv) in v.iter_mut().enumerate() {
+            let row = (q_rows + kv_rows + kvh * head_dim + i) * cols * 2;
+            *kvv = dot_bf16(&normed, &qkv_w[row..row + cols * 2], cols);
+        }
+        // Rope this position's q and k in place (rotate-half, table-driven).
+        for j in 0..head_dim / 2 {
+            let (c, s) = (cos[j], sin[j]);
+            let (a, b) = (q[j], q[j + head_dim / 2]);
+            q[j] = a * c - b * s;
+            q[j + head_dim / 2] = b * c + a * s;
+            let (a, b) = (k[j], k[j + head_dim / 2]);
+            k[j] = a * c - b * s;
+            k[j + head_dim / 2] = b * c + a * s;
+        }
+        // Append to the cache at this position, in the expanded q-head layout.
+        k_slot.copy_from_slice(&k);
+        v_slot.copy_from_slice(&v);
+        // Attend over rows 0..=position: history from the cache, the current row
+        // (just appended) from this task's own slot.
+        let mut scores = vec![0.0f32; len_hist + 1];
+        let mut maxs = f32::NEG_INFINITY;
+        for (j, score) in scores.iter_mut().enumerate().take(len_hist) {
+            let ko = j * stride + qo;
+            let mut acc = 0.0f32;
+            for i in 0..head_dim {
+                acc += q[i] * hist_k[ko + i];
+            }
+            *score = acc * scale;
+            maxs = maxs.max(*score);
+        }
+        {
+            let mut acc = 0.0f32;
+            for i in 0..head_dim {
+                acc += q[i] * k_slot[i];
+            }
+            let cur = acc * scale;
+            scores[len_hist] = cur;
+            maxs = maxs.max(cur);
+        }
+        let mut sum = 0.0f32;
+        for score in scores.iter_mut() {
+            *score = (*score - maxs).exp();
+            sum += *score;
+        }
+        let inv = 1.0 / sum;
+        for i in 0..head_dim {
+            let mut acc = 0.0f32;
+            for (j, score) in scores.iter().enumerate() {
+                let vv = if j < len_hist { &hist_v[j * stride + qo + i] } else { &v_slot[i] };
+                acc += score * vv;
+            }
+            out[i] = acc * inv;
+        }
+    });
+}
+
 /// Rotary embedding from a cos/sin table, in place.
 pub fn rope_tabled(x: &mut [f32], cos: &[f32], sin: &[f32], frames: usize, heads: usize, head_dim: usize) {
     let half = head_dim / 2;
