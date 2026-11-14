@@ -321,10 +321,17 @@ cin-chunk 循环导致 silent garbage，parity_codec 拦截）；snake kernel �
 pow(sin,2)→s·s + 预 exp 表（每元素 2 次 exp→零次）；tiled transpose（两侧合并）。
 encoder 的 CL 绕行实测变慢已回退（窄通道形状不划算）。
 
-**当前 GPU 分解**（98 帧样例，RTF 2.39-2.40 @ 提交 5d04692）：codec ~4.8s（残差
+**当前 GPU 分解**（98 帧样例，RTF 2.44 @ 提交 b99ee29）：codec ~4.8s（残差
 单元 12 个 conv @384 GFLOP/s + snake/转置/pre_transformer/quantise ~0.75s + 在位
 开销），depth ~3.6s（dispatch 受限：6 dispatch × 75 层），encode ~0.9s，prefill
 0.3s。双模式 9 套全绿；codes 0 mismatch；SNR 109.4dB。
+
+**arena 迁移状态**：uniform arena + Kernel 缓存 + depth 19-dispatch ring 化 +
+冷启动防御全部落地，但 depth arena 路径仍被 wgpu 使用冲突挡住
+（`M5_DEPTH_ARENA=1` 实验）。params-arena 实验已回滚（破坏全部 GPU op，
+params pool 恢复 ✓）。完整 WIP 保留在 `arena-wip` 分支（2c8bcb6），含
+逐张量验证数据。-depth 的 dispatch 税需要 ming 式持久 scratch 的完全等价
+实现（其 Op 层的 buffer 生命周期管理与 wgpu tracker 的交互是关键差异）。
 
 下一步 = **移植 ming-3.0-tts-wgpu 的已验证 GPU 架构**（D:\ming-3.0-tts-wgpu，
 同款 P104，RTF 0.60 > CUDA——它踩平了我们所有的坑）：
