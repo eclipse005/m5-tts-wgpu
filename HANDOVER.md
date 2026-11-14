@@ -343,10 +343,21 @@ encode ~0.9s，prefill 0.3s。
 4. **required_limits: adapter.limits()**（gpu.rs:226）——取满适配器上限。
 5. in-flight 管线（✅已移植）：flush 后非阻塞 poll，CPU 录制与 GPU 执行重叠。
 
-RO→RW pass hazard 的修正认识：wgpu 只禁止**同一 dispatch** 内双绑定；跨
-dispatch 的 RW→RO→RW 在同一 pass 内是合法的（ming DiT 每步都在这么跑）——
-之前 mega-pass 的验证错误是池别名导致的单 dispatch 双绑定。所以持久 scratch
-+ arena 是安全的，之前回退 scratch 的理由不再成立（在 arena 架构下恢复）。
+RO→RW pass hazard 的修正认识（**再次修正**，91077a9）：wgpu 的规则是
+**READ_WRITE 是独占用法**——同一 pass 内，一个 buffer 被绑定为 RW 后不能再被
+任何 dispatch 以任何用法绑定（包括 RO）。之前 mega-pass 的错误与 arena 路径
+稳态的错误都是这个规则：**顺序残差链（读→写 per layer）天然违反它**。
+ming 的 DiT 不触雷是因为每步 ~110 dispatch 恰好整体落在一个 pass 内、步间
+scratch 不跨 pass 复用；我们的 depth 5 层 × 30 dispatch 需要每层结束一个 pass
+（sync），或把层间依赖改为 double-buffer 的纯 RW→RO 形式。
+
+arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + rope 全表 +
+双缓冲 norm_out 已落地，per-dispatch-sync 追踪下数值逐位正确；默认路径仍是
+已验证的 6-dispatch 形式（69ms/帧），arena 路径在 M5_DEPTH_ARENA=1 之后。
+**开放问题**：稳态下 wgpu 仍报某 pooled buffer RO→RW——已排除池别名、参数
+语义、缓存组身份；怀疑与 RW 独占的 pass 级验证有关，需要用 double-buffer
+的纯 RW→RO 形式重排残差链（x_in/x_out 每层交替），或每层结束 pass（当前
+sync 方案，~0.5ms/层 × 75 = 37ms/帧 开销，接近 CPU 路径——需要先量）。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
