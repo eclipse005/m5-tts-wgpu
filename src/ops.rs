@@ -104,20 +104,23 @@ pub fn snake_beta(dev: &Device, x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Re
     let [channels, time] = x.shape();
     expect("snake alpha", alpha.shape(), [channels, 1])?;
     expect("snake beta", beta.shape(), [channels, 1])?;
-    // Measured: copy + in-place stays faster than the fused read/write variant on
-    // the last SEANet block, and the GPU kernel is in-place anyway. A fused version
-    // with a polynomial sine was tried and came out slower; revisit only with a
-    // microbenchmark in hand.
-    let mut out = dev.copy(x)?;
     match dev {
         Device::Gpu(gpu) => {
+            let mut out = dev.copy(x)?;
             gpu_ops::snake_beta(gpu, out.gpu_buffer()?, alpha.gpu_buffer()?, beta.gpu_buffer()?, channels, time);
+            Ok(out)
         }
+        // Fused read/write with the polynomial sine: one 72 MB pass instead of
+        // copy + a second in-place pass (4 ms vs 40 ms at block-4 size — the old
+        // "copy is faster" note predates the lazy-page zeros fix, when the copy
+        // was amortised against a freshly materialised output either way).
         Device::Cpu => {
-            cpu_ops::snake_beta(out.cpu_slice_mut()?, alpha.cpu_slice()?, beta.cpu_slice()?, channels, time);
+            let mut out = dev.zeros(x.shape())?;
+            cpu_ops::snake_beta_into(x.cpu_slice()?, out.cpu_slice_mut()?, alpha.cpu_slice()?,
+                                     beta.cpu_slice()?, channels, time);
+            Ok(out)
         }
     }
-    Ok(out)
 }
 
 /// `y = a + b`.

@@ -5,6 +5,7 @@
 //! stage therefore costs one op, not one implementation per backend.
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 use crate::gpu::Gpu;
 use std::rc::Rc;
@@ -61,7 +62,16 @@ impl Device {
 
     /// Uninitialised tensor (every op overwrites its output).
     pub fn zeros(&self, shape: [usize; 2]) -> Result<Tensor> {
-        self.tensor(shape, &vec![0.0; shape[0] * shape[1]])
+        match self {
+            // `vec![0.0; n]` on f32 is an `alloc_zeroed`: the OS hands out lazily
+            // committed zero pages, so the allocation is free and the pages fault
+            // in (in parallel, inside the writing op) on first touch. Copying that
+            // fresh vec into a second one — what `tensor()` would do — instead
+            // forced every page to materialise on a single thread: ~31 ms per
+            // 72 MB tensor, paid once per codec output buffer.
+            Device::Cpu => Ok(Tensor::Cpu(vec![0.0; shape[0] * shape[1]], shape)),
+            _ => self.tensor(shape, &vec![0.0; shape[0] * shape[1]]),
+        }
     }
 
     /// Copy a tensor back to the host.
@@ -123,7 +133,18 @@ impl Device {
             (Device::Gpu(gpu), Tensor::Gpu(src, shape), Tensor::Gpu(dst, _)) => {
                 crate::gpu_ops::copy(gpu, src, dst, shape[0] * shape[1]);
             }
-            (Device::Cpu, Tensor::Cpu(src, _), Tensor::Cpu(dst, _)) => dst.copy_from_slice(src),
+            // Large CPU copies split across threads: the destination's pages are
+            // uncommitted, and faulting them in from one thread is what made a
+            // 72 MB copy take 36 ms while the memcpy itself needs ~7.
+            (Device::Cpu, Tensor::Cpu(src, _), Tensor::Cpu(dst, _)) => {
+                if src.len() >= 8192 {
+                    dst.par_chunks_mut(8192)
+                        .zip(src.par_chunks(8192))
+                        .for_each(|(d, s)| d.copy_from_slice(s));
+                } else {
+                    dst.copy_from_slice(src);
+                }
+            }
             _ => bail!("copy across devices"),
         }
         Ok(out)

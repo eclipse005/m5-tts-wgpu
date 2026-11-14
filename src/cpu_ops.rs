@@ -1193,7 +1193,7 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
                     let src = start + j as isize;
                     if src >= 0 && (src as usize) < t_in {
                         let v = x[ci * t_in + src as usize];
-                        let s = (v * ca).sin();
+                        let s = fast_sin(v * ca);
                         *slot = v + s * s / cb;
                     }
                 }
