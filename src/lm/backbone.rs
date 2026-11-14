@@ -471,21 +471,9 @@ impl Lm {
         let p = format!("{prefix}.layers.{index}");
         let q_dim = HEADS * HEAD_DIM;
 
-        // Scratch pool: allocated once, reused every layer step. `x_out` doubles
-        // as the next layer's input (K1 reads it only after K4 overwrites it).
-        if self.gpu_scratch.borrow().is_none() {
-            let s = GpuLayerScratch {
-                attended: dev.zeros([1, q_dim])?,
-                normed: dev.zeros([1, HIDDEN])?,
-                qkv: dev.zeros([1, q_dim + 2 * KV_HEADS * HEAD_DIM])?,
-                x1: dev.zeros([1, HIDDEN])?,
-                gate_up: dev.zeros([1, 2 * INTERMEDIATE])?,
-                x_out: dev.zeros([1, HIDDEN])?,
-            };
-            *self.gpu_scratch.borrow_mut() = Some(s);
-        }
-        let mut scratch_guard = self.gpu_scratch.borrow_mut();
-        let scratch = scratch_guard.as_mut().expect("scratch initialised above");
+        // Activations come from the device pool each step (take_pooled pops a
+        // buffer recycled in an EARLIER pass, so no read/write hazard inside the
+        // current pass; the pool makes this allocation-free in steady state).
         let (cos_t, sin_t) = self.gpu_rope_tables()?;
 
         let prof = std::env::var("M5_PROFILE_LAYER").is_ok();
@@ -499,48 +487,55 @@ impl Lm {
         };
         lap("weights", &mut tick);
 
+        let attended = dev.zeros([1, q_dim])?;
+        let normed = dev.zeros([1, HIDDEN])?;
+        let qkv = dev.zeros([1, q_dim + 2 * KV_HEADS * HEAD_DIM])?;
+        let x1 = dev.zeros([1, HIDDEN])?;
+        let gate_up = dev.zeros([1, 2 * INTERMEDIATE])?;
+        let x_out = dev.zeros([1, HIDDEN])?;
+
         // RMS norm, then the fused [q; k; v] projection as one warp-per-row GEMV
         // (768 rows): an earlier all-in-one kernel ran its dots uncoalesced on
         // 8 workgroups and lost to this two-dispatch form.
         let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
         crate::gpu_ops::rms_norm(gpu, x.gpu_buffer()?, input_norm.gpu_buffer()?,
-                          scratch.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
+                          normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
         lap("rms", &mut tick);
         let qkv_w = self.qkv_weight(prefix, index)?;
-        crate::gpu_ops::linear(gpu, scratch.normed.gpu_buffer()?, qkv_w.gpu_buffer()?, None,
-                        scratch.qkv.gpu_buffer()?, 1, q_dim + 2 * KV_HEADS * HEAD_DIM, HIDDEN);
+        crate::gpu_ops::linear(gpu, normed.gpu_buffer()?, qkv_w.gpu_buffer()?, None,
+                        qkv.gpu_buffer()?, 1, q_dim + 2 * KV_HEADS * HEAD_DIM, HIDDEN);
         lap("qkv", &mut tick);
         {
             let (cache_k, cache_v) = (&mut cache.k[index], &mut cache.v[index]);
-            crate::gpu_ops::qkv_attend_f32(gpu, scratch.qkv.gpu_buffer()?,
+            crate::gpu_ops::qkv_attend_f32(gpu, qkv.gpu_buffer()?,
                                            cache_k.gpu_buffer()?, cache_v.gpu_buffer()?,
-                                           scratch.attended.gpu_buffer()?,
+                                           attended.gpu_buffer()?,
                                            cos_t.gpu_buffer()?, sin_t.gpu_buffer()?, position,
                                            HEADS, q_dim);
         }
         lap("attn", &mut tick);
 
         let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
-        crate::gpu_ops::gemv_add_f32(gpu, scratch.attended.gpu_buffer()?, o_w.gpu_buffer()?,
-                              x.gpu_buffer()?, scratch.x1.gpu_buffer()?, HIDDEN, q_dim);
+        crate::gpu_ops::gemv_add_f32(gpu, attended.gpu_buffer()?, o_w.gpu_buffer()?,
+                              x.gpu_buffer()?, x1.gpu_buffer()?, HIDDEN, q_dim);
         lap("o+res", &mut tick);
 
         let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
         let gate_w = self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
         let up_w = self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
-        crate::gpu_ops::norm_gateup_f32(gpu, scratch.x1.gpu_buffer()?, post_norm.gpu_buffer()?,
+        crate::gpu_ops::norm_gateup_f32(gpu, x1.gpu_buffer()?, post_norm.gpu_buffer()?,
                                  gate_w.gpu_buffer()?, up_w.gpu_buffer()?,
-                                 scratch.gate_up.gpu_buffer()?, INTERMEDIATE, HIDDEN, 1e-5);
+                                 gate_up.gpu_buffer()?, INTERMEDIATE, HIDDEN, 1e-5);
         lap("gateup", &mut tick);
 
         let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
-        crate::gpu_ops::silu_down_f32(gpu, scratch.gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
-                               scratch.x1.gpu_buffer()?, scratch.x_out.gpu_buffer()?,
+        crate::gpu_ops::silu_down_f32(gpu, gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
+                               x1.gpu_buffer()?, x_out.gpu_buffer()?,
                                INTERMEDIATE, HIDDEN);
         lap("down", &mut tick);
-        // handle clone: Tensor is not Clone (the CPU variant owns a Vec)
-        // handle clone: Tensor is not Clone (the CPU variant owns a Vec)
-        Ok(Tensor::Gpu(scratch.x_out.gpu_buffer()?.clone(), [1, HIDDEN]))
+        // A fresh handle over the pooled scratch buffer (the scratch outlives
+        // the returned tensor, and the next layer's K4 overwrites it anyway).
+        Ok(x_out)
     }
 
     /// Full rope table ([2048, head_dim] cos/sin) on the GPU device, uploaded

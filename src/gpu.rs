@@ -46,6 +46,15 @@ pub struct Gpu {
     /// tracking superlinear (28 us/dispatch); whole bindings on reused buffers
     /// stay on the fast path (~7 us). The pool flushes when it wraps.
     params_pool: RefCell<ParamsPool>,
+    /// Scratch-buffer pool keyed by element count: codec ops allocate 36-72 MB
+    /// outputs per call, and a fresh Vulkan buffer per op cost ~70 ms each once
+    /// the allocator fragmented. Dropped tensors return here.
+    pool: RefCell<HashMap<usize, Vec<Buffer>>>,
+    pool_bytes: RefCell<usize>,
+    /// Buffers dropped while a submit batch was still open: they may be
+    /// referenced by recorded dispatches, so they only join the pool after the
+    /// next flush (write_buffer semantics make post-submit rewrites safe).
+    deferred_pool: RefCell<Vec<(usize, Buffer)>>,
 }
 
 /// A parameter block from the pool: bound whole, offset always 0.
@@ -88,6 +97,14 @@ impl Gpu {
     pub fn sync(&self) {
         self.flush();
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+    }
+
+    fn drain_deferred(&self) {
+        let mut deferred = self.deferred_pool.borrow_mut();
+        if deferred.is_empty() { return; }
+        for (len, buf) in deferred.drain(..) {
+            self.recycle(len, buf);
+        }
     }
 }
 
@@ -142,10 +159,14 @@ impl Gpu {
         // ~2 s, and one SEANet block is already hundreds of dispatches on a slow
         // kernel. 8 keeps the worst-case submit well inside the watchdog;
         // `M5_MAX_PENDING` overrides for experiments.
+        // 64: large enough that submit overhead amortises, small enough that a
+        // pass ends before pooled activations are read-then-written inside it
+        // (wgpu forbids RO->RW on one buffer within a pass) and before VRAM
+        // fills with deferred recycling.
         let max_pending = std::env::var("M5_MAX_PENDING")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(64);
         Ok(Self {
             device,
             queue,
@@ -157,6 +178,9 @@ impl Gpu {
             stats: RefCell::new(Stats::default()),
             upload_labels: RefCell::new(HashMap::new()),
             params_pool: RefCell::new(ParamsPool { buffers: Vec::new(), next: 0 }),
+            pool: RefCell::new(HashMap::new()),
+            pool_bytes: RefCell::new(0),
+            deferred_pool: RefCell::new(Vec::new()),
         })
     }
 
@@ -166,6 +190,45 @@ impl Gpu {
 
     fn storage_usage() -> BufferUsages {
         BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC
+    }
+
+    /// Take a pooled buffer of exactly `len` f32, or allocate one.
+    pub fn take_pooled(&self, len: usize) -> Buffer {
+        if let Some(buf) = self.pool.borrow_mut().get_mut(&len).and_then(Vec::pop) {
+            *self.pool_bytes.borrow_mut() -= len * 4;
+            return buf;
+        }
+        self.empty("pooled", len)
+    }
+
+    /// Return a dropped buffer to the pool (capped: ~1.5 GB of scratch).
+    pub fn recycle(&self, len: usize, buf: Buffer) {
+        const CAP_BYTES: usize = 1_500_000_000;
+        let mut pool = self.pool.borrow_mut();
+        let slot = pool.entry(len).or_default();
+        if slot.len() < 4 && *self.pool_bytes.borrow() + len * 4 <= CAP_BYTES {
+            *self.pool_bytes.borrow_mut() += len * 4;
+            slot.push(buf);
+        }
+    }
+
+    /// Recycle on tensor drop: a buffer recorded in the open submit batch is
+    /// deferred to after the flush (rewrites before submit would corrupt it).
+    pub fn recycle_on_drop(&self, len: usize, buf: Buffer) {
+        if self.pending.borrow().is_empty() {
+            self.recycle(len, buf);
+        } else {
+            self.deferred_pool.borrow_mut().push((len, buf));
+        }
+    }
+
+    /// Allocate-or-pool a storage buffer and upload `data`. Weights hit this
+    /// once and stay cached; pooled buffers only help per-op scratch tensors.
+    pub fn upload_pooled(&self, data: &[f32]) -> Buffer {
+        let buffer = self.take_pooled(data.len());
+        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
+        buffer
     }
 
     /// Allocate a storage buffer and upload `data`.
@@ -393,6 +456,7 @@ impl Gpu {
     pub fn flush(&self) {
         if let Some(batch) = self.encode_batch() {
             self.queue.submit(std::iter::once(batch));
+            self.drain_deferred();
         }
     }
 

@@ -48,16 +48,28 @@ fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Re
                                 &format!("{prefix}.conv2.conv.bias"), channels, 1, 1, Some(x));
     }
 
-    let alpha = codec.vector(&format!("{prefix}.act1.alpha"), channels)?;
-    let beta = codec.vector(&format!("{prefix}.act1.beta"), channels)?;
-    let h = ops::snake_beta(dev, x, &alpha, &beta)?;
+    let prof = std::env::var("M5_PROFILE_DEEP").is_ok() && dev.is_gpu();
+    let mut tick = std::time::Instant::now();
+    let lap = |name: &str, tick: &mut std::time::Instant| {
+        if prof {
+            if let Device::Gpu(gpu) = dev { gpu.sync(); }
+            eprintln!("          {name}: {:.0}us", tick.elapsed().as_secs_f64() * 1e6);
+        }
+        *tick = std::time::Instant::now();
+    };
+    lap("unit-start", &mut tick);
+    let h = codec.snake_beta_gpu(x, &format!("{prefix}.act1.alpha"),
+                                 &format!("{prefix}.act1.beta"), channels)?;
+    lap("snake1", &mut tick);
     let h3 = causal_conv(codec, &h, &format!("{prefix}.conv1.conv.weight"),
                          &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation)?;
-    let alpha2 = codec.vector(&format!("{prefix}.act2.alpha"), channels)?;
-    let beta2 = codec.vector(&format!("{prefix}.act2.beta"), channels)?;
-    let h4 = ops::snake_beta(dev, &h3, &alpha2, &beta2)?;
+    lap("conv7", &mut tick);
+    let h4 = codec.snake_beta_gpu(&h3, &format!("{prefix}.act2.alpha"),
+                                  &format!("{prefix}.act2.beta"), channels)?;
+    lap("snake2", &mut tick);
     let out = causal_conv(codec, &h4, &format!("{prefix}.conv2.conv.weight"),
                           &format!("{prefix}.conv2.conv.bias"), channels, 1, 1)?;
+    lap("conv1", &mut tick);
 
     let mut sum = dev.zeros(x.shape())?;
     ops::add(dev, &out, x, &mut sum)?;
@@ -79,9 +91,14 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     };
     let cout = cin / 2;
 
-    let alpha = codec.vector(&format!("{prefix}.block.0.alpha"), cin)?;
-    let beta = codec.vector(&format!("{prefix}.block.0.beta"), cin)?;
-    let h = ops::snake_beta(dev, x, &alpha, &beta)?;
+    let h = if let Device::Gpu(_) = dev {
+        codec.snake_beta_gpu(x, &format!("{prefix}.block.0.alpha"),
+                             &format!("{prefix}.block.0.beta"), cin)?
+    } else {
+        let alpha = codec.vector(&format!("{prefix}.block.0.alpha"), cin)?;
+        let beta = codec.vector(&format!("{prefix}.block.0.beta"), cin)?;
+        ops::snake_beta(dev, x, &alpha, &beta)?
+    };
 
     // CausalTransConvNet(cin, cout, kernel=2*rate, stride=rate), trimmed to frames*rate.
     let ks = 2 * upsample_rate;
@@ -143,9 +160,13 @@ impl Codec {
             }
         }
         let channels = h.shape()[0];
-        let alpha = self.vector("decoder.decoder.5.alpha", channels)?;
-        let beta = self.vector("decoder.decoder.5.beta", channels)?;
-        h = ops::snake_beta(self.device(), &h, &alpha, &beta)?;
+        h = if let Device::Gpu(_) = self.device() {
+            self.snake_beta_gpu(&h, "decoder.decoder.5.alpha", "decoder.decoder.5.beta", channels)?
+        } else {
+            let alpha = self.vector("decoder.decoder.5.alpha", channels)?;
+            let beta = self.vector("decoder.decoder.5.beta", channels)?;
+            ops::snake_beta(self.device(), &h, &alpha, &beta)?
+        };
         if let Some(t) = trace.as_deref_mut() {
             t.push(("snake".to_string(), self.device().copy(&h)?));
         }

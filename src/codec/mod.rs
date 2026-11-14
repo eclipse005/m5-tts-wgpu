@@ -187,6 +187,40 @@ impl Codec {
         self.tensor(name, [len, 1])
     }
 
+    /// Pre-exponentiated SnakeBeta tables `[(exp(alpha), exp(beta)+1e-9)]` per
+    /// channel, cached per layer: the GPU snake kernel otherwise recomputes two
+    /// exps per element (18 M exps for 96 channels' worth of constants).
+    pub fn snake_tables(&self, alpha_name: &str, beta_name: &str,
+                        channels: usize) -> Result<(Rc<Tensor>, Rc<Tensor>)> {
+        let ea_key = format!("snake_exp.{alpha_name}");
+        if let Some(ea) = self.cache.borrow().get(&ea_key) {
+            let eb = self.cache.borrow().get(&format!("snake_exp.{beta_name}"))
+                .expect("ea cached implies eb cached").clone();
+            return Ok((ea.clone(), eb));
+        }
+        let ea_v: Vec<f32> = self.weights.get_f32(alpha_name)?.iter().map(|v| v.exp()).collect();
+        let ea = Rc::new(self.dev.tensor([channels, 1], &ea_v)?);
+        let mut eb_v: Vec<f32> = self.weights.get_f32(beta_name)?.iter().map(|v| v.exp() + 1e-9).collect();
+        eb_v.truncate(channels);
+        let eb = Rc::new(self.dev.tensor([channels, 1], &eb_v)?);
+        self.cache.borrow_mut().insert(ea_key, ea.clone());
+        self.cache.borrow_mut().insert(format!("snake_exp.{beta_name}"), eb.clone());
+        Ok((ea, eb))
+    }
+
+    /// SnakeBeta on the GPU with pre-exponentiated tables (channels-first x).
+    pub fn snake_beta_gpu(&self, x: &Tensor, alpha_name: &str, beta_name: &str,
+                          channels: usize) -> Result<Tensor> {
+        let Device::Gpu(gpu) = self.device() else {
+            bail!("snake_beta_gpu is GPU-only");
+        };
+        let (ea, eb) = self.snake_tables(alpha_name, beta_name, channels)?;
+        let out = self.dev.copy(x)?;
+        crate::gpu_ops::snake_beta(gpu, out.gpu_buffer()?, ea.gpu_buffer()?, eb.gpu_buffer()?,
+                                   channels, x.shape()[1]);
+        Ok(out)
+    }
+
     /// Channels-last packed weight `[(tap*cin + ci) * cout + co]` (cached).
     ///
     /// The staged channels-last conv kernel needs this layout; the checkpoint

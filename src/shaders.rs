@@ -109,9 +109,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     if (idx >= p[0] * p[1]) { return; }
     let c = idx / p[1];
     let v = x[idx];
-    let a = exp(alpha[c]);
-    let b = exp(beta[c]);
-    x[idx] = v + (1.0 / (b + 0.000000001)) * pow(sin(v * a), 2.0);
+    // alpha/beta arrive pre-exp'ed (they are per-channel constants) and the
+    // square is a multiply: pow(sin(x), 2.0) compiles to the exp2/log2 slow
+    // path, and exp() per element was 18 M exps for 96 channels' worth.
+    let s = sin(v * alpha[c]);
+    x[idx] = v + s * s / beta[c];
 }
 "#;
 
@@ -176,6 +178,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let c = gid.y;
     if (r >= p[0] || c >= p[1]) { return; }
     y[c * p[0] + r] = x[r * p[1] + c];
+}
+"#;
+
+/// Tiled 2-D transpose: both sides coalesced via a padded shared tile.
+///
+/// The naive one-element-per-thread kernel read x rows 752 KB apart - every
+/// warp transaction fetched a full line for 4 used bytes (128x read
+/// amplification), which cost ~2 s across the codec's 48 transposes.
+pub const TRANSPOSE_TILED_F32: &str = r#"
+// 0=rows 1=cols
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 2>;
+
+var<workgroup> tile: array<f32, 17 * 16>;  // +1 padding: no bank conflicts
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r0 = wid.x * 16u;
+    let c0 = wid.y * 16u;
+    let r = r0 + lid.x;
+    let c = c0 + lid.y;
+    if (r < p[0] && c < p[1]) {
+        tile[lid.x * 17u + lid.y] = x[r * p[1] + c];
+    }
+    workgroupBarrier();
+    // write phase: consecutive threads take consecutive r (coalesced y writes)
+    let i = lid.x;
+    let j = lid.y;
+    let rr = r0 + i;
+    let cc = c0 + j;
+    if (rr < p[0] && cc < p[1]) {
+        y[cc * p[0] + rr] = tile[i * 17u + j];
+    }
 }
 "#;
 

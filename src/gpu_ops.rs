@@ -162,6 +162,14 @@ pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
     gpu.dispatch_params("copy_f32", shaders::COPY_F32, "main", &[(0, x), (1, y)], &params, grid(len));
 }
 
+/// Tiled 2-D transpose: y[c, r] = x[r, c], both sides coalesced.
+pub fn transpose_tiled(gpu: &Gpu, x: &Buffer, y: &Buffer, rows: usize, cols: usize) {
+    let params = gpu.params_u32(&[rows as u32, cols as u32]);
+    gpu.dispatch_params("transpose_tiled", shaders::TRANSPOSE_TILED_F32, "main",
+                        &[(0, x), (1, y)], &params,
+                        ((rows as u32).div_ceil(16).max(1), (cols as u32).div_ceil(16).max(1), 1u32));
+}
+
 /// Fused decode-step attention block (one workgroup per query head).
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_attend_f32(gpu: &Gpu, qkv: &Buffer, cache_k: &Buffer, cache_v: &Buffer,

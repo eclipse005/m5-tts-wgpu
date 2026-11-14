@@ -180,7 +180,7 @@ pub fn transpose(dev: &Device, x: &Tensor, y: &mut Tensor) -> Result<()> {
     let [rows, cols] = x.shape();
     expect("transpose output", y.shape(), [cols, rows])?;
     match dev {
-        Device::Gpu(gpu) => gpu_ops::transpose(gpu, x.gpu_buffer()?, y.gpu_buffer()?, rows, cols),
+        Device::Gpu(gpu) => gpu_ops::transpose_tiled(gpu, x.gpu_buffer()?, y.gpu_buffer()?, rows, cols),
         Device::Cpu => cpu_ops::transpose(x.cpu_slice()?, y.cpu_slice_mut()?, rows, cols),
     }
     Ok(())

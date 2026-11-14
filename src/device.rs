@@ -55,7 +55,10 @@ impl Device {
             bail!("tensor {:?} needs {} values, got {}", shape, shape[0] * shape[1], data.len());
         }
         Ok(match self {
-            Device::Gpu(gpu) => Tensor::Gpu(gpu.upload("tensor", data), shape),
+            Device::Gpu(gpu) => Tensor::Gpu(GpuBuffer {
+                raw: gpu.upload_pooled(data),
+                gpu: Rc::clone(gpu),
+            }, shape),
             Device::Cpu => Tensor::Cpu(data.to_vec(), shape),
         })
     }
@@ -77,7 +80,7 @@ impl Device {
     /// Copy a tensor back to the host.
     pub fn read(&self, tensor: &Tensor) -> Result<Vec<f32>> {
         match (self, tensor) {
-            (Device::Gpu(gpu), Tensor::Gpu(buffer, shape)) => Ok(gpu.download(buffer, shape[0] * shape[1])),
+            (Device::Gpu(gpu), Tensor::Gpu(buffer, shape)) => Ok(gpu.download(&buffer.raw, shape[0] * shape[1])),
             (Device::Cpu, Tensor::Cpu(data, _)) => Ok(data.clone()),
             _ => bail!("tensor was created on a different device"),
         }
@@ -90,7 +93,7 @@ impl Device {
                 if data.len() != shape[0] * shape[1] {
                     bail!("write size {} != tensor {:?}", data.len(), shape);
                 }
-                gpu.write(buffer, data);
+                gpu.write(&buffer.raw, data);
                 Ok(())
             }
             (Device::Cpu, Tensor::Cpu(host, shape)) => {
@@ -131,7 +134,7 @@ impl Device {
         let mut out = self.zeros(tensor.shape())?;
         match (self, tensor, &mut out) {
             (Device::Gpu(gpu), Tensor::Gpu(src, shape), Tensor::Gpu(dst, _)) => {
-                crate::gpu_ops::copy(gpu, src, dst, shape[0] * shape[1]);
+                crate::gpu_ops::copy(gpu, &src.raw, &dst.raw, shape[0] * shape[1]);
             }
             // Large CPU copies split across threads: the destination's pages are
             // uncommitted, and faulting them in from one thread is what made a
@@ -180,8 +183,28 @@ impl Tokens {
 /// Deliberately **not** `Clone`: on the GPU the payload is a buffer handle, so a
 /// derived clone would alias device memory and an "in-place" op would silently
 /// overwrite its caller's tensor. Use [`Device::copy`] instead.
+/// A GPU buffer bound to its device so a dropped tensor returns the storage to
+/// the device's pool instead of paying a Vulkan alloc/free cycle per op.
+pub struct GpuBuffer {
+    pub raw: wgpu::Buffer,
+    pub gpu: Rc<Gpu>,
+}
+
+impl GpuBuffer {
+    /// A fresh Tensor handle sharing this pooled buffer (cheap: handle clone).
+    pub fn tensor(&self, shape: [usize; 2]) -> Tensor {
+        Tensor::Gpu(GpuBuffer { raw: self.raw.clone(), gpu: Rc::clone(&self.gpu) }, shape)
+    }
+}
+
+impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        self.gpu.recycle_on_drop(self.raw.size() as usize / 4, self.raw.clone());
+    }
+}
+
 pub enum Tensor {
-    Gpu(wgpu::Buffer, [usize; 2]),
+    Gpu(GpuBuffer, [usize; 2]),
     Cpu(Vec<f32>, [usize; 2]),
 }
 
@@ -197,9 +220,18 @@ impl Tensor {
         a * b
     }
 
+    /// A fresh GPU Tensor handle sharing this tensor's pooled buffer (cheap:
+    /// handle clone; the buffer returns to the pool only when ALL handles drop).
+    pub fn handle(&self, shape: [usize; 2]) -> Result<Tensor> {
+        match self {
+            Tensor::Gpu(buf, _) => Ok(buf.tensor(shape)),
+            Tensor::Cpu(..) => bail!("handle() is GPU-only"),
+        }
+    }
+
     pub fn gpu_buffer(&self) -> Result<&wgpu::Buffer> {
         match self {
-            Tensor::Gpu(buffer, _) => Ok(buffer),
+            Tensor::Gpu(buffer, _) => Ok(&buffer.raw),
             Tensor::Cpu(..) => bail!("expected a GPU tensor"),
         }
     }
