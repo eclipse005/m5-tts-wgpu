@@ -365,10 +365,13 @@ arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + ro
    arena kernel 的 lazy-compile priming ✓（新 pipeline 首 dispatch 后立即
    flush+drain）。**全 pipeline 仍 device-lost 级联**：prefill 的 146-dispatch
    submit 在 encoder 常驻（~840MB）时超过 P104 冷启动阈值（ming 记录阈值
-   降至 ~16 dispatch）→ device fault → 后续全 invalid。**修复方向明确**：
-   prefill/所有长 batch 的提交也走 priming（每 ~16 dispatch drain 一次直到
-   进程度过冷启动期），或按 ming 的做法把 encoder 常驻下的阈值降到 16。
-   batch 上限 256 与 in-flight=4 已按 ming 校准。
+   降至 ~16 dispatch）→ device fault → 后续全 invalid。**修复方向**：提交规模爬坡 8→16→32→64→128→256（每级 drain）已实现
+   （gpu.rs maybe_flush 的 ramp 表），encoder 常驻下稳态 256 批仍触发
+   device fault——冷窗口比一次 drain 长，与 ming 的"一次 drain 即稳态"
+   不同；差异点在 m5 的 encode 阶段实际 dispatch 了 encoder（~500 dispatch
+   + 编码器 pipeline 编译），且 buffer 创建与 submit 交错。下一步：对比
+   ming 的 dispatch/创建时序，或把 encode 阶段也纳入 ramp 的冷窗口。
+   in-flight=4、batch 256 已按 ming 校准。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。

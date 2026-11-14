@@ -109,7 +109,7 @@ struct Pending {
 
 /// Submits kept in flight before a blocking wait (ming-3.0-tts: 4 overlaps
 /// CPU recording with GPU execution; deeper queues flake on the P104).
-const MAX_IN_FLIGHT: u32 = 1;
+const MAX_IN_FLIGHT: u32 = 4;
 /// Uniform slots are 256 B: the guaranteed minUniformBufferOffsetAlignment.
 pub const UNIFORM_SLOT: usize = 256;
 const ARENA_SLOTS: usize = 4096;
@@ -576,19 +576,24 @@ impl Gpu {
         self.reuse(_key, pipeline, &group, workgroups);
     }
 
-    /// Flush policy: the first submit of the process is capped at 8 dispatches
-    /// and drained (P104 cold-buffer device fault, ming-3.0-tts); later batches
-    /// run at max_pending.
+    /// Flush policy: the P104's cold-start window faults the device when the
+    /// first submits carry too many dispatches (the threshold ~50, dropping to
+    /// ~16 with the encoder resident - ming-3.0-tts gpu.rs). The submit size
+    /// ramps 8 -> 16 -> 32 -> 64 -> 128 -> max_pending over the first six
+    /// submits, each drained, before steady state.
     fn maybe_flush(&self) {
         let n = self.pending.borrow().len();
+        let s = self.submit_count.get();
+        let ramp = [FIRST_SUBMIT_MAX as usize, 16, 32, 64, 128];
+        let cap = if s < ramp.len() { ramp[s] } else { self.max_pending };
         if !self.primed.get() {
-            if n >= FIRST_SUBMIT_MAX {
+            if n >= cap {
                 self.primed.set(true);
                 self.flush();
                 self.device.poll(wgpu::PollType::wait_indefinitely()).expect("prime poll");
                 self.in_flight.set(0);
             }
-        } else if n >= self.max_pending {
+        } else if n >= cap {
             self.flush();
         }
     }
