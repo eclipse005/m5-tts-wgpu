@@ -451,6 +451,8 @@ impl Lm {
         let q_dim = HEADS * HEAD_DIM;
         let kv_dim = KV_HEADS * HEAD_DIM;
         let row = x.cpu_slice()?.to_vec();
+        let profile = std::env::var("M5_PROFILE_LAYER").is_ok();
+        let mut phase = std::time::Instant::now();
 
         let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
         let qkv_w = self.qkv_bf16(prefix, index);
@@ -460,6 +462,7 @@ impl Lm {
                                                   HIDDEN, q_dim + 2 * kv_dim, 1e-5),
             None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
         }
+        if profile { eprintln!("      qkv {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
 
         let (q, rest) = qkv.split_at_mut(q_dim);
         let (k, v) = rest.split_at_mut(kv_dim);
@@ -474,6 +477,7 @@ impl Lm {
         let mut attended = vec![0.0f32; q_dim];
         cpu_ops::attention_decode(q, cache.k[index].cpu_slice()?, cache.v[index].cpu_slice()?,
                                  &mut attended, position + 1, HEADS, HEAD_DIM);
+        if profile { eprintln!("      attn {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
 
         let o_w = self.bf16_bytes(&format!("{p}.self_attn.o_proj.weight"));
         let mut x1 = vec![0.0f32; HIDDEN];
@@ -481,6 +485,7 @@ impl Lm {
             Some(w) => cpu_ops::gemv_add_bf16(&attended, w, &row, &mut x1, q_dim, HIDDEN),
             None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
         }
+        if profile { eprintln!("      o    {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
 
         let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
         let gate_up_w = self.gate_up_bf16(prefix, index);
@@ -490,6 +495,7 @@ impl Lm {
                                                   HIDDEN, 2 * INTERMEDIATE, 1e-5),
             None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
         }
+        if profile { eprintln!("      gateup {:.0}us", phase.elapsed().as_secs_f64() * 1e6); phase = std::time::Instant::now(); }
 
         let down_w = self.bf16_bytes(&format!("{p}.mlp.down_proj.weight"));
         let mut out = vec![0.0f32; HIDDEN];
@@ -498,6 +504,8 @@ impl Lm {
                                                &x1, &mut out, INTERMEDIATE, HIDDEN),
             None => return self.llama_layer_cpu_step(prefix, index, x, cos, sin, cache, position),
         }
+        if profile { eprintln!("      down {:.0}us", phase.elapsed().as_secs_f64() * 1e6); }
         dev.tensor([1, HIDDEN], &out)
     }
+
 }
