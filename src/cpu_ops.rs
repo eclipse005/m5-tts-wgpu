@@ -189,24 +189,12 @@ pub fn snake_beta_into(x: &[f32], y: &mut [f32], alpha: &[f32], beta: &[f32],
             let a = alpha[c].exp();
             let b = beta[c].exp() + 1e-9;
             for (slot, v) in out.iter_mut().zip(src) {
-                let s = fast_sin(*v * a);
+                let s = (*v * a).sin();
                 *slot = v + s * s / b;
             }
         });
 }
 
-/// Sine accurate to ~1e-7 over the range the codec reaches, without libm's call.
-#[inline]
-fn fast_sin(x: f32) -> f32 {
-    // Range-reduce to [-pi, pi], then a 7th-order odd polynomial.
-    use std::f32::consts::PI;
-    let mut t = x - (x * (1.0 / (2.0 * PI))).round() * (2.0 * PI);
-    if t > PI {
-        t -= 2.0 * PI;
-    }
-    let t2 = t * t;
-    t * (1.0 + t2 * (-1.0 / 6.0 + t2 * (1.0 / 120.0 + t2 * (-1.0 / 5040.0 + t2 / 362880.0))))
-}
 
 /// SnakeBeta in place (kept for callers that already own a copy).
 pub fn snake_beta(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize, time: usize) {
@@ -1246,7 +1234,7 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
                     let src = start + j as isize;
                     if src >= 0 && (src as usize) < t_in {
                         let v = x[ci * t_in + src as usize];
-                        let s = fast_sin(v * ca);
+                        let s = (v * ca).sin();
                         *slot = v + s * s / cb;
                     }
                 }
