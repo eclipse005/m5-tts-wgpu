@@ -64,6 +64,23 @@ impl Device {
         })
     }
 
+    /// Upload into a FRESH (non-pooled) buffer: for tensors that live for the
+    /// whole run (weights, tables) - their buffers never re-enter the pool, so
+    /// no later tensor can inherit their read-only usage history.
+    pub fn tensor_fresh(&self, shape: [usize; 2], data: &[f32]) -> Result<Tensor> {
+        if data.len() != shape[0] * shape[1] {
+            bail!("tensor_fresh {:?} needs {} values, got {}", shape, shape[0] * shape[1], data.len());
+        }
+        Ok(match self {
+            Device::Gpu(gpu) => Tensor::Gpu(GpuBuffer {
+                raw: gpu.upload("tensor-fresh", data),
+                gpu: Rc::clone(gpu),
+                owned: false,
+            }, shape),
+            Device::Cpu => Tensor::Cpu(data.to_vec(), shape),
+        })
+    }
+
     /// Uninitialised tensor (every op overwrites its output).
     pub fn zeros(&self, shape: [usize; 2]) -> Result<Tensor> {
         match self {

@@ -361,11 +361,13 @@ arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + ro
 3. ✅RO→RW 冲突根因确认：**池复用的 buffer 跨 pass 的 RO→RW**——
    M5_NO_POOL_REUSE 下 arena 路径完全正确（codes 逐值一致）。
 4. ✅depth 持久 scratch/ring 改专用非池化分配（fresh，2KB 级，永不回收）。
-5. ⚠️当前剩余：fresh 小 buffer 的驱动 slab 累积曾致 OOM（64KB 粒度 × 每帧
-   ~2500 个）；audio_head_matrix 的 write_buffer 在部分生命周期下报 invalid。
-   方向：depth 瞬态全部走持久 ring（已做 last/logits/embedding），把
-   audio_head_matrix 的 4.2MB 表改为常驻 + 复查 fresh 生命周期，或对池回收
-   加 "上次用途" 标记只复用 RW-last 的 buffer。
+5. ⚠️当前剩余（本轮实测）：depth 瞬态 ring 全覆盖已落地（last/logits/
+   embedding 走持久 ring ✓）；audio_head_matrix + embedding table 改
+   tensor_fresh 常驻（非池化，永不回收）✓。**全 pipeline 仍 OOM/invalid**：
+   codec 解码的 72MB 级 buffer 在 deferred 回收列表中堆积（256-dispatch
+   batch 间 ~2.9GB deferred）→ VRAM 耗尽 → device lost 级联。batch 64 也
+   仍 OOM。方向：①codec 的 per-op 输出改为持久 double-buffer ring（ming
+   模式，彻底消除 deferred 堆积）；②或 deferred 按字节压力提前 drain。
 
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。

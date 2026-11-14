@@ -274,7 +274,7 @@ impl Gpu {
             // 256 (ming-3.0-tts, same card): >=1024-record submits lose the
             // device to TDR during lazy pipeline compilation; 256 amortises
             // submit overhead without that.
-            .unwrap_or(256);
+            .unwrap_or(64);
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform-arena"),
             size: (ARENA_SLOTS * UNIFORM_SLOT) as u64,
@@ -337,7 +337,7 @@ impl Gpu {
 
     /// Return a dropped buffer to the pool (capped: ~1.5 GB of scratch).
     pub fn recycle(&self, len: usize, buf: Buffer) {
-        const CAP_BYTES: usize = 1_500_000_000;
+        const CAP_BYTES: usize = 512_000_000;
         let mut pool = self.pool.borrow_mut();
         let slot = pool.entry(len).or_default();
         if slot.len() < 4 && *self.pool_bytes.borrow() + len * 4 <= CAP_BYTES {

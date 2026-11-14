@@ -162,7 +162,7 @@ impl Lm {
             return Ok(tensor.clone());
         }
         let tensor = std::rc::Rc::new(
-            self.device().tensor([CODEBOOKS * AUDIO_VOCAB, HIDDEN], self.audio_embedding_table())?,
+            self.device().tensor_fresh([CODEBOOKS * AUDIO_VOCAB, HIDDEN], self.audio_embedding_table())?,
         );
         self.cache_ref().borrow_mut().insert(key.to_string(), tensor.clone());
         Ok(tensor)

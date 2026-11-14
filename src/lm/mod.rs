@@ -163,7 +163,9 @@ impl Lm {
                 rows[v * HIDDEN + h] = slice[h * AUDIO_VOCAB + v];
             }
         }
-        let tensor = Rc::new(self.dev.tensor([AUDIO_VOCAB, HIDDEN], &rows)?);
+        // 常驻: fresh non-pooled upload - cached for the whole run; a pooled
+        // buffer's recycled history can trip cross-pass RO->RW validation.
+        let tensor = Rc::new(self.dev.tensor_fresh([AUDIO_VOCAB, HIDDEN], &rows)?);
         self.cache.borrow_mut().insert(key, tensor.clone());
         Ok(tensor)
     }
