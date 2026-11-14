@@ -102,5 +102,37 @@ fn dispatch_cost_decomp() -> anyhow::Result<()> {
         });
     }
     println!("d) bind group only:    {:5.1} us/op", s.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // e) dispatch_params with a FIXED params buffer: isolates the ring slice
+    //    binding from create_bind_group in dispatch context.
+    let fixed = gpu.params_u32(&[n as u32, 0, 0, 0]);
+    let s = Instant::now();
+    for _ in 0..iters { gpu.reuse_with_slice("probe_add", &pipeline, &layout, &[(0, a.gpu_buffer()?), (1, b.gpu_buffer()?), (2, y.gpu_buffer()?)], &fixed, (1, 1, 1)); }
+    gpu.sync();
+    println!("e) new group, fixed params: {:5.1} us/op", s.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // f) queue.write_buffer alone into the pool buffers (cycled)
+    let pool: Vec<wgpu::Buffer> = (0..1024).map(|i| {
+        gpu.raw_device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("probe.pool.{i}")),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }).collect();
+    let s = Instant::now();
+    for i in 0..iters {
+        gpu.queue.write_buffer(&pool[i % 1024], 0, bytemuck::cast_slice(&[n as u32, 0u32, 0u32, 0u32]));
+    }
+    gpu.sync();
+    println!("f) write_buffer only:  {:5.1} us/op", s.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // g) params_u32 alone (pool bookkeeping + write_buffer + Buffer clone)
+    let s = Instant::now();
+    for _ in 0..iters {
+        let _p = gpu.params_u32(&[n as u32, 0u32, 0u32, 0u32]);
+    }
+    gpu.sync();
+    println!("g) params_u32 alone:   {:5.1} us/op", s.elapsed().as_secs_f64() * 1e6 / iters as f64);
     Ok(())
 }
