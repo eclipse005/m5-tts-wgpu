@@ -512,33 +512,74 @@ fn conv_transpose_matches_naive_reference() {
         let b = rand_vec(cout, 93);
         let mut y = vec![0.0f32; cout * t_out];
         cpu_ops::conv_transpose1d(&x, &w, &b, &mut y, cin, cout, ks, stride, t_in);
-
-        // Naive gather: y[co, j] = sum over taps with (j - k) % stride == 0.
-        let mut want = vec![0.0f32; cout * t_out];
-        for co in 0..cout {
-            for j in 0..t_out {
-                let mut sum = b[co];
-                for k in 0..ks {
-                    let num = j as isize - k as isize;
-                    if num < 0 || (num as usize) % stride != 0 {
-                        continue;
-                    }
-                    let t = num as usize / stride;
-                    if t >= t_in {
-                        continue;
-                    }
-                    for ci in 0..cin {
-                        sum += x[ci * t_in + t] * w[(ci * cout + co) * ks + k];
-                    }
-                }
-                want[co * t_out + j] = sum;
-            }
-        }
-        let mut worst = 0.0f32;
-        for (a, c) in want.iter().zip(&y) {
-            worst = worst.max((a - c).abs());
-        }
-        eprintln!("transpose naive cin={cin} cout={cout} stride={stride} t_in={t_in}: max|diff|={worst:.3e}");
-        assert!(worst < 5e-4, "transposed conv diff {worst}");
+        assert_transpose_close(&x, &w, &b, &y, cin, cout, ks, stride, t_in);
     }
 }
+
+/// The channel-outer core behind [`conv_transpose1d_phased`]'s big-weight path,
+/// checked against the same naive gather at small shapes (the production shape
+/// that takes this path would need a 75 MB weight tensor).
+#[test]
+fn conv_transpose_co_outer_matches_naive_reference() {
+    use m5_tts_wgpu::cpu_ops;
+    for (cin, cout, stride, t_in) in [
+        (4usize, 2usize, 2usize, 1usize), // t_in edge: the [0] tap only
+        (4, 2, 2, 10),
+        (7, 5, 8, 37),    // stride 8 = block 1, odd channels, partial last chunk
+        (5, 6, 3, 129),   // cout % CO != 0, stride 3 = block 4
+        (3, 4, 5, 64),    // stride 5 = block 2, cin < CO
+        (16, 4, 4, 256),  // stride 4 = block 3
+    ] {
+        let ks = 2 * stride;
+        let t_out = t_in * stride;
+        let x = rand_vec(cin * t_in, 94);
+        let w = rand_vec(cin * cout * ks, 95);
+        let b = rand_vec(cout, 96);
+        let rows_total = cout * stride;
+        let mut tmp = vec![0.0f32; rows_total * t_in];
+        cpu_ops::conv_transpose_phased_co_outer(&x, &w, &b, &mut tmp, cin, cout, ks, stride, t_in);
+        // Interleave exactly as conv_transpose1d_phased does.
+        let mut y = vec![0.0f32; cout * t_out];
+        for co in 0..cout {
+            for m in 0..t_in {
+                for q in 0..stride {
+                    y[co * t_out + m * stride + q] = tmp[(co * stride + q) * t_in + m];
+                }
+            }
+        }
+        assert_transpose_close(&x, &w, &b, &y, cin, cout, ks, stride, t_in);
+    }
+}
+
+/// Shared naive-gather comparison for both transposed-conv tests.
+fn assert_transpose_close(x: &[f32], w: &[f32], b: &[f32], y: &[f32],
+                          cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
+    let t_out = t_in * stride;
+    let mut want = vec![0.0f32; cout * t_out];
+    for co in 0..cout {
+        for j in 0..t_out {
+            let mut sum = b[co];
+            for k in 0..ks {
+                let num = j as isize - k as isize;
+                if num < 0 || (num as usize) % stride != 0 {
+                    continue;
+                }
+                let t = num as usize / stride;
+                if t >= t_in {
+                    continue;
+                }
+                for ci in 0..cin {
+                    sum += x[ci * t_in + t] * w[(ci * cout + co) * ks + k];
+                }
+            }
+            want[co * t_out + j] = sum;
+        }
+    }
+    let mut worst = 0.0f32;
+    for (a, c) in want.iter().zip(y) {
+        worst = worst.max((a - c).abs());
+    }
+    eprintln!("transpose naive cin={cin} cout={cout} stride={stride} t_in={t_in}: max|diff|={worst:.3e}");
+    assert!(worst < 5e-4, "transposed conv diff {worst}");
+}
+

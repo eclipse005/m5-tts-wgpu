@@ -499,32 +499,43 @@ pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
 ///
 /// Output sample `t = m*stride + q` only reads input samples `m` and `m-1` with
 /// kernel taps `q` and `q+stride`, so phase `q` is a contiguous stride-1 conv over
-/// the whole input. That reuses the tuned `conv1d` kernels (~280 GFLOP/s) instead
-/// of the hand-rolled scatter loop (~80), at the cost of one extra full-size
-/// intermediate plus an interleave pass — a clear win at every block size.
+/// the whole input. Loop order follows the memory hierarchy: shapes whose weights
+/// exceed L3 run channel-outer reading the original `[cin, cout, ks]` layout
+/// directly (one 64 B line per (ci, co) serves every phase — no repack pass);
+/// the rest go through the tuned `conv1d` kernels (~280 GFLOP/s). Both cost one
+/// full-size intermediate plus an interleave pass, and both replace the
+/// hand-rolled scatter loop (~80 GFLOP/s). The intermediate is row-major in
+/// `[co, q]`: row `co*stride + q`.
 pub fn conv_transpose1d_phased(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
                                cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
     debug_assert_eq!(ks, 2 * stride, "phased form needs ks == 2*stride, got {ks}/{stride}");
     let t_out = t_in * stride;
-    // conv1d row `q*cout + co` = [x[m-1] taps | x[m] taps] = [W[ci,co,q+stride] | W[ci,co,q]].
-    let mut w2 = vec![0.0f32; cout * stride * cin * 2];
-    for q in 0..stride {
+    let rows_total = cout * stride;
+    let mut tmp = vec![0.0f32; rows_total * t_in];
+
+    if rows_total * cin * 2 * 4 > 24 << 20 {
+        conv_transpose_phased_co_outer(x, w, b, &mut tmp, cin, cout, ks, stride, t_in);
+    } else {
+        // Repack into conv1d rows: row `co*stride + q` = [x[m-1] | x[m]] taps =
+        // [W[ci,co,q+stride] | W[ci,co,q]].
+        let mut w2 = vec![0.0f32; rows_total * cin * 2];
         for co in 0..cout {
-            let dst = (q * cout + co) * cin * 2;
-            for ci in 0..cin {
-                let src = (ci * cout + co) * ks;
-                w2[dst + ci * 2] = w[src + q + stride];
-                w2[dst + ci * 2 + 1] = w[src + q];
+            for q in 0..stride {
+                let dst = (co * stride + q) * cin * 2;
+                for ci in 0..cin {
+                    let src = (ci * cout + co) * ks;
+                    w2[dst + ci * 2] = w[src + q + stride];
+                    w2[dst + ci * 2 + 1] = w[src + q];
+                }
             }
         }
+        let b2: Vec<f32> = (0..rows_total).map(|row| b[row / stride]).collect();
+        conv1d(x, &w2, &b2, &mut tmp, (cin, rows_total, 2, 1, 1, 1, t_in, t_in));
     }
-    let b2: Vec<f32> = (0..cout * stride).map(|row| b[row % cout]).collect();
-    let mut tmp = vec![0.0f32; cout * stride * t_in];
-    conv1d(x, &w2, &b2, &mut tmp, (cin, cout * stride, 2, 1, 1, 1, t_in, t_in));
 
-    // `y[co, m*stride + q] = tmp[q*cout + co, m]`. Reads go one phase plane at a
-    // time; a small staging tile keeps both sides' streams contiguous instead of
-    // striding `t_in` floats between successive elements.
+    // `y[co, m*stride + q] = tmp[(co*stride + q)*t_in + m]`. A small staging tile
+    // keeps both sides' streams contiguous instead of striding `t_in` floats
+    // between successive elements.
     if stride == 1 {
         y.copy_from_slice(&tmp);
         return;
@@ -535,12 +546,64 @@ pub fn conv_transpose1d_phased(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
         for m0 in (0..t_in).step_by(TILE) {
             let len = TILE.min(t_in - m0);
             for q in 0..stride {
-                let src = &tmp[(q * cout + co) * t_in + m0..][..len];
+                let src = &tmp[(co * stride + q) * t_in + m0..][..len];
                 stage[q * TILE..q * TILE + len].copy_from_slice(src);
             }
             for m in 0..len {
                 for q in 0..stride {
                     row[(m0 + m) * stride + q] = stage[q * TILE + m];
+                }
+            }
+        }
+    });
+}
+
+/// Channel-outer phase convolution for shapes whose weights exceed L3
+/// ([`conv_transpose1d_phased`] dispatches here).
+///
+/// One task per `CO` output channels; each walks the whole time span, so its
+/// weight slab (CO x ks x 4 B per ci) stays resident while `x` is shared through
+/// L3 — the weights stream exactly once, unlike a time-outer walk that re-reads
+/// them once per time block. Reads the original `[cin, cout, ks]` layout: the
+/// line holding (ci, co) carries every phase's taps, so there is no repack.
+/// `tmp` rows are `[co, q]` = `co*stride + q`.
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose_phased_co_outer(x: &[f32], w: &[f32], b: &[f32], tmp: &mut [f32],
+                                             cin: usize, cout: usize, ks: usize, stride: usize,
+                                             t_in: usize) {
+    const CO: usize = 4;
+    // One chunk = CO output channels x all their phase rows.
+    tmp.par_chunks_mut(t_in * CO * stride).enumerate().for_each(|(block, out_chunk)| {
+        let co0 = block * CO;
+        let cos = CO.min(cout - co0);
+        // Bias first, then accumulate the two-tap conv over every input channel.
+        for r in 0..cos {
+            let bv = b[co0 + r];
+            for q in 0..stride {
+                let acc = &mut out_chunk[(r * stride + q) * t_in..(r * stride + q + 1) * t_in];
+                acc.iter_mut().for_each(|slot| *slot = bv);
+            }
+        }
+        for ci in 0..cin {
+            let xr = &x[ci * t_in..(ci + 1) * t_in];
+            for r in 0..cos {
+                // One 64 B line holds all `ks` taps for (ci, co): reused by every
+                // phase of this output channel.
+                let line = &w[(ci * cout + co0 + r) * ks..][..ks];
+                for q in 0..stride {
+                    let w0 = line[q + stride]; // multiplies x[m-1]
+                    let w1 = line[q]; // multiplies x[m]
+                    let acc = &mut out_chunk[(r * stride + q) * t_in..(r * stride + q + 1) * t_in];
+                    // y[m] = x[m-1]*w0 + x[m]*w1; equal-length zips vectorise on
+                    // any target ISA (same trick as conv1d's fallback).
+                    acc[0] += xr[0] * w1;
+                    if t_in > 1 {
+                        let prev = &xr[..t_in - 1];
+                        let cur = &xr[1..];
+                        for (a, (p, c)) in acc[1..].iter_mut().zip(prev.iter().zip(cur)) {
+                            *a += p * w0 + c * w1;
+                        }
+                    }
                 }
             }
         }
