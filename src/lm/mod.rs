@@ -71,6 +71,8 @@ pub struct Lm {
     pub gpu_rope: RefCell<Option<(std::rc::Rc<Tensor>, std::rc::Rc<Tensor>)>>,
     /// Arena kernels + persistent scratch for the GPU depth pass.
     pub depth_gpu: RefCell<Option<std::rc::Rc<backbone::DepthGpu>>>,
+    /// Dispatch counter for the M5_ARENA_MAXDISP hazard bisect.
+    pub arena_disp_count: std::cell::Cell<usize>,
 }
 
 impl Lm {
@@ -112,6 +114,7 @@ impl Lm {
             gpu_scratch: RefCell::new(None),
             gpu_rope: RefCell::new(None),
             depth_gpu: RefCell::new(None),
+            arena_disp_count: std::cell::Cell::new(0),
         })
     }
 

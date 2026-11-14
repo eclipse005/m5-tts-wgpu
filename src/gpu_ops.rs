@@ -175,10 +175,10 @@ pub fn transpose_tiled(gpu: &Gpu, x: &Buffer, y: &Buffer, rows: usize, cols: usi
 // u32 params slice copied into the uniform arena.
 
 pub fn a_rms(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
-             y: &Buffer, hidden: usize, eps: f32) {
-    // FUSED_RMS body semantics: {rows, cols, eps_bits, pad}
-    let uni: [u32; 4] = [1, hidden as u32, eps.to_bits(), 0];
-    k.run(gpu, key, &uni, &[x, norm_w, y], (1, 1, 1));
+             y: &Buffer, rows: usize, hidden: usize, eps: f32) {
+    // RMS_NORM_F32 body semantics: {rows, cols, eps_bits, pad}
+    let uni: [u32; 4] = [rows as u32, hidden as u32, eps.to_bits(), 0];
+    k.run_params(gpu, key, &uni, &[x, norm_w, y], (rows as u32, 1u32, 1u32));
 }
 
 pub fn a_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
@@ -219,6 +219,44 @@ pub fn a_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer
     let uni: [u32; 2] = [inter as u32, hidden as u32];
     k.run(gpu, key, &uni, &[gate_up, down_w, x1, y],
           ((hidden as u32).div_ceil(8).max(1), 1u32, 1u32));
+}
+
+pub fn a_rope(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, cos: &Buffer,
+              sin: &Buffer, tokens: usize, heads: usize, head_dim: usize) {
+    // in-place: x is the read_write binding; cos/sin read-only
+    let wgs = (((tokens * heads * (head_dim / 2)) as u32).div_ceil(128).max(1), 1u32, 1u32);
+    k.run_params(gpu, key, &[tokens as u32, heads as u32, head_dim as u32, 0u32],
+                 &[x, cos, sin], wgs);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn a_repeat_kv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, y: &Buffer,
+                   tokens: usize, kv_heads: usize, heads: usize, head_dim: usize) {
+    k.run_params(gpu, key, &[tokens as u32, kv_heads as u32, heads as u32, head_dim as u32],
+                 &[x, y], (1u32, 1u32, 1u32));
+}
+
+pub fn a_write_rows(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, src: &Buffer, dst: &Buffer,
+                    cols: usize, position: usize) {
+    k.run_params(gpu, key, &[cols as u32, position as u32, 1u32, 0u32],
+                 &[dst, src], (1u32, 1u32, 1u32));
+}
+
+pub fn a_attention_decode(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, q: &Buffer,
+                          cache_k: &Buffer, cache_v: &Buffer, out: &Buffer, len: usize,
+                          heads: usize, head_dim: usize) {
+    k.run_params(gpu, key, &[len as u32, heads as u32, head_dim as u32, 0u32],
+                 &[q, cache_k, cache_v, out], (heads as u32, 1u32, 1u32));
+}
+
+pub fn a_add(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, a: &Buffer, b: &Buffer,
+             y: &Buffer, len: usize) {
+    k.run_params(gpu, key, &[len as u32], &[a, b, y], (1u32, 1u32, 1u32));
+}
+
+pub fn a_silu_mul(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate: &Buffer, up: &Buffer,
+                  y: &Buffer, len: usize) {
+    k.run_params(gpu, key, &[len as u32], &[gate, up, y], (1u32, 1u32, 1u32));
 }
 
 /// Fused decode-step attention block (one workgroup per query head).

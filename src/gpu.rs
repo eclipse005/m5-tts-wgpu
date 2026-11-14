@@ -22,6 +22,7 @@ pub struct Kernel {
     pub bgl: wgpu::BindGroupLayout,
     pub pipe: wgpu::ComputePipeline,
     kinds: Vec<bool>,
+    name: String,
     cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
 }
 
@@ -30,40 +31,59 @@ impl Kernel {
     /// same buffer set for a key; only the uniform bytes change per dispatch.
     pub fn run(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
                workgroups: (u32, u32, u32)) {
+        self.run_impl(gpu, key, uni, bufs, workgroups, false);
+    }
+
+    /// Same, but the params bytes are uploaded as the LAST binding (a storage
+    /// buffer with a dynamic offset) instead of the uniform arena. Lets the
+    /// existing storage-params shaders run through cached bind groups with
+    /// zero shader edits; the bytes land in a per-params ring buffer whose
+    /// write_buffer is queued with the batch that reads it.
+    pub fn run_params(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
+                      workgroups: (u32, u32, u32)) {
+        self.run_impl(gpu, key, uni, bufs, workgroups, true);
+    }
+
+    fn run_impl(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
+                workgroups: (u32, u32, u32), params_dyn: bool) {
+        let params = gpu.params_u32(uni);
+        let (resource, dyn_off) = if params_dyn {
+            (wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &params.buffer,
+                offset: params.offset,
+                size: Some(params.size.try_into().expect("non-zero params")),
+            }), params.offset as u32)
+        } else {
+            (params.buffer.as_entire_binding(), 0u32)
+        };
         let hit = self.cache.borrow().get(&key).cloned();
         let bind = if let Some(b) = hit {
             b
         } else {
-            let mut entries = vec![wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: gpu.arena_buffer(),
-                    offset: 0,
-                    size: Some((UNIFORM_SLOT as u64).try_into().expect("non-zero")),
-                }),
-            }];
+            let mut entries = Vec::with_capacity(bufs.len() + 1);
             for (i, b) in bufs.iter().enumerate() {
                 entries.push(wgpu::BindGroupEntry {
-                    binding: (i + 1) as u32,
+                    binding: i as u32,
                     resource: b.as_entire_binding(),
                 });
             }
+            entries.push(wgpu::BindGroupEntry {
+                binding: bufs.len() as u32,
+                resource: resource.clone(),
+            });
             let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("arena-kernel.{key}")),
+                label: Some(&format!("kernel.{}", self.name)),
                 layout: &self.bgl,
                 entries: &entries,
             });
             self.cache.borrow_mut().insert(key, bind.clone());
             bind
         };
-        let bytes: &[u8] = bytemuck::cast_slice(uni);
-        let trace = std::env::var_os("M5_DISPATCH_TRACE").is_some();
-        let t0 = std::time::Instant::now();
-        let offset = gpu.alloc_uniform(bytes);
-        let t1 = std::time::Instant::now();
-        if trace { eprintln!("        [run.alloc] {:.0}us", t1.elapsed().as_secs_f64() * 1e6); }
-        gpu.record_dyn(&self.pipe, &bind, offset, workgroups);
-        if trace { eprintln!("        [run.record] {:.0}us", t1.elapsed().as_secs_f64() * 1e6); }
+        if params_dyn {
+            gpu.record_dyn_off(&self.pipe, &bind, dyn_off, workgroups);
+        } else {
+            gpu.record(&self.pipe, &bind, workgroups);
+        }
     }
 }
 
@@ -80,6 +100,7 @@ struct Pending {
     /// params). None: no dynamic bindings.
     dyn_offset: Option<u32>,
     workgroups: (u32, u32, u32),
+    label: String,
 }
 
 /// Submits kept in flight before a blocking wait (ming-3.0-tts: 4 overlaps
@@ -123,6 +144,7 @@ pub struct Gpu {
     pool: RefCell<HashMap<usize, Vec<Buffer>>>,
     pool_bytes: RefCell<usize>,
     pool_counter: Cell<usize>,
+    submit_count: Cell<usize>,
     /// Buffers dropped while a submit batch was still open: they may be
     /// referenced by recorded dispatches, so they only join the pool after the
     /// next flush (write_buffer semantics make post-submit rewrites safe).
@@ -275,6 +297,7 @@ impl Gpu {
             pool: RefCell::new(HashMap::new()),
             pool_bytes: RefCell::new(0),
             pool_counter: Cell::new(0),
+            submit_count: Cell::new(0),
             deferred_pool: RefCell::new(Vec::new()),
             arena,
             arena_host: RefCell::new(Vec::new()),
@@ -292,6 +315,17 @@ impl Gpu {
 
     /// Take a pooled buffer of exactly `len` f32, or allocate one.
     pub fn take_pooled(&self, len: usize) -> Buffer {
+        // Small buffers skip the pool: the LM decode re-reads buffers (RO) in a
+        // later pass after writing them (RW) in an earlier one, and wgpu-core's
+        // per-buffer usage state across submits flags the recycled buffer's
+        // new RW binding against its stale RO one. Fresh small buffers cost
+        // ~2 us; the codec's multi-MB buffers keep pooling (their flow is
+        // write->read only).
+        if len <= 4096 || std::env::var_os("M5_NO_POOL_REUSE").is_some() {
+            let n = self.pool_counter.get();
+            self.pool_counter.set(n + 1);
+            return self.empty(&format!("fresh.{n}.{len}"), len);
+        }
         if let Some(buf) = self.pool.borrow_mut().get_mut(&len).and_then(Vec::pop) {
             *self.pool_bytes.borrow_mut() -= len * 4;
             return buf;
@@ -534,6 +568,7 @@ impl Gpu {
             group: group.clone(),
             dyn_offset: None,
             workgroups,
+            label: _key.to_string(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
@@ -544,27 +579,47 @@ impl Gpu {
     /// buffer last. The shader must declare `var<uniform> p` at binding 0.
     pub fn arena_layout(&self, key: &str, shader: &str, kinds: &str)
                         -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.arena_layout_impl(key, shader, kinds, true)
+    }
+
+    /// Same, without the leading uniform binding: `kinds` starts at binding 0
+    /// (the existing storage-params shaders keep their original binding order,
+    /// with the params binding marked `dyn` for the ring's dynamic offset).
+    pub fn arena_layout_plain(&self, key: &str, shader: &str, kinds: &str)
+                              -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        self.arena_layout_impl(key, shader, kinds, false)
+    }
+
+    fn arena_layout_impl(&self, key: &str, shader: &str, kinds: &str, leading_uniform: bool)
+                         -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(key),
             source: wgpu::ShaderSource::Wgsl(shader.into()),
         });
-        let mut entries = vec![wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(UNIFORM_SLOT as u64),
-            },
-            count: None,
-        }];
-        for (i, kind) in kinds.split(',').enumerate() {
+        let mut entries = Vec::new();
+        if leading_uniform {
             entries.push(wgpu::BindGroupLayoutEntry {
-                binding: (i + 1) as u32,
+                binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: kind.trim() == "ro" },
-                    has_dynamic_offset: false,
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SLOT as u64),
+                },
+                count: None,
+            });
+        }
+        let base = if leading_uniform { 1 } else { 0 };
+        for (i, kind) in kinds.split(',').enumerate() {
+            let k = kind.trim();
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: (i as u32) + base,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    // the dyn params binding stays read-only: the ring's bytes
+                    // are written via queue.write_buffer before the submit
+                    ty: wgpu::BufferBindingType::Storage { read_only: k != "rw" },
+                    has_dynamic_offset: k == "dyn",
                     min_binding_size: None,
                 },
                 count: None,
@@ -596,17 +651,67 @@ impl Gpu {
     pub fn kernel(&self, key: &str, shader: &str, kinds: &str) -> Kernel {
         let (bgl, pipe) = self.arena_layout(key, shader, kinds);
         let kinds = kinds.split(',').map(|k| k.trim() == "ro").collect();
-        Kernel { bgl, pipe, kinds, cache: RefCell::new(HashMap::new()) }
+        Kernel {
+            bgl,
+            pipe,
+            kinds,
+            name: key.to_string(),
+            cache: RefCell::new(HashMap::new()),
+        }
     }
 
-    /// Record a dispatch with a dynamic uniform offset into the current batch.
-    pub fn record_dyn(&self, pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup,
-                      offset: u32, workgroups: (u32, u32, u32)) {
+    /// Kernel for the existing storage-params shaders: the params binding (the
+    /// LAST one) gets has_dynamic_offset, fed from the params ring per dispatch.
+    pub fn kernel_params(&self, key: &str, shader: &str, kinds: &str) -> Kernel {
+        let kinds_full = format!("{kinds},dyn");
+        let (bgl, pipe) = self.arena_layout_plain(key, shader, &kinds_full);
+        let kinds = kinds_full.split(',').map(|k| k.trim() == "ro").collect();
+        Kernel {
+            bgl,
+            pipe,
+            kinds,
+            name: key.to_string(),
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Record a dispatch (no dynamic offsets) into the current batch.
+    pub fn record(&self, pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup,
+                  workgroups: (u32, u32, u32)) {
+        self.pending.borrow_mut().push(Pending {
+            pipeline: pipeline.clone(),
+            group: group.clone(),
+            dyn_offset: None,
+            workgroups,
+            label: String::new(),
+        });
+        self.stats.borrow_mut().dispatches += 1;
+        self.maybe_flush();
+    }
+
+    /// Record a dispatch whose bind group has one dynamic offset.
+    pub fn record_dyn_off(&self, pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup,
+                          offset: u32, workgroups: (u32, u32, u32)) {
         self.pending.borrow_mut().push(Pending {
             pipeline: pipeline.clone(),
             group: group.clone(),
             dyn_offset: Some(offset),
             workgroups,
+            label: String::new(),
+        });
+        self.stats.borrow_mut().dispatches += 1;
+        self.maybe_flush();
+    }
+
+    /// Record a dispatch with a dynamic uniform offset into the current batch.
+    pub fn record_dyn(&self, label: &str, pipeline: &wgpu::ComputePipeline,
+                      group: &wgpu::BindGroup, offset: u32, workgroups: (u32, u32, u32)) {
+        self.pending.borrow_mut().push(Pending {
+            pipeline: pipeline.clone(),
+            group: group.clone(),
+            dyn_offset: Some(offset),
+            workgroups,
+            label: label.to_string(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
@@ -630,7 +735,7 @@ impl Gpu {
             entries: &entries,
         });
         self.stats.borrow_mut().dispatches += 1;
-        self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups });
+        self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups, label: key.to_string() });
         self.maybe_flush();
     }
 
@@ -641,9 +746,17 @@ impl Gpu {
         if batch.is_empty() {
             return None;
         }
+        let n = self.submit_count.get();
+        self.submit_count.set(n + 1);
+        if std::env::var_os("M5_DISPATCH_TRACE").is_some() {
+            let comps: Vec<&str> = batch.iter().map(|p| p.label.as_str()).collect();
+            eprintln!("[batch.{n}] {} dispatches: {}", batch.len(), comps.join(", "));
+        }
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("batch") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(&format!("batch.{n}")),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             for pending in &batch {

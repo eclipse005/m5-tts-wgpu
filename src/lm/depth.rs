@@ -126,16 +126,32 @@ impl Lm {
 
     /// `h @ audio_head[codebook]^T`, `[1, AUDIO_VOCAB]`.
     fn audio_head_logits(&self, hidden: &Tensor, codebook: usize) -> Result<Tensor> {
+        self.audio_head_logits_ring(hidden, codebook, None)
+    }
+
+    /// Same, with the intermediates taken from the depth ring (persistent
+    /// buffers, never pooled - pool reuse trips a cross-pass RO->RW conflict).
+    fn audio_head_logits_ring(&self, hidden: &Tensor, codebook: usize,
+                              ring: Option<&crate::lm::backbone::DepthGpu>) -> Result<Tensor> {
         let weight = self.audio_head_matrix(codebook)?;
         // Only the newest row carries logits; `hidden` is 2 rows on the prefill step.
         let [rows, cols] = hidden.shape();
         let last = if rows == 1 {
-            self.device().copy(hidden)?
+            match ring {
+                Some(d) => d.next_ring()?,
+                None => self.device().copy(hidden)?,
+            }
         } else {
             let host = self.device().read(hidden)?;
             self.device().tensor([1, cols], &host[(rows - 1) * cols..])?
         };
-        let mut logits = self.device().zeros([1, AUDIO_VOCAB])?;
+        let mut logits = match ring {
+            Some(d) => d.next_logits()?,
+            None => self.device().zeros([1, AUDIO_VOCAB])?,
+        };
+        if std::env::var_os("M5_DISPATCH_TRACE").is_some() {
+            eprintln!("      [head_logits] last={:?} logits={:?}", last.shape(), logits.shape());
+        }
         ops::linear(self.device(), &last, &weight, None, &mut logits)?;
         Ok(logits)
     }
@@ -247,12 +263,12 @@ impl Lm {
         let norm_w = self.vector("decoder.norm.weight", HIDDEN)?;
         let mut position = 2usize;
         for codebook in 1..CODEBOOKS {
-            let logits = self.audio_head_logits(&hidden, codebook - 1)?;
+            let logits = self.audio_head_logits_ring(&hidden, codebook - 1, Some(&d))?;
             sample(&logits, codebook, true, codebook)?;
             if codebook + 1 == CODEBOOKS {
                 break;
             }
-            let embedding = dev.zeros([1, HIDDEN])?;
+            let embedding = d.next_ring()?;
             gpu_ops::embed_sum(gpu, table.gpu_buffer()?, &token_buffer, embedding.gpu_buffer()?,
                                HIDDEN, codebook, 1, AUDIO_VOCAB);
             {
