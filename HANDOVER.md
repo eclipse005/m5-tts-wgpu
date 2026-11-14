@@ -5,10 +5,13 @@
 
 最后更新：见 `git log -1`。当前 HEAD 的提交信息会告诉你最后一步动了什么。
 
-**2025-11 本轮成果**（提交 603eb7c..4e49264）：RTF 从 1.21 → **0.95**（对 Python 1.36 快 30%），
-三步：①修好 6.3 的 9 倍回归（根因是 `env::var_os` 环境锁）；②发现逐元素算子本身不慢、
-慢的是每个 op 新分配大张量的双重分配（lazy 零页修复）；③转置卷积分相分解为 kernel-2 卷积。
-新增探针：`examples/mem_probe.rs`（内存原语）、`examples/seanet_probe.rs`（残差单元拆解）。
+**2025-11 本轮成果**（提交 603eb7c 起）：RTF 1.21 → **0.75**（配对 best-of-3，对 Python CPU 1.36
+快 45%，**已追平 Python CUDA 的 0.77**）。八步：①修好 9 倍回归（`env::var_os` 环境锁）；
+②大张量双重分配 → lazy 零页；③转置卷积分相分解；④大权重转置卷积直读原布局（block1 6.2x）；
+⑤snake_conv1d/conv1d 时间块 128→512（fork 摊销，block4 单元 -43%）；⑥GEMM 路径 AVX2 化
+（pre_transformer -37%）；⑦libm sin 保住 SNR 109dB；⑧depth 预取实验失败复盘。
+新增探针：`mem_probe`（内存原语）、`seanet_probe`（残差单元/BT A/B）、`bw_probe`（带宽标定
+51.8 GB/s @20 线程）、`tconv_probe`、`gemv_prefetch_probe`。
 
 ---
 
