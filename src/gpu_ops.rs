@@ -255,6 +255,21 @@ pub fn sample_topk(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buffer,
                  &[(0, logits), (1, noise), (2, out), (3, &params)], (1, 1, 1));
 }
 
+/// Phased transposed conv (weights pre-packed as `[(co*stride+q)*taps*cin + tap*cin + ci]`).
+#[allow(clippy::too_many_arguments)]
+pub fn conv_transpose_phased(gpu: &Gpu, x: &Buffer, w2: &Buffer, bias: &Buffer, y: &Buffer,
+                             cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
+    let taps = ks / stride;
+    let rows_total = cout * stride;
+    let params = gpu.upload_u32("ct_phased.params", &[
+        cin as u32, rows_total as u32, stride as u32, t_in as u32,
+        cout as u32, (t_in * stride) as u32, taps as u32,
+    ]);
+    let groups = (rows_total.div_ceil(32) as u32, t_in.div_ceil(8) as u32, 1);
+    gpu.dispatch("ct_phased", shaders::CONV_TRANSPOSE_PHASED_F32, "main",
+                 &[(0, x), (1, w2), (2, bias), (3, y), (4, &params)], groups);
+}
+
 /// Channels-last conv with packed weights `[tap*cin+ci][cout]`.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_cl(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: &Buffer, y: &Buffer,

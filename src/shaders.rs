@@ -475,6 +475,50 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+/// Phased transposed conv1d for the codec's upsampling shapes (`ks == taps*stride`).
+///
+/// Output `t = m*stride + q` reads only input samples `m-tap` with kernel tap
+/// `q + tap*stride`, so each `(co, q)` pair is an independent contiguous stream:
+/// no modulo, no gather, and 32 m-accumulators per thread give the FMA pipeline
+/// something to chew on (the naive kernel above is one accumulator + modulo per
+/// output, measured 16-25 GFLOP/s on the P104). Weights are pre-packed on the
+/// host as `[(co*stride + q)*taps*cin + tap*cin + ci]` - one cache line's worth
+/// of broadcast reads per input channel per thread.
+pub const CONV_TRANSPOSE_PHASED_F32: &str = r#"
+// 0=cin 1=rows_total(cout*stride) 2=stride 3=t_in 4=cout 5=t_out 6=taps
+@group(0) @binding(0) var<storage, read> x: array<f32>;    // [cin, t_in]
+@group(0) @binding(1) var<storage, read> w2: array<f32>;   // [(tap*cin+ci)*rows + cq]
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>; // [cout, t_out]
+@group(0) @binding(4) var<storage, read> p: array<u32, 7>;
+
+const LANES: u32 = 8u;   // m per workgroup: consecutive lanes read x coalesced
+const SLOTS: u32 = 32u;  // (co,q) slots per workgroup: ci-major w2 reads coalesce
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cq = wid.x * SLOTS + lid.x / LANES;   // co*stride + q
+    let m = wid.y * LANES + lid.x % LANES;
+    // one accumulator per thread: a runtime-indexed local array spills to local
+    // memory on this backend and cost ~3x (measured).
+    var acc = 0.0;
+    if (cq < p[1] && m < p[3]) {
+        let co = cq / p[2];
+        let q = cq % p[2];
+        for (var tap = 0u; tap < p[6]; tap = tap + 1u) {
+            // the m >= tap edge is thread-uniform, so the branch leaves the ci loop
+            if (m >= tap) {
+                for (var ci = 0u; ci < p[0]; ci = ci + 1u) {
+                    acc = acc + x[ci * p[3] + m - tap] * w2[(tap * p[0] + ci) * p[1] + cq];
+                }
+            }
+        }
+        let t = m * p[2] + q;
+        y[co * p[5] + t] = acc + b[co];
+    }
+}
+"#;
+
 /// Exact GELU (`erf` form; A&S 7.1.26 for erf, max error ~1.5e-7).
 pub const GELU_F32: &str = r#"
 @group(0) @binding(0) var<storage, read_write> x: array<f32>;

@@ -203,6 +203,34 @@ impl Codec {
         Ok(tensor)
     }
 
+    /// Phased transposed conv on the GPU, channels-first in and out (the same
+    /// contract as [`ops::conv_transpose1d`]); weights packed once and cached.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose_phased(&self, x: &Tensor, weight_name: &str, bias_name: &str,
+                                 cout: usize, ks: usize, stride: usize) -> Result<Tensor> {
+        let Device::Gpu(gpu) = self.device() else {
+            bail!("phased transposed conv is GPU-only");
+        };
+        let [cin, t_in] = x.shape();
+        let key = format!("phased.{weight_name}");
+        let hit = self.cache.borrow().get(&key).cloned();
+        let w2 = if let Some(t) = hit {
+            t
+        } else {
+            let raw = self.weights.get_f32(weight_name)?;
+            let packed = cpu_ops::pack_conv_transpose_phased(&raw, cin, cout, ks, stride);
+            let t = Rc::new(self.dev.tensor([cout * ks, cin], &packed)?);
+            self.cache.borrow_mut().insert(key, t.clone());
+            t
+        };
+        let bias = self.vector(bias_name, cout)?;
+        let out = self.dev.zeros([cout, t_in * stride])?;
+        crate::gpu_ops::conv_transpose_phased(gpu, x.gpu_buffer()?, w2.gpu_buffer()?,
+                                              bias.gpu_buffer()?, out.gpu_buffer()?,
+                                              cin, cout, ks, stride, t_in);
+        Ok(out)
+    }
+
     /// The fifteen acoustic codebooks stacked into one table, built once.
     ///
     /// `rvq_rest` stores one tensor per codebook; concatenating them on the host

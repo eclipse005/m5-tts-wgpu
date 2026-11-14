@@ -1087,6 +1087,30 @@ pub fn pack_conv_transpose_weights(w: &[f32], cin: usize, cout: usize, ks: usize
     packed
 }
 
+/// Pack `[cin, cout, ks]` ConvTranspose weights into the phased layout
+/// `[(co*stride + q) * taps*cin + tap*cin + ci]` (`taps = ks / stride`) for the
+/// GPU phased kernel: one contiguous row per `(co, q)` pair, tap-major inside.
+pub fn pack_conv_transpose_phased(w: &[f32], cin: usize, cout: usize, ks: usize,
+                                  stride: usize) -> Vec<f32> {
+    // Layout: [(tap*cin + ci) * rows_total + (co*stride + q)] - ci-major, so a
+    // workgroup's 32 (co,q) slots read one contiguous w2 line per (ci, tap)
+    // instead of 32 cache lines (the GPU twin of the CPU co-outer lesson).
+    let taps = ks / stride;
+    let rows = cout * stride;
+    let mut out = vec![0.0f32; rows * taps * cin];
+    for tap in 0..taps {
+        for ci in 0..cin {
+            for co in 0..cout {
+                for q in 0..stride {
+                    out[(tap * cin + ci) * rows + co * stride + q] =
+                        w[(ci * cout + co) * ks + q + tap * stride];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Channels-last causal conv1d.
 ///
 /// `x` is `[t_in, cin]`, `y` is `[t_out, cout]`, `w` is the packed weight matrix

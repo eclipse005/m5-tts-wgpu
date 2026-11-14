@@ -24,7 +24,14 @@ impl Codec {
             let weight = self.tensor(&format!("{prefix}.0.conv.weight"), [channels, channels * factor])?;
             let bias = self.vector(&format!("{prefix}.0.conv.bias"), channels)?;
             let mut upsampled = dev.zeros([channels, frames * factor])?;
-            ops::conv_transpose1d(dev, &hidden, &weight, &bias, &mut upsampled, *factor, *factor)?;
+            if let crate::device::Device::Gpu(_) = dev {
+                upsampled = self.conv_transpose_phased(&hidden,
+                                                       &format!("{prefix}.0.conv.weight"),
+                                                       &format!("{prefix}.0.conv.bias"),
+                                                       channels, *factor, *factor)?;
+            } else {
+                ops::conv_transpose1d(dev, &hidden, &weight, &bias, &mut upsampled, *factor, *factor)?;
+            }
 
             hidden = self.convnext(&upsampled, &prefix)?;
         }

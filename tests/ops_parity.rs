@@ -455,7 +455,9 @@ fn channels_last_conv_matches_channels_first() {
 }
 
 #[test]
-fn gpu_channels_last_conv_matches_cpu() {
+#[test]
+#[test]
+fn gpu_conv_transpose_phased_matches_cpu() {
     let Some(gpu) = gpu() else { return };
     use m5_tts_wgpu::cpu_ops;
     use m5_tts_wgpu::gpu_ops;

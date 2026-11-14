@@ -88,7 +88,13 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     let weight = codec.tensor(&format!("{prefix}.block.1.conv.weight"), [cin, cout * ks])?;
     let bias = codec.vector(&format!("{prefix}.block.1.conv.bias"), cout)?;
     let mut up = dev.zeros([cout, frames * upsample_rate])?;
-    ops::conv_transpose1d(dev, &h, &weight, &bias, &mut up, ks, upsample_rate)?;
+    if let Device::Gpu(_) = dev {
+        up = codec.conv_transpose_phased(&h, &format!("{prefix}.block.1.conv.weight"),
+                                         &format!("{prefix}.block.1.conv.bias"),
+                                         cout, ks, upsample_rate)?;
+    } else {
+        ops::conv_transpose1d(dev, &h, &weight, &bias, &mut up, ks, upsample_rate)?;
+    }
     lap("transposed conv", &mut phase);
 
     for (unit, dilation) in [(2usize, 1usize), (3, 3), (4, 9)] {
