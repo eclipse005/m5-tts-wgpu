@@ -6,7 +6,7 @@
 //! ports converged on.
 
 use anyhow::{bail, Context, Result};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
@@ -29,6 +29,13 @@ struct Pending {
     workgroups: (u32, u32, u32),
 }
 
+/// Submits kept in flight before a blocking wait (ming-3.0-tts: 4 overlaps
+/// CPU recording with GPU execution; deeper queues flake on the P104).
+const MAX_IN_FLIGHT: u32 = 4;
+/// Dispatches allowed in the very first submit of the process (P104 faults
+/// the device above ~50 in a cold first command buffer).
+const FIRST_SUBMIT_MAX: usize = 8;
+
 pub struct Gpu {
     pub device: Device,
     pub queue: Queue,
@@ -46,6 +53,14 @@ pub struct Gpu {
     /// tracking superlinear (28 us/dispatch); whole bindings on reused buffers
     /// stay on the fast path (~7 us). The pool flushes when it wraps.
     params_pool: RefCell<ParamsPool>,
+    /// Submits in flight without a wait: a few queued submits let the CPU
+    /// record the next batch while the GPU drains the previous one
+    /// (ming-3.0-tts proved 4 is the sweet spot on this exact card).
+    in_flight: Cell<u32>,
+    /// The first submit of the process is capped (FIRST_SUBMIT_MAX) and
+    /// drained: the P104 faults the whole device when the first submit
+    /// carries more than ~50 dispatches (nvlddmkm 153 -> device lost).
+    primed: Cell<bool>,
     /// Scratch-buffer pool keyed by element count: codec ops allocate 36-72 MB
     /// outputs per call, and a fresh Vulkan buffer per op cost ~70 ms each once
     /// the allocator fragmented. Dropped tensors return here.
@@ -166,7 +181,10 @@ impl Gpu {
         let max_pending = std::env::var("M5_MAX_PENDING")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
+            // 256 (ming-3.0-tts, same card): >=1024-record submits lose the
+            // device to TDR during lazy pipeline compilation; 256 amortises
+            // submit overhead without that.
+            .unwrap_or(256);
         Ok(Self {
             device,
             queue,
@@ -178,6 +196,8 @@ impl Gpu {
             stats: RefCell::new(Stats::default()),
             upload_labels: RefCell::new(HashMap::new()),
             params_pool: RefCell::new(ParamsPool { buffers: Vec::new(), next: 0 }),
+            in_flight: Cell::new(0),
+            primed: Cell::new(false),
             pool: RefCell::new(HashMap::new()),
             pool_bytes: RefCell::new(0),
             deferred_pool: RefCell::new(Vec::new()),
@@ -388,6 +408,23 @@ impl Gpu {
         self.reuse(_key, pipeline, &group, workgroups);
     }
 
+    /// Flush policy: the first submit of the process is capped at 8 dispatches
+    /// and drained (P104 cold-buffer device fault, ming-3.0-tts); later batches
+    /// run at max_pending.
+    fn maybe_flush(&self) {
+        let n = self.pending.borrow().len();
+        if !self.primed.get() {
+            if n >= FIRST_SUBMIT_MAX {
+                self.primed.set(true);
+                self.flush();
+                self.device.poll(wgpu::PollType::wait_indefinitely()).expect("prime poll");
+                self.in_flight.set(0);
+            }
+        } else if n >= self.max_pending {
+            self.flush();
+        }
+    }
+
     /// Record a dispatch from a pre-built pipeline + bind group: the probe path
     /// that separates object-creation cost from plain recording.
     pub fn reuse(&self, _key: &str, pipeline: &wgpu::ComputePipeline,
@@ -398,9 +435,7 @@ impl Gpu {
             workgroups,
         });
         self.stats.borrow_mut().dispatches += 1;
-        if self.pending.borrow().len() >= self.max_pending {
-            self.flush();
-        }
+        self.maybe_flush();
     }
 
     /// Record one dispatch into the current batch.
@@ -422,9 +457,7 @@ impl Gpu {
         });
         self.stats.borrow_mut().dispatches += 1;
         self.pending.borrow_mut().push(Pending { pipeline, group, workgroups });
-        if self.pending.borrow().len() >= self.max_pending {
-            self.flush();
-        }
+        self.maybe_flush();
     }
 
 
@@ -457,6 +490,17 @@ impl Gpu {
         if let Some(batch) = self.encode_batch() {
             self.queue.submit(std::iter::once(batch));
             self.drain_deferred();
+            let n = self.in_flight.get() + 1;
+            self.in_flight.set(n);
+            if n >= MAX_IN_FLIGHT {
+                // block: the pipeline is deep enough
+                self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+                self.in_flight.set(0);
+            } else {
+                // non-blocking: let the driver start the batch while the CPU
+                // records the next one
+                let _ = self.device.poll(wgpu::PollType::Poll);
+            }
         }
     }
 
