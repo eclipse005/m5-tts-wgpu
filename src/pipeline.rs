@@ -224,14 +224,13 @@ impl Pipeline {
         // The EOS frame stays all zero and is dropped below.
         let prompt_len = total_input - 1;
 
-        // The backbone's positional range: the reference's `max_seq_len` (2048),
-        // enforced there as `prompt tokens < max_seq_len - max_audio_frames`.
-        // Without this check a long text plus a long `max_audio_length_ms` walks
-        // past the end of the rope tables and produces silently wrong audio.
-        const MAX_SEQ_LEN: usize = 2048;
-        if prompt_len + args.max_audio_frames > MAX_SEQ_LEN {
+        // The backbone's positional range (the reference's `max_seq_len`). The
+        // rope tables and the attention kernels' score staging are both sized to
+        // it, so this is the one place the limit is enforced.
+        if prompt_len + args.max_audio_frames > crate::lm::MAX_CONTEXT {
             let frames = args.max_audio_frames;
-            bail!("inputs too long: {prompt_len} prompt tokens + {frames} audio frames exceed the model's {MAX_SEQ_LEN}-token context; shorten the text or lower --max-audio-length-ms");
+            bail!("inputs too long: {prompt_len} prompt tokens + {frames} audio frames exceed the model's {} -token context; shorten the text or lower --max-audio-length-ms",
+                  crate::lm::MAX_CONTEXT);
         }
 
         let embedded = self.lm.embed_frames(&tokens[..prompt_len * (CODEBOOKS + 1)], prompt_len)?;

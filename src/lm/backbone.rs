@@ -1094,10 +1094,10 @@ impl Lm {
     /// per-step cos/sin uploads (two buffer allocations per layer step).
     fn gpu_rope_tables(&self) -> Result<(Rc<Tensor>, Rc<Tensor>)> {
         if self.gpu_rope.borrow().is_none() {
-            let positions: Vec<usize> = (0..2048).collect();
+            let positions: Vec<usize> = (0..MAX_CONTEXT).collect();
             let (cos, sin) = rope_table(&positions);
-            let ct = Rc::new(self.device().tensor([2048, HEAD_DIM], &cos)?);
-            let st = Rc::new(self.device().tensor([2048, HEAD_DIM], &sin)?);
+            let ct = Rc::new(self.device().tensor([MAX_CONTEXT, HEAD_DIM], &cos)?);
+            let st = Rc::new(self.device().tensor([MAX_CONTEXT, HEAD_DIM], &sin)?);
             *self.gpu_rope.borrow_mut() = Some((ct, st));
         }
         let pair = {

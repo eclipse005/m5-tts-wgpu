@@ -33,6 +33,33 @@ PROMPT_WAV = r"D:\M5-TTS\assets\aslp_default_voice.wav"
 PROMPT_WAV_44K = r"D:\M5-TTS\assets\aslp_default_voice_44k.wav"
 PROMPT_TEXT = "猪携带该疾病，然后通过蚊子传染给人类。"
 
+# A bedtime script: 571 characters, 498 text tokens, ~90 s of speech. The
+# reference only gets this far by raising its 40 s default budget, and even at
+# 90 s it ends on the cap without EOS - the case that exercises positions past
+# 1024 (the attention kernels' score staging used to overflow there).
+LONG_TEXT = (
+    "夜深了，城市的灯一盏一盏慢慢安静下来，你也终于有了一点属于自己的时间。"
+    "或许今天并不轻松，可能有些事情没有按照期待发展，也可能只是单纯地感到疲惫。"
+    "但没关系，现在这一刻，你不需要证明什么，也不需要赶着去完成什么，"
+    "只需要好好待在这里，和自己待一会儿。"
+    "想象一下，窗外有一点点微风，轻轻地吹动树叶，发出很细很柔的声音。"
+    "这样的声音，不急不躁，就像时间本来的样子。"
+    "你可以慢慢地呼吸，让空气一点点进入身体，再轻轻地呼出来。"
+    "所有紧绷的情绪，都可以随着呼气一点点放松下来。"
+    "有时候我们会对自己太严格，总觉得应该更好一点、更快一点、更完美一点。"
+    "但其实，你已经走了很远的路。"
+    "那些你以为不起眼的坚持，那些别人看不到的努力，都在一点一点地塑造现在的你。"
+    "你不需要一直强大，也可以偶尔脆弱，偶尔停下来。"
+    "停下来，并不是失败，而是给自己一点空间，好让内心重新变得柔软。"
+    "如果你愿意，可以把今天发生的一件小事轻轻地想一想，"
+    "也许是一杯温热的水，一句简单的问候，或者是某个不经意的微笑。"
+    "这些细碎的温暖，像夜空里不太显眼的星星，但它们一直都在，默默地陪着你。"
+    "现在，就这样慢慢地，把肩膀放松下来，让呼吸变得更轻一点。"
+    "你已经做得很好了，真的。"
+    "接下来的时间，不需要焦虑未来，也不需要回头纠结过去。"
+    "就只是这一刻，你是安全的，是被允许安静下来的。"
+    "晚安，愿你在柔软的梦里，被温柔地接住。")
+
 
 def scenarios():
     clone = dict(kind="clone", prompt_wav=PROMPT_WAV, prompt_text=PROMPT_TEXT)
@@ -70,6 +97,8 @@ def scenarios():
         "clone_topk1": s(topk=1, text="你好，今天天气很好。"),
         "clone_topk50": s(topk=50, text="你好，今天天气很好。"),
         "clone_temp05": s(temperature=0.5, text="你好，今天天气很好。"),
+        # --- long text: 498 tokens and ~90 s, i.e. positions well past 1024 ---
+        "clone_zh_verylong": s(text=LONG_TEXT, max_audio_length_ms=90000),
         # --- preset voices (CustomVoice checkpoint) ---
         "preset_1_zh": s(kind="preset", speaker_id=1, text="你好，今天的天气很好。"),
         "preset_2_zh": s(kind="preset", speaker_id=2, text="你好，今天的天气很好。"),
@@ -141,7 +170,7 @@ def main():
         kw = dict(text=spec["text"], lang=spec.get("lang", "Chinese"),
                   accent=spec.get("accent"), caption=spec.get("caption"),
                   temperature=spec.get("temperature", 0.9), topk=spec.get("topk", 10),
-                  max_audio_length_ms=40000)
+                  max_audio_length_ms=spec.get("max_audio_length_ms", 40000))
         if spec["kind"] == "clone":
             kw.update(prompt_wav=spec["prompt_wav"], prompt_text=spec["prompt_text"])
         else:
@@ -165,6 +194,7 @@ def main():
         np.ascontiguousarray(audio).tofile(d / "pcm.bin")
         meta = dict(spec)
         meta.update(name=name, frames=int(real_frames), codebooks=int(codes.shape[1]),
+                    max_audio_length_ms=float(kw["max_audio_length_ms"]),
                     draws=int(noise.shape[0]), pcm_samples=int(audio.size),
                     reference=dict(device="cpu", attention="sdpa", seed=1234, dtype="fp32"))
         (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")

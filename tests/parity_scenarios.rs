@@ -122,6 +122,12 @@ fn scenarios_match_reference() -> Result<()> {
                 topk: meta(&text, "topk").and_then(|v| v.parse().ok()).unwrap_or(10),
                 ..Default::default()
             };
+            // The reference's generation budget matters (it decides where the cap
+            // lands), so it travels with the scenario.
+            let budget = meta(&text, "max_audio_length_ms")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(40000.0);
+            args = args.with_max_audio_length_ms(budget)?;
             if let Some(lang) = meta(&text, "lang") {
                 args.lang = lang.to_string();
             }
@@ -145,6 +151,22 @@ fn scenarios_match_reference() -> Result<()> {
             let pipeline = &resident[&key];
             let mut source = RecordedNoise::new(noise.clone());
             let out = pipeline.synthesize(&args, &mut source as &mut dyn NoiseSource)?;
+
+            // Same input, same noise, same process -> the same bytes. Run with
+            // M5_SCENARIO_REPEAT=1: a kernel that reads memory it never wrote
+            // (fixed-size score staging, a missing storage barrier, a recycled
+            // pool buffer) shows up here and nowhere else, because it looks
+            // like ordinary sampling noise from outside.
+            if std::env::var_os("M5_SCENARIO_REPEAT").is_some() {
+                let mut again = RecordedNoise::new(noise.clone());
+                let second = pipeline.synthesize(&args, &mut again as &mut dyn NoiseSource)?;
+                let same = second.audio.len() == out.audio.len()
+                    && second.generated == out.generated
+                    && second.audio.iter().zip(&out.audio).all(|(a, b)| a.to_bits() == b.to_bits());
+                if !same {
+                    failures.push(format!("{name}/{spec}: not reproducible run to run"));
+                }
+            }
 
             if std::env::var_os("M5_DUMP_PCM").is_some() {
                 let bytes: Vec<u8> = bytemuck::cast_slice::<f32, u8>(&out.audio).to_vec();

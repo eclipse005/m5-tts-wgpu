@@ -25,6 +25,11 @@ use crate::device::{Device, Tensor};
 use crate::tok::Tok;
 use crate::weights::Weights;
 
+/// The backbone's positional range: the rope table covers these positions and
+/// the attention kernels stage that many scores. The reference calls the same
+/// number `max_seq_len` and enforces `prompt tokens + audio frames < it`.
+pub const MAX_CONTEXT: usize = 2048;
+
 /// Fixed geometry of the 50M checkpoint (`config.json` flavours).
 pub const HIDDEN: usize = 512;
 pub const HEADS: usize = 8;

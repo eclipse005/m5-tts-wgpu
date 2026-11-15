@@ -439,8 +439,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 ///
 /// One workgroup per (query, head). Lanes split the score pass across keys and
 /// each lane writes one output element. Nothing is written back to workgroup
-/// memory after the barrier: every lane recomputes exp() locally, which is cheap
-/// at window <= 256 and removes a genuine write/read race.
+/// memory after the barrier: every lane recomputes exp() locally, which removes
+/// a genuine write/read race.
+///
+/// `scores` holds one span, so it must cover the longest span any caller asks
+/// for. The codec passes its 72-frame sliding window, but the backbone prefill
+/// passes the whole prompt (`window = frames`), i.e. up to the model's context
+/// limit - the array used to be 256 entries and silently corrupted workgroup
+/// memory for any prompt longer than that (a 500-token text already did).
 pub const ATTENTION_F32: &str = r#"
 // 0=T 1=heads 2=head_dim 3=window
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -448,7 +454,8 @@ pub const ATTENTION_F32: &str = r#"
 @group(0) @binding(2) var<storage, read> v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 4>;
-var<workgroup> scores: array<f32, 256>;
+// MAX_CONTEXT = 2048 (crate::lm::MAX_CONTEXT); the host rejects longer requests.
+var<workgroup> scores: array<f32, 2048>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -781,6 +788,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// accumulation order match the unfused kernels, so results are bit-identical.
 pub const QKV_ATTEND_F32: &str = r#"
 // 0=q_rows 1=kv_rows 2=head_dim 3=position 4=heads
+//
+// `scores` is one span over the KV cache: it used to be 1024 entries while
+// `len = position + 1` runs to the model's 2048-position context, so every
+// generation past frame ~1024 wrote out of bounds and the output stopped being
+// reproducible (the same command produced 467 or 1168 frames on this card).
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;      // [q_rows + 2*kv_rows]
 @group(0) @binding(1) var<storage, read_write> cache_k: array<f32>; // [cap, q_rows]
 @group(0) @binding(2) var<storage, read_write> cache_v: array<f32>;
@@ -791,7 +803,8 @@ pub const QKV_ATTEND_F32: &str = r#"
 
 var<workgroup> qs: array<f32, 64>;
 var<workgroup> ks: array<f32, 64>;
-var<workgroup> scores: array<f32, 1024>;
+// MAX_CONTEXT wide (crate::lm::MAX_CONTEXT); the host rejects longer requests.
+var<workgroup> scores: array<f32, 2048>;
 var<workgroup> red123: array<f32, 1>;
 
 @compute @workgroup_size(64)
@@ -826,7 +839,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let off = p[3] * p[0] + qo;
     cache_k[off + t] = ks[t];
     cache_v[off + t] = vv;
+    // The rows just written are read back below (key `position` included), so the
+    // barrier has to order *storage* accesses, not only workgroup memory.
     workgroupBarrier();
+    storageBarrier();
 
     // Attention over rows 0..=position: scores in shared, softmax in thread 0,
     // weighted sum per thread over this head's value slice.
@@ -2497,7 +2513,8 @@ pub const ATTENTION_DECODE_F32: &str = r#"
 @group(0) @binding(2) var<storage, read> v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 4>;
-var<workgroup> scores: array<f32, 256>;
+// MAX_CONTEXT = 2048 (crate::lm::MAX_CONTEXT); the host rejects longer requests.
+var<workgroup> scores: array<f32, 2048>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
