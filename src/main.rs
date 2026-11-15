@@ -44,6 +44,10 @@ struct Cli {
     temperature: f32,
     #[arg(long, default_value_t = 10)]
     topk: usize,
+    /// Longest utterance, in milliseconds (reference `max_audio_length_ms`,
+    /// default 40 s; generation stops there even without an EOS).
+    #[arg(long, default_value_t = 40000.0)]
+    max_audio_length_ms: f64,
     #[arg(long, default_value_t = 1234)]
     seed: u64,
     #[arg(long, default_value = "output.wav")]
@@ -99,7 +103,8 @@ fn main() -> Result<()> {
         temperature: cli.temperature,
         topk: cli.topk,
         max_audio_frames: 500,
-    };
+    }
+    .with_max_audio_length_ms(cli.max_audio_length_ms)?;
     let mut noise = PrngNoise::new(cli.seed);
     let started = std::time::Instant::now();
     let out = pipeline.synthesize(&args, &mut noise as &mut dyn NoiseSource)?;

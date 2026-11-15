@@ -660,6 +660,8 @@ codes（要求逐值相等）与 PCM（SNR ≥ 60 dB）：
 | 克隆·法文 | 28 | 2.14 s | 0 | 103.1 / 100.3 |
 | 克隆·韩文 | 31 | 2.38 s | 0 | 106.1 / 105.0 |
 | 克隆·accent=chuan | 48 | 3.74 s | 0 | 112.6 / 110.7 |
+| 克隆·accent=yue（繁体字，粤语腔） | 78 | 6.14 s | 0 | 105.0 / — |
+| 克隆·参考音频 44.1 kHz（重采样路径） | 28 | 2.14 s | 0 | 106.4 / — |
 | 克隆·caption | 29 | 2.22 s | 0 | 109.3 / 107.2 |
 | 克隆·topk=1（跑满 40 s 无 EOS） | 500 | 39.90 s | 0 | 109.1 / 108.5 |
 | 克隆·topk=50 | 33 | 2.54 s | 0 | 112.6 / 109.6 |
@@ -687,18 +689,31 @@ codes（要求逐值相等）与 PCM（SNR ≥ 60 dB）：
    而且差异集中在第 20~35 秒。按参考分块（含丢掉 left context 的写法）后 **109.1 dB**，
    顺带把 40 s 音频的峰值显存从"爆 8 GB"降到"每块 325 帧"。
 
-**尚未覆盖 / 已知不对齐**（这一节就是"没测到"的清单）：
+**已补齐的两项外部依赖（都按"数据 + 算法一起入库"，不留运行时依赖）**：
 
-* **非 24 kHz 参考音频**：参考用 `torchaudio.functional.resample` 重采样，我们**直接报错**
-  （`audio.rs` 里写明"resampling not implemented"）。真实素材大多是 44.1/48 kHz，
-  这是可用性硬缺口。要做严格对齐还得复刻它的 Kaiser 窗 sinc。
-* **accent=yue**：参考做 OpenCC s2hk 转换，我们报错（缺表，见第 7 节）。
-* `max_audio_length_ms`：我们内部固定 500 帧（= 40 s，与参考默认一致），CLI 没暴露。
-* **多段对话 / 多 speaker 的 Segment 序列**（参考 `Generator.generate` 支持 context 列表）：
-  我们只做单段克隆或单 speaker。
-* ONNX 路径（`infer_onnx.py`）不在范围内；Gradio `app.py` 只是包装。
-* 流式（边生成边出音频）参考没有，我们也没有。
-* `parity_tn` 覆盖 6 语言 21 例，但 1 条英文平局差异已登记；粤语未支持。
+* **accent=yue**：参考里的 `yue` **不是粤语发音**，而是中文 TN 之后做 **字形转换**
+  （OpenCC `s2hk`：简体 → 香港繁体），模型在 yue 条件下配对的是港繁字形。
+  `opencc-python-reimplemented` 只是三个文本词典上的纯 Python 循环，所以
+  `src/opencc.rs` 移植了它**同一套算法**（分隔符切分 → 分组词典左最长匹配 + 长度 hint →
+  取第一候选 → 顺序重建 → 再过 HKVariants）+ **同一份数据**（`tn_data/opencc/`，
+  1.0 MB），并用 `scripts/dump_opencc.py` 导出的 **12 048 条**参考输出做闸门
+  （`opencc::tests::matches_reference_on_corpus`，全等）。端到端 78 帧、codes 0 mismatch、
+  105 dB。
+* **非 24 kHz 参考音频**：`audio::resample` 按 torchaudio 2.8 的公式实现
+  （`sinc_interp_hann`，`lowpass_filter_width=6`，`rolloff=0.99`，按 gcd 约简成
+  `min(orig,new)*rolloff` 的窗化 sinc 滤波器组 + stride 卷积，含 `width` 两侧补零与
+  `ceil(new*len/orig)` 截断）。44.1 kHz 参考音频端到端 28 帧、codes 0 mismatch、106.4 dB。
+
+**仍然缺的**（如实）：
+
+* `max_audio_length_ms` 已按参考语义暴露（`--max-audio-length-ms`，默认 40000，<800 报错，
+  帧数 = ms/80）。
+* **多段 context / 多 speaker**：参考的 `Generator.generate` 收 `List[Segment]`，但**公开 API
+  不暴露**它——`M5TTS.infer`、`infer_clone.py`、`infer_speaker.py`、`app.py` 都只传一段。
+  所以我们按公开 API 对齐，没有做多段（要做是加功能，不是补对齐）。
+* ONNX 路径（`infer_onnx.py`）按约定不做；Gradio `app.py` 只是包装。
+* 流式（边生成边出音频）参考没有，我们也没有（但 codec 已按参考分块，接流式只差调度）。
+* `parity_tn` 覆盖 6 语言 + 两种 accent，1 条英文平局差异已登记。
 
 ---
 

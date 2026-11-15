@@ -308,12 +308,17 @@ pub fn language_code(lang: &str) -> Option<&'static str> {
 
 pub struct Tn {
     dir: PathBuf,
+    /// `accent=yue` converts the normalised text to Hong Kong traditional; the
+    /// ~1 MB of tables are only parsed the first time a Cantonese request needs
+    /// them.
+    s2hk: std::cell::OnceCell<crate::opencc::S2hk>,
 }
 
 impl Tn {
     pub fn new(tn_dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: tn_dir.into(),
+            s2hk: std::cell::OnceCell::new(),
         }
     }
 
@@ -345,9 +350,6 @@ impl Tn {
                 return Ok(text.to_string());
             }
         }
-        if dialect == "yue" {
-            bail!("yue needs the OpenCC s2hk table, which is not shipped yet");
-        }
         let prefix = LANGUAGES
             .iter()
             .find(|(c, _)| *c == code)
@@ -356,6 +358,19 @@ impl Tn {
         let out = Normalizer::load(&self.dir, prefix)?.normalize(text)?;
         if out.trim().is_empty() {
             bail!("WeTextProcessing returned empty or invalid normalized text");
+        }
+        if dialect == "yue" {
+            // `text_normalization.py`: Cantonese is Chinese TN followed by OpenCC
+            // `s2hk`, i.e. a script change, not Cantonese verbalisation.
+            if self.s2hk.get().is_none() {
+                let table = crate::opencc::S2hk::load(&self.dir.join("opencc"))?;
+                let _ = self.s2hk.set(table);
+            }
+            let converted = self.s2hk.get().expect("initialised above").convert(&out);
+            if converted.trim().is_empty() {
+                bail!("OpenCC returned empty or invalid converted text");
+            }
+            return Ok(converted);
         }
         Ok(out)
     }

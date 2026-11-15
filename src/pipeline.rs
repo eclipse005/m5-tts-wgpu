@@ -66,6 +66,19 @@ pub struct Args {
     pub max_audio_frames: usize,
 }
 
+impl Args {
+    /// `max_audio_length_ms` from the reference API (`infer` defaults to 40 s and
+    /// rejects anything under 800 ms); the generator turns it into frames of
+    /// 80 ms.
+    pub fn with_max_audio_length_ms(mut self, ms: f64) -> Result<Self> {
+        if !ms.is_finite() || ms < 800.0 {
+            bail!("max_audio_length_ms must be at least 800");
+        }
+        self.max_audio_frames = (ms / 80.0) as usize;
+        Ok(self)
+    }
+}
+
 impl Default for Args {
     fn default() -> Self {
         Self {
@@ -311,6 +324,7 @@ impl Pipeline {
             eprintln!("  codec decode: {:.3}s", phase.elapsed().as_secs_f64());
             if let Device::Gpu(gpu) = self.lm.device() {
                 let st = gpu.snapshot();
+                eprintln!("  gpu objects: {} bind groups created", gpu.bind_groups_created.get());
                 eprintln!("  gpu upload staging: {:.0} ms of client time in write_buffer",
                           gpu.upload_host_nanos.get() as f64 / 1e6);
                 eprintln!("  gpu stats: {} dispatches, {} submits, uploaded {:.1} MB, readback {:.1} MB",

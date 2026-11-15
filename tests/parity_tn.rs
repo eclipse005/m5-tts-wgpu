@@ -41,20 +41,8 @@ fn normalize_text_matches_reference_per_language() -> Result<()> {
     let tn = Tn::bundled();
 
     let mut per_language: BTreeMap<String, usize> = BTreeMap::new();
-    let mut yue_pending = 0usize;
     for case in &golden.cases {
         let lang = case.lang.clone().unwrap_or_default();
-        if case.accent.as_deref() == Some("yue") {
-            // OpenCC s2hk is not shipped yet; assert the gap stays explicit
-            // instead of silently returning un-converted text.
-            assert!(
-                tn.normalize(&case.text, &lang, case.accent.as_deref()).is_err(),
-                "yue must fail loudly until s2hk lands: {:?}",
-                case.text
-            );
-            yue_pending += 1;
-            continue;
-        }
         let got = tn.normalize(&case.text, &lang, case.accent.as_deref())?;
         if got != case.normalized {
             let known = KNOWN_DIVERGENCES.iter().any(|(text, _)| *text == case.text);
@@ -71,7 +59,7 @@ fn normalize_text_matches_reference_per_language() -> Result<()> {
         }
         *per_language.entry(lang).or_default() += 1;
     }
-    eprintln!("TN parity: {per_language:?} exact, {yue_pending} yue case(s) still gated");
+    eprintln!("TN parity: {per_language:?} exact");
     // Every language the model supports must be covered by at least one case.
     for lang in ["Chinese", "English", "German", "French", "Japanese", "Korean"] {
         assert!(

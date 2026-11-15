@@ -27,6 +27,10 @@ REFERENCE = os.environ.get("M5_REFERENCE", r"D:\M5-TTS")
 sys.path.insert(0, REFERENCE)
 
 PROMPT_WAV = r"D:\M5-TTS\assets\aslp_default_voice.wav"
+# A 44.1 kHz copy of the same recording: the reference resamples it to the codec
+# rate (`torchaudio.functional.resample`), which the port carries as
+# `audio::resample`. Real reference audio is usually 44.1/48 kHz.
+PROMPT_WAV_44K = r"D:\M5-TTS\assets\aslp_default_voice_44k.wav"
 PROMPT_TEXT = "猪携带该疾病，然后通过蚊子传染给人类。"
 
 
@@ -56,7 +60,12 @@ def scenarios():
         "clone_ko": s(lang="Korean", text="안녕하세요, 오늘 날씨가 아주 좋네요."),
         # --- accents and captions ---
         "clone_accent_chuan": s(accent="chuan", text="你好，今天天气很好。"),
+        # Cantonese: Chinese TN then OpenCC s2hk (script conversion, not
+        # Cantonese verbalisation - see src/opencc.rs).
+        "clone_accent_yue": s(accent="yue", text="请问，你食咗饭未啊？今天天气很好。"),
         "clone_caption": s(caption="用温柔一点的语气说", text="你好，今天天气很好。"),
+        # Reference recording at 44.1 kHz -> resampling path.
+        "clone_prompt_44k": s(prompt_wav=PROMPT_WAV_44K, text="你好，今天天气很好。"),
         # --- sampling knobs ---
         "clone_topk1": s(topk=1, text="你好，今天天气很好。"),
         "clone_topk50": s(topk=50, text="你好，今天天气很好。"),

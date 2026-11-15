@@ -79,6 +79,7 @@ impl Kernel {
                 binding: bufs.len() as u32,
                 resource: params_buffer.as_entire_binding(),
             });
+            gpu.bind_groups_created.set(gpu.bind_groups_created.get() + 1);
             let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("kernel.{}", self.name)),
                 layout: &self.bgl,
@@ -145,6 +146,8 @@ impl ArenaKernel {
                     resource: b.as_entire_binding(),
                 });
             }
+            gpu.bind_groups_created.set(gpu.bind_groups_created.get() + 1);
+            gpu.bind_groups_created.set(gpu.bind_groups_created.get() + 1);
             let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("arena-kernel"),
                 layout: &self.bgl,
@@ -198,6 +201,8 @@ pub struct Gpu {
     /// dispatches flush and drain immediately.
     unprimed: RefCell<HashMap<String, ()>>,
     pub stats: RefCell<Stats>,
+    /// Bind groups created (diagnostic: one per dispatch on the generic op path).
+    pub bind_groups_created: std::cell::Cell<u64>,
     /// Upload bytes per call-site label, so a profiling run can show where the
     /// PCIe traffic actually comes from (`M5_PROFILE=1`).
     pub upload_labels: RefCell<HashMap<String, u64>>,
@@ -400,6 +405,7 @@ impl Gpu {
             pipelines: RefCell::new(HashMap::new()),
             unprimed: RefCell::new(HashMap::new()),
             stats: RefCell::new(Stats::default()),
+            bind_groups_created: std::cell::Cell::new(0),
             upload_labels: RefCell::new(HashMap::new()),
             params_pool: RefCell::new(ParamsPool { buffers: Vec::new(), next: 0 }),
             in_flight: Cell::new(0),
@@ -593,6 +599,7 @@ impl Gpu {
                 size: Some(params.size.try_into().expect("non-zero params")),
             }),
         });
+        self.bind_groups_created.set(self.bind_groups_created.get() + 1);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(key),
             layout: &layout,
@@ -699,6 +706,7 @@ impl Gpu {
                 size: Some(params.size.try_into().expect("non-zero params")),
             }),
         });
+        self.bind_groups_created.set(self.bind_groups_created.get() + 1);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("probe-slice"),
             layout,
@@ -916,6 +924,7 @@ impl Gpu {
                 resource: buffer.as_entire_binding(),
             })
             .collect();
+        self.bind_groups_created.set(self.bind_groups_created.get() + 1);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(key),
             layout: &layout,
