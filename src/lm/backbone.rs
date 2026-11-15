@@ -53,6 +53,8 @@ pub struct DepthGpuKernels {
     pub rms: crate::gpu::Kernel,
     pub gemv: crate::gpu::Kernel,
     pub gemv_bf16: crate::gpu::Kernel,
+    /// rms-norm + qkv projection in one dispatch (see `NORM_GEMV_BF16_F32`).
+    pub norm_gemv_bf16: crate::gpu::Kernel,
     pub rope: crate::gpu::Kernel,
     pub repeat_kv: crate::gpu::Kernel,
     pub write_rows: crate::gpu::Kernel,
@@ -138,6 +140,8 @@ pub struct DepthFusedGpu {
     pub norm_gateup: crate::gpu::Kernel,
     pub silu_down: crate::gpu::Kernel,
     pub gemv_bf16: crate::gpu::Kernel,
+    /// rms-norm + qkv projection in one dispatch (see `NORM_GEMV_BF16_F32`).
+    pub norm_gemv_bf16: crate::gpu::Kernel,
     pub gemv_add_bf16: crate::gpu::Kernel,
     pub norm_gateup_bf16: crate::gpu::Kernel,
     pub silu_down_bf16: crate::gpu::Kernel,
@@ -711,6 +715,8 @@ impl Lm {
             rms: gpu.kernel_params("d.rms", crate::shaders::RMS_NORM_F32, "ro,ro,rw"),
             gemv: gpu.kernel_params("d.gemv", crate::shaders::GEMV_F32, "ro,ro,ro,rw"),
             gemv_bf16: gpu.kernel_params("d.gemv_bf16", crate::shaders::GEMV_BF16W_M5, "ro,ro,rw"),
+            norm_gemv_bf16: gpu.kernel_params("d.norm_gemv_bf16", crate::shaders::NORM_GEMV_BF16_F32,
+                                              "ro,ro,ro,rw"),
             rope: gpu.kernel_params("d.rope", crate::shaders::ROPE_TABLED_F32, "rw,ro,ro"),
             repeat_kv: gpu.kernel_params("d.repeat_kv", crate::shaders::REPEAT_KV_F32, "ro,rw"),
             write_rows: gpu.kernel_params("d.write_rows", crate::shaders::WRITE_ROWS_F32, "rw,ro"),
@@ -1004,6 +1010,8 @@ impl Lm {
                                            "ro,ro,ro,ro,rw"),
             silu_down: gpu.kernel_params("f.silu_down", crate::shaders::SILU_DOWN_F32, "ro,ro,ro,rw"),
             gemv_bf16: gpu.kernel_params("fb.gemv", crate::shaders::GEMV_BF16_F32, "ro,ro,ro,rw"),
+            norm_gemv_bf16: gpu.kernel_params("fb.norm_gemv", crate::shaders::NORM_GEMV_BF16_F32,
+                                              "ro,ro,ro,rw"),
             gemv_add_bf16: gpu.kernel_params("fb.gemv_add", crate::shaders::GEMV_ADD_BF16_F32, "ro,ro,ro,rw"),
             norm_gateup_bf16: gpu.kernel_params("fb.norm_gateup", crate::shaders::NORM_GATEUP_BF16_F32,
                                                 "ro,ro,ro,ro,rw"),
@@ -1035,15 +1043,14 @@ impl Lm {
         let input = if index == 0 { &s.x_in } else { &d.layers[index - 1].x_out };
 
         let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
-        crate::gpu_ops::f_rms(&d.rms, gpu, key, input.gpu_buffer()?,
-                              input_norm.gpu_buffer()?, s.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
         let (cos_t, sin_t) = self.gpu_rope_tables()?;
         let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
         if let Some(sets) = &d.bf16 {
             let w = &sets[index];
-            crate::gpu_ops::f_gemv(&d.gemv_bf16, gpu, key | 1, s.normed.gpu_buffer()?,
-                                   &w.qkv, d.zero1.gpu_buffer()?, s.qkv.gpu_buffer()?,
-                                   q_dim + 2 * kv_dim, HIDDEN);
+            // One dispatch for norm + qkv instead of two.
+            crate::gpu_ops::f_norm_gemv(&d.norm_gemv_bf16, gpu, key | 1, input.gpu_buffer()?,
+                                        input_norm.gpu_buffer()?, &w.qkv, s.qkv.gpu_buffer()?,
+                                        q_dim + 2 * kv_dim, HIDDEN, 1e-5);
             {
                 let kv = d.kv.borrow();
                 crate::gpu_ops::f_qkv_attend(&d.qkv_attend, gpu, key | 2, s.qkv.gpu_buffer()?,
@@ -1061,6 +1068,8 @@ impl Lm {
                                         INTERMEDIATE, HIDDEN);
             return Ok(());
         }
+        crate::gpu_ops::f_rms(&d.rms, gpu, key, input.gpu_buffer()?,
+                              input_norm.gpu_buffer()?, s.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
         let qkv_w = self.qkv_weight("decoder", index)?;
         crate::gpu_ops::f_gemv(&d.gemv, gpu, key | 1, s.normed.gpu_buffer()?,
                                qkv_w.gpu_buffer()?, d.zero1.gpu_buffer()?, s.qkv.gpu_buffer()?,

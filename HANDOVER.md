@@ -213,6 +213,7 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 `M5_PROFILE_LAYER=1`（融合层内部，f32 与 bf16 都有）、`M5_NO_SIMD=1`（强制通用路径）、
 `M5_NO_FUSED=1`、`M5_NO_BF16=1`、`M5_MAX_PENDING=N`、`M5_TN_DIR`、`M5_MODEL`、
 `M5_DEPTH_PLAIN=1`（depth 走逐 op 路径，默认是融合路径）、`M5_DEPTH_ARENA=1`、
+`M5_GATEUP_ROWS=N`（norm_gateup 行/workgroup，默认 32）、
 `M5_CODEC`、`RAYON_NUM_THREADS`。
 
 ---
@@ -847,6 +848,60 @@ SNR 110.8 dB（CPU）/ 110.6 dB（GPU）**，本次 `M5_SCENARIO_REPEAT=1` 下�
 
 其余 30 个场景：**codes 逐值相同，PCM SNR 103-116 dB**，且 GPU 侧在
 `M5_SCENARIO_REPEAT=1`（同进程跑两遍要求逐位相同）下全过。
+
+---
+
+## 6.14 2026-11 第八轮：depth 的 kernel 提速与"延迟地板"
+
+**结论先说**：depth 现在是**依赖 dispatch 链的延迟**受限，不是 kernel 算术或带宽受限。
+
+**做了什么**（都在 `src/shaders.rs`）：
+
+1. **bf16 / f32 的 GEMV 全部改成 16 字节宽 load**（权重视图 `array<vec4<u32>>` /
+   `array<vec4<f32>>`，每次取 8 个 bf16 或 4 个 f32）+ 4 个独立累加器。之前每个元素
+   一条 4 B load、一条累加链。
+2. **`norm_gateup` 的两处结构问题**：原来每 workgroup 串行做 64 行（4096 行的投影只有
+   64 个 workgroup = 3.2 个/SM），且暂存行按 8 个 float 的 lane 步长读取（8 路 bank 冲突）。
+   改成 vec4 暂存 + 每 warp 行。
+3. **rms 融进 qkv 投影**（`NORM_GEMV_BF16_F32`，和 norm_gateup 同一招：norm 在每
+   workgroup 内重算），层步 6 dispatch → **5**。
+
+隔离测量（`examples/depth_bf16_probe.rs`，一层步 6 dispatch）：
+
+| kernel | 改前 | 改后 |
+|---|---|---|
+| rms 512 | 7.7 µs | 8.1 µs（已并入 qkv） |
+| gemv bf16 768×512 | 13.7 µs | 9.3 µs |
+| qkv_attend | 13.2 µs | 14.0 µs |
+| gemv_add 512×512 | 11.6 µs | 7.9 µs |
+| **norm_gateup 2×2048×512** | **82.3 µs** | **20-28 µs**（192 GB/s，带宽上限） |
+| silu_down 512×2048 | 29.4 µs | 21.3 µs |
+| 一层步合计 | ~163 µs | **~92 µs** |
+
+**但整帧只从 21.2 → 17.7 ms**（depth 650 dispatch/帧）。这暴露了真正的瓶颈：把 6 个
+kernel 单独测是 92 µs/步，而真实帧里每步要 190 µs——**每个"依赖前一个"的 dispatch 在这张卡上
+约 30 µs**（隔离背靠背只要 5-15 µs）。同一份 kernel 提速 1.6 倍，帧时间几乎不动，就是证据。
+
+**一个反直觉的调参**：`norm_gateup` 的 workgroup 数不是越多越好。同一 kernel：
+
+| 行/workgroup | workgroup 数 | 隔离耗时 | 整帧 depth |
+|---|---|---|---|
+| 64 | 64 | 66.8 µs | 21.2 ms |
+| 8 | 512 | 20.3 µs | **22.2 ms**（更慢！） |
+| 32 | 128 | 28.4 µs | **18.9 ms** |
+
+隔离最快的那档在链里最慢：512 个 workgroup 的**尾巴**拉长了单次 dispatch 的完成时间。
+延迟受限时，网格大小要按"最慢 workgroup 的完成时间"调，不是按带宽利用率调。
+
+**RTF**：0.54 → **0.51**（synthesis 2.33 → 2.20 s；depth 21.2 → 19.1 ms/帧，含 backbone 的
+排空；纯 depth 帧 17.65 ms / 650 dispatch）。所有门全绿（含 31 场景、GPU 逐位复现）。
+
+**下一步的唯一大杠杆**：把整个 codebook 步做成**一个 persistent kernel**——一个
+512 线程的 workgroup（hidden=512，一线程一维）在同一个 dispatch 里跑完 5 层
+（rms/qkv/attend/o/gateup/down 全在 workgroup 内存里接力，KV 留在全局）。dispatch 数从
+650/帧降到 ~45/帧；按当前 30 µs/依赖 dispatch 与 190 GB/s 的权重流（570 MB/帧 = 3 ms）
+估算，depth 可到 **4-6 ms/帧**，RTF 0.51 → **0.30 左右**。代价：一个 ~300 行的 WGSL kernel，
+共享内存预算 ~22 KB（hidden 2 KB + qkv 3 KB + gate_up 16 KB），数值需要重过 31 场景门。
 
 ---
 

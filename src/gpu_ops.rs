@@ -345,6 +345,13 @@ pub fn f_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffe
 }
 
 #[allow(clippy::too_many_arguments)]
+/// rms-norm + GEMV in one dispatch (bf16 weights): rows per workgroup is 32.
+pub fn f_norm_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
+                   w: &Buffer, y: &Buffer, n: usize, kk: usize, eps: f32) {
+    k.run_params(gpu, key, &[n as u32, kk as u32, eps.to_bits()], &[x, norm_w, w, y],
+                 ((n as u32).div_ceil(32).max(1), 1, 1));
+}
+
 pub fn f_qkv_attend(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, qkv: &Buffer,
                     cache_k: &Buffer, cache_v: &Buffer, attended: &Buffer,
                     cos: &Buffer, sin: &Buffer, position: usize, heads: usize,
@@ -362,8 +369,14 @@ pub fn f_gemv_add(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &B
 pub fn f_norm_gateup(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer,
                      norm_w: &Buffer, gate_w: &Buffer, up_w: &Buffer, y: &Buffer,
                      inter: usize, hidden: usize, eps: f32) {
+    // Rows per workgroup is a latency lever here, not a bandwidth one: the depth
+    // decode is a dependent dispatch chain, so a 512-workgroup grid finishes
+    // later than a 128-workgroup one even though it streams faster in isolation.
+    let rows_per_group = std::env::var("M5_GATEUP_ROWS").ok()
+        .and_then(|v| v.parse::<u32>().ok()).unwrap_or(32);
     k.run_params(gpu, key, &[inter as u32, hidden as u32, eps.to_bits()],
-                 &[x, norm_w, gate_w, up_w, y], (((2 * inter) as u32).div_ceil(64).max(1), 1, 1));
+                 &[x, norm_w, gate_w, up_w, y],
+                 (((2 * inter) as u32).div_ceil(rows_per_group).max(1), 1, 1));
 }
 
 pub fn f_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer,
@@ -402,7 +415,7 @@ pub fn norm_gateup_f32(gpu: &Gpu, x: &Buffer, norm_w: &Buffer, gate_w: &Buffer,
     let params = gpu.params_u32(&[inter as u32, hidden as u32, eps.to_bits()]);
     gpu.dispatch_params("norm_gateup_f32", shaders::NORM_GATEUP_F32, "main",
                         &[(0, x), (1, norm_w), (2, gate_w), (3, up_w), (4, y)],
-                        &params, ((2 * inter as u32).div_ceil(64).max(1), 1u32, 1u32));
+                        &params, ((2 * inter as u32).div_ceil(8).max(1), 1u32, 1u32));
 }
 
 /// silu-mul fused into the down projection with the residual add.

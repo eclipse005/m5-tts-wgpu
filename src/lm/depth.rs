@@ -355,10 +355,16 @@ impl Lm {
         hidden = self.llama_norm("decoder", &hidden)?;
 
         let norm_w = self.vector("decoder.norm.weight", HIDDEN)?;
+        let probe = std::env::var_os("M5_DEPTH_PROBE").is_some();
+        let (mut t_head, mut t_sample, mut t_step, mut t_norm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut lap = std::time::Instant::now();
+        if probe { gpu.sync(); eprintln!("    depth prefill+drain {:.2}ms", 0.0); lap = std::time::Instant::now(); }
         let mut position = 2usize;
         for codebook in 1..CODEBOOKS {
             let logits = self.audio_head_logits(&hidden, codebook - 1)?;
+            if probe { gpu.sync(); t_head += lap.elapsed().as_secs_f64(); lap = std::time::Instant::now(); }
             sample(&logits, codebook, true, codebook)?;
+            if probe { gpu.sync(); t_sample += lap.elapsed().as_secs_f64(); lap = std::time::Instant::now(); }
             if codebook + 1 == CODEBOOKS {
                 break;
             }
@@ -372,9 +378,15 @@ impl Lm {
             }
             d.kv.borrow_mut().len = position + 1;
             position += 1;
+            if probe { gpu.sync(); t_step += lap.elapsed().as_secs_f64(); lap = std::time::Instant::now(); }
             gpu_ops::rms_norm(gpu, d.layers[DEPTH_LAYERS - 1].x_out.gpu_buffer()?,
                               norm_w.gpu_buffer()?, d.norm_out.gpu_buffer()?, 1, HIDDEN, 1e-5);
             hidden = d.norm_out.handle([1, HIDDEN])?;
+            if probe { gpu.sync(); t_norm += lap.elapsed().as_secs_f64(); lap = std::time::Instant::now(); }
+        }
+        if probe {
+            eprintln!("    depth head {:.2}ms sample {:.2}ms layers {:.2}ms norm {:.2}ms",
+                      t_head * 1e3, t_sample * 1e3, t_step * 1e3, t_norm * 1e3);
         }
         dev.read_tokens(&tokens)
     }

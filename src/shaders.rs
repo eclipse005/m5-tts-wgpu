@@ -1887,13 +1887,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// paying a barrier round-trip between two kernels.
 pub const NORM_GATEUP_F32: &str = r#"
 // 0=inter 1=hidden 2=eps_bits
-@group(0) @binding(0) var<storage, read> x: array<f32>;      // [hidden]
+@group(0) @binding(0) var<storage, read> x: array<f32>;             // [hidden]
 @group(0) @binding(1) var<storage, read> norm_w: array<f32>;
-@group(0) @binding(2) var<storage, read> gate_w: array<f32>; // [inter, hidden]
-@group(0) @binding(3) var<storage, read> up_w: array<f32>;   // [inter, hidden]
-@group(0) @binding(4) var<storage, read_write> y: array<f32>; // [2*inter]
+@group(0) @binding(2) var<storage, read> gate_w: array<vec4<f32>>;  // [inter * hidden/4]
+@group(0) @binding(3) var<storage, read> up_w: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
 @group(0) @binding(5) var<storage, read> p: array<u32, 3>;
-var<workgroup> normed: array<f32, 512>;
+var<workgroup> normed: array<vec4<f32>, 128>;
 var<workgroup> nred: array<f32, 256>;
 var<workgroup> wred: array<array<f32, 32>, 8>;
 
@@ -1904,7 +1904,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let warp = lid.x / 32u;
     let lane = lid.x % 32u;
 
-    // One norm per 64-row workgroup: 512 loads amortised over 8 warps x 8 rows.
     var sq = 0.0;
     for (var i = lid.x; i < hidden; i = i + 256u) { sq = sq + x[i] * x[i]; }
     nred[lid.x] = sq;
@@ -1916,36 +1915,46 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
     workgroupBarrier();
     let inv = nred[0u];
-    for (var i = lid.x; i < hidden; i = i + 256u) {
-        normed[i] = x[i] * inv * norm_w[i];
+    let quads = hidden / 4u;
+    for (var q = lid.x; q < quads; q = q + 256u) {
+        let i = q * 4u;
+        normed[q] = vec4<f32>(x[i] * inv * norm_w[i],
+                              x[i + 1u] * inv * norm_w[i + 1u],
+                              x[i + 2u] * inv * norm_w[i + 2u],
+                              x[i + 3u] * inv * norm_w[i + 3u]);
     }
     workgroupBarrier();
 
-    // Eight warps x eight rows: warp `w` handles rows wg*64 + w + 8*r.
-    for (var r = 0u; r < 8u; r = r + 1u) {
-        let row = wid.x * 64u + warp + 8u * r;
-        if (row < 2u * inter) {
-            var acc = 0.0;
-            if (row < inter) {
-                let wrow = row * hidden;
-                for (var i = lane; i < hidden; i = i + 32u) {
-                    acc = acc + normed[i] * gate_w[wrow + i];
-                }
-            } else {
-                let wrow = (row - inter) * hidden;
-                for (var i = lane; i < hidden; i = i + 32u) {
-                    acc = acc + normed[i] * up_w[wrow + i];
-                }
-            }
-            wred[warp][lane] = acc;
-            workgroupBarrier();
-            if (lane == 0u) {
-                var sum = 0.0;
-                for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + wred[warp][i]; }
-                y[row] = sum;
-            }
-            workgroupBarrier();
+    // One row per warp: 64 rows per workgroup left the 4096-row projection with
+    // only 64 workgroups, and the staged row was read at an eight-float lane
+    // stride (eight banks in conflict per load).
+    let groups = hidden / 4u;
+    for (var r = 0u; r < 4u; r = r + 1u) {
+    let row = wid.x * 32u + warp + 8u * r;
+    if (row < 2u * inter) {
+        let base = (row % inter) * groups;
+        let use_gate = row < inter;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let wv = select(up_w[base + g], gate_w[base + g], use_gate);
+            let nv = normed[g];
+            a0 = a0 + wv.x * nv.x;
+            a1 = a1 + wv.y * nv.y;
+            a2 = a2 + wv.z * nv.z;
+            a3 = a3 + wv.w * nv.w;
         }
+        wred[warp][lane] = (a0 + a1) + (a2 + a3);
+        workgroupBarrier();
+        if (lane == 0u) {
+            var sum = 0.0;
+            for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
+            y[row] = sum;
+        }
+        workgroupBarrier();
+    }
     }
 }
 "#;
@@ -1955,10 +1964,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// gate/up rows (2048 ops, trivial) so the activation never hits memory.
 pub const SILU_DOWN_F32: &str = r#"
 // 0=inter 1=hidden
-@group(0) @binding(0) var<storage, read> gate_up: array<f32>; // [2*inter]
-@group(0) @binding(1) var<storage, read> down_w: array<f32>;  // [hidden, inter]
+@group(0) @binding(0) var<storage, read> gate_up: array<f32>;       // [2*inter]
+@group(0) @binding(1) var<storage, read> down_w: array<vec4<f32>>;  // [hidden * inter/4]
 @group(0) @binding(2) var<storage, read> x1: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>; // [hidden]
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 2>;
 var<workgroup> red: array<array<f32, 32>, 8>;
 
@@ -1968,24 +1977,37 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let warp = lid.x / 32u;
     let lane = lid.x % 32u;
     let row = wid.x * 8u + warp;
+    let groups = inter / 4u;
     var acc = 0.0;
     if (row < p[1]) {
-        let base = row * inter;
-        var i = lane;
-        loop {
-            if (i >= inter) { break; }
-            let g = gate_up[i];
-            let u = gate_up[inter + i];
-            let act = g / (1.0 + exp(-g)) * u;
-            acc = acc + act * down_w[base + i];
-            i = i + 32u;
+        let base = row * groups;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let i = g * 4u;
+            let g0 = gate_up[i];
+            let g1 = gate_up[i + 1u];
+            let g2 = gate_up[i + 2u];
+            let g3 = gate_up[i + 3u];
+            let s0 = g0 / (1.0 + exp(-g0)) * gate_up[inter + i];
+            let s1 = g1 / (1.0 + exp(-g1)) * gate_up[inter + i + 1u];
+            let s2 = g2 / (1.0 + exp(-g2)) * gate_up[inter + i + 2u];
+            let s3 = g3 / (1.0 + exp(-g3)) * gate_up[inter + i + 3u];
+            let wv = down_w[base + g];
+            a0 = a0 + wv.x * s0;
+            a1 = a1 + wv.y * s1;
+            a2 = a2 + wv.z * s2;
+            a3 = a3 + wv.w * s3;
         }
+        acc = (a0 + a1) + (a2 + a3);
     }
     red[warp][lane] = acc;
     workgroupBarrier();
     if (lane == 0u && row < p[1]) {
         var sum = 0.0;
-        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + red[warp][j]; }
         out[row] = sum + x1[row];
     }
 }
@@ -2303,30 +2325,48 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// GEMV with bf16 weights, params {m, n, k, has_bias}.
 pub const GEMV_BF16_F32: &str = r#"
 // 0=m 1=n 2=k 3=has_bias
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> w: array<u32>;
+//
+// Weights are viewed as `vec4<u32>` (8 bf16 per load) and x as `vec4<f32>`: one
+// 16-byte weight load per 8-element group. The previous form did one 4-byte load
+// per element (two loads per FMA), which held these GEMVs at 50-70 GB/s on a
+// card whose CRAM does ~190; the depth decode streams ~600 MB of weights per
+// frame, so it was the largest remaining cost in the whole run.
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;   // [k/4]
+@group(0) @binding(1) var<storage, read> w: array<vec4<u32>>;   // [n * k/8]
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 4>;
 var<workgroup> red: array<array<f32, 32>, 8>;
+
+// bf16 pair: element 2j is the low half of word j, 2j+1 the high half.
+fn lo(word: u32) -> f32 { return bitcast<f32>((word & 0xFFFFu) << 16u); }
+fn hi(word: u32) -> f32 { return bitcast<f32>(word & 0xFFFF0000u); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let warp = lid.x / 32u;
     let lane = lid.x % 32u;
     let row = wid.x * 8u + warp;
-    let kdim = p[2];
+    let groups = p[2] / 8u;   // one group per 8 elements
     var acc = 0.0;
     if (row < p[1]) {
-        let base = row * (kdim / 2u);
-        var i = lane;
-        loop {
-            if (i >= kdim) { break; }
-            let u = w[base + (i >> 1u)];
-            let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
-            acc = acc + v * x[i];
-            i = i + 32u;
+        let base = row * groups;
+        // Four accumulators over the four words of a group: the same 8 products
+        // per lane, four independent FMA chains instead of one.
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let wv = w[base + g];
+            let xa = x[g * 2u];
+            let xb = x[g * 2u + 1u];
+            a0 = a0 + lo(wv.x) * xa.x + hi(wv.x) * xa.y;
+            a1 = a1 + lo(wv.y) * xa.z + hi(wv.y) * xa.w;
+            a2 = a2 + lo(wv.z) * xb.x + hi(wv.z) * xb.y;
+            a3 = a3 + lo(wv.w) * xb.z + hi(wv.w) * xb.w;
         }
+        acc = (a0 + a1) + (a2 + a3);
     }
     red[warp][lane] = acc;
     workgroupBarrier();
@@ -2339,32 +2379,121 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 "#;
 
+/// RMSNorm fused into the qkv projection (bf16 weights), params {n, k, eps_bits}.
+///
+/// Same trick as `NORM_GATEUP_BF16_F32`: the norm is recomputed per workgroup
+/// (512 loads, 256+256-element reduction, the same order the standalone kernel
+/// uses) instead of costing its own dispatch. In the depth decode every layer
+/// step is a dependent chain of six dispatches, so removing one is worth more
+/// than the arithmetic it duplicates.
+pub const NORM_GEMV_BF16_F32: &str = r#"
+// 0=n 1=k 2=eps_bits
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<u32>>;   // [n * k/8]
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 3>;
+var<workgroup> normed: array<vec4<f32>, 128>;
+var<workgroup> nred: array<f32, 256>;
+var<workgroup> wred: array<array<f32, 32>, 8>;
+
+fn lo(word: u32) -> f32 { return bitcast<f32>((word & 0xFFFFu) << 16u); }
+fn hi(word: u32) -> f32 { return bitcast<f32>(word & 0xFFFF0000u); }
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let k = p[1];
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+
+    var sq = 0.0;
+    for (var i = lid.x; i < k; i = i + 256u) { sq = sq + x[i] * x[i]; }
+    nred[lid.x] = sq;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var sum = 0.0;
+        for (var i = 0u; i < 256u; i = i + 1u) { sum = sum + nred[i]; }
+        nred[0u] = 1.0 / sqrt(sum / f32(k) + bitcast<f32>(p[2]));
+    }
+    workgroupBarrier();
+    let inv = nred[0u];
+    let quads = k / 4u;
+    for (var q = lid.x; q < quads; q = q + 256u) {
+        let i = q * 4u;
+        normed[q] = vec4<f32>(x[i] * inv * norm_w[i],
+                              x[i + 1u] * inv * norm_w[i + 1u],
+                              x[i + 2u] * inv * norm_w[i + 2u],
+                              x[i + 3u] * inv * norm_w[i + 3u]);
+    }
+    workgroupBarrier();
+
+    let groups = k / 8u;
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        let row = wid.x * 32u + warp + 8u * r;
+        if (row < p[0]) {
+            let base = row * groups;
+            var a0 = 0.0;
+            var a1 = 0.0;
+            var a2 = 0.0;
+            var a3 = 0.0;
+            for (var g = lane; g < groups; g = g + 32u) {
+                let wv = w[base + g];
+                let n0 = normed[g * 2u];
+                let n1 = normed[g * 2u + 1u];
+                a0 = a0 + lo(wv.x) * n0.x + hi(wv.x) * n0.y;
+                a1 = a1 + lo(wv.y) * n0.z + hi(wv.y) * n0.w;
+                a2 = a2 + lo(wv.z) * n1.x + hi(wv.z) * n1.y;
+                a3 = a3 + lo(wv.w) * n1.z + hi(wv.w) * n1.w;
+            }
+            wred[warp][lane] = (a0 + a1) + (a2 + a3);
+            workgroupBarrier();
+            if (lane == 0u) {
+                var sum = 0.0;
+                for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
+                y[row] = sum;
+            }
+            workgroupBarrier();
+        }
+    }
+}
+"#;
+
 /// GEMV + residual with bf16 weights, params {n, k}.
 pub const GEMV_ADD_BF16_F32: &str = r#"
 // 0=n 1=k
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;   // [k/4]
+@group(0) @binding(1) var<storage, read> w: array<vec4<u32>>;   // [n * k/8]
 @group(0) @binding(2) var<storage, read> res: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 2>;
 var<workgroup> red: array<array<f32, 32>, 8>;
+
+fn lo(word: u32) -> f32 { return bitcast<f32>((word & 0xFFFFu) << 16u); }
+fn hi(word: u32) -> f32 { return bitcast<f32>(word & 0xFFFF0000u); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let warp = lid.x / 32u;
     let lane = lid.x % 32u;
     let row = wid.x * 8u + warp;
+    let groups = p[1] / 8u;
     var acc = 0.0;
     if (row < p[0]) {
-        let base = row * (p[1] / 2u);
-        var i = lane;
-        loop {
-            if (i >= p[1]) { break; }
-            let u = w[base + (i >> 1u)];
-            let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
-            acc = acc + v * x[i];
-            i = i + 32u;
+        let base = row * groups;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let wv = w[base + g];
+            let xa = x[g * 2u];
+            let xb = x[g * 2u + 1u];
+            a0 = a0 + lo(wv.x) * xa.x + hi(wv.x) * xa.y;
+            a1 = a1 + lo(wv.y) * xa.z + hi(wv.y) * xa.w;
+            a2 = a2 + lo(wv.z) * xb.x + hi(wv.z) * xb.y;
+            a3 = a3 + lo(wv.w) * xb.z + hi(wv.w) * xb.w;
         }
+        acc = (a0 + a1) + (a2 + a3);
     }
     red[warp][lane] = acc;
     workgroupBarrier();
@@ -2381,13 +2510,16 @@ pub const NORM_GATEUP_BF16_F32: &str = r#"
 // 0=inter 1=hidden 2=eps_bits
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> norm_w: array<f32>;
-@group(0) @binding(2) var<storage, read> gate_w: array<u32>;
-@group(0) @binding(3) var<storage, read> up_w: array<u32>;
+@group(0) @binding(2) var<storage, read> gate_w: array<vec4<u32>>;  // [inter * hidden/8]
+@group(0) @binding(3) var<storage, read> up_w: array<vec4<u32>>;
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
 @group(0) @binding(5) var<storage, read> p: array<u32, 3>;
-var<workgroup> normed: array<f32, 512>;
+var<workgroup> normed: array<vec4<f32>, 128>;   // hidden/4, read as 16-byte groups
 var<workgroup> nred: array<f32, 256>;
 var<workgroup> wred: array<array<f32, 32>, 8>;
+
+fn lo(word: u32) -> f32 { return bitcast<f32>((word & 0xFFFFu) << 16u); }
+fn hi(word: u32) -> f32 { return bitcast<f32>(word & 0xFFFF0000u); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -2407,40 +2539,50 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
     workgroupBarrier();
     let inv = nred[0u];
-    for (var i = lid.x; i < hidden; i = i + 256u) {
-        normed[i] = x[i] * inv * norm_w[i];
+    // One thread writes a whole vec4: storing components separately would be a
+    // read-modify-write on the same 16 bytes from four lanes.
+    let quads = hidden / 4u;
+    for (var q = lid.x; q < quads; q = q + 256u) {
+        let i = q * 4u;
+        normed[q] = vec4<f32>(x[i] * inv * norm_w[i],
+                              x[i + 1u] * inv * norm_w[i + 1u],
+                              x[i + 2u] * inv * norm_w[i + 2u],
+                              x[i + 3u] * inv * norm_w[i + 3u]);
     }
     workgroupBarrier();
 
-    let half = hidden / 2u;
-    for (var r = 0u; r < 8u; r = r + 1u) {
-        let row = wid.x * 64u + warp + 8u * r;
-        if (row < 2u * inter) {
-            var acc = 0.0;
-            if (row < inter) {
-                let wrow = row * half;
-                for (var i = lane; i < hidden; i = i + 32u) {
-                    let u = gate_w[wrow + (i >> 1u)];
-                    let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
-                    acc = acc + normed[i] * v;
-                }
-            } else {
-                let wrow = (row - inter) * half;
-                for (var i = lane; i < hidden; i = i + 32u) {
-                    let u = up_w[wrow + (i >> 1u)];
-                    let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
-                    acc = acc + normed[i] * v;
-                }
-            }
-            wred[warp][lane] = acc;
-            workgroupBarrier();
-            if (lane == 0u) {
-                var sum = 0.0;
-                for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
-                y[row] = sum;
-            }
-            workgroupBarrier();
+    // One row per warp (8 rows per workgroup): with 64 rows per group the kernel
+    // only had 64 workgroups for 4096 rows, i.e. 3.2 per SM, and the staged
+    // normalised row was read as 8 scalars per group at an 8-float lane stride -
+    // eight banks fighting per load. Now 512 workgroups, 16-byte reads.
+    let groups = hidden / 8u;
+    for (var r = 0u; r < 4u; r = r + 1u) {
+    let row = wid.x * 32u + warp + 8u * r;
+    if (row < 2u * inter) {
+        let base = (row % inter) * groups;
+        let use_gate = row < inter;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let wv = select(up_w[base + g], gate_w[base + g], use_gate);
+            let n0 = normed[g * 2u];
+            let n1 = normed[g * 2u + 1u];
+            a0 = a0 + lo(wv.x) * n0.x + hi(wv.x) * n0.y;
+            a1 = a1 + lo(wv.y) * n0.z + hi(wv.y) * n0.w;
+            a2 = a2 + lo(wv.z) * n1.x + hi(wv.z) * n1.y;
+            a3 = a3 + lo(wv.w) * n1.z + hi(wv.w) * n1.w;
         }
+        wred[warp][lane] = (a0 + a1) + (a2 + a3);
+        workgroupBarrier();
+        if (lane == 0u) {
+            var sum = 0.0;
+            for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
+            y[row] = sum;
+        }
+        workgroupBarrier();
+    }
     }
 }
 "#;
@@ -2449,11 +2591,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 pub const SILU_DOWN_BF16_F32: &str = r#"
 // 0=inter 1=hidden
 @group(0) @binding(0) var<storage, read> gate_up: array<f32>;
-@group(0) @binding(1) var<storage, read> down_w: array<u32>;
+@group(0) @binding(1) var<storage, read> down_w: array<vec4<u32>>;   // [hidden * inter/8]
 @group(0) @binding(2) var<storage, read> x1: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<storage, read> p: array<u32, 2>;
 var<workgroup> red: array<array<f32, 32>, 8>;
+
+fn lo(word: u32) -> f32 { return bitcast<f32>((word & 0xFFFFu) << 16u); }
+fn hi(word: u32) -> f32 { return bitcast<f32>(word & 0xFFFF0000u); }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -2461,20 +2606,47 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let warp = lid.x / 32u;
     let lane = lid.x % 32u;
     let row = wid.x * 8u + warp;
+    let groups = inter / 8u;
     var acc = 0.0;
     if (row < p[1]) {
-        let base = row * (inter / 2u);
-        var i = lane;
-        loop {
-            if (i >= inter) { break; }
-            let g = gate_up[i];
-            let u = gate_up[inter + i];
-            let act = g / (1.0 + exp(-g)) * u;
-            let wu = down_w[base + (i >> 1u)];
-            let v = select(bitcast<f32>(wu & 0xFFFF0000u), bitcast<f32>((wu & 0xFFFFu) << 16u), (i & 1u) == 0u);
-            acc = acc + act * v;
-            i = i + 32u;
+        let base = row * groups;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        var a2 = 0.0;
+        var a3 = 0.0;
+        for (var g = lane; g < groups; g = g + 32u) {
+            let i = g * 8u;
+            let wv = down_w[base + g];
+            let g0 = gate_up[i];
+            let g1 = gate_up[i + 1u];
+            let g2 = gate_up[i + 2u];
+            let g3 = gate_up[i + 3u];
+            let g4 = gate_up[i + 4u];
+            let g5 = gate_up[i + 5u];
+            let g6 = gate_up[i + 6u];
+            let g7 = gate_up[i + 7u];
+            let u0 = gate_up[inter + i];
+            let u1 = gate_up[inter + i + 1u];
+            let u2 = gate_up[inter + i + 2u];
+            let u3 = gate_up[inter + i + 3u];
+            let u4 = gate_up[inter + i + 4u];
+            let u5 = gate_up[inter + i + 5u];
+            let u6 = gate_up[inter + i + 6u];
+            let u7 = gate_up[inter + i + 7u];
+            let s0 = g0 / (1.0 + exp(-g0)) * u0;
+            let s1 = g1 / (1.0 + exp(-g1)) * u1;
+            let s2 = g2 / (1.0 + exp(-g2)) * u2;
+            let s3 = g3 / (1.0 + exp(-g3)) * u3;
+            let s4 = g4 / (1.0 + exp(-g4)) * u4;
+            let s5 = g5 / (1.0 + exp(-g5)) * u5;
+            let s6 = g6 / (1.0 + exp(-g6)) * u6;
+            let s7 = g7 / (1.0 + exp(-g7)) * u7;
+            a0 = a0 + lo(wv.x) * s0 + hi(wv.x) * s1;
+            a1 = a1 + lo(wv.y) * s2 + hi(wv.y) * s3;
+            a2 = a2 + lo(wv.z) * s4 + hi(wv.z) * s5;
+            a3 = a3 + lo(wv.w) * s6 + hi(wv.w) * s7;
         }
+        acc = (a0 + a1) + (a2 + a3);
     }
     red[warp][lane] = acc;
     workgroupBarrier();
