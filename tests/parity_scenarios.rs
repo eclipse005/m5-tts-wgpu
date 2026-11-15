@@ -150,7 +150,14 @@ fn scenarios_match_reference() -> Result<()> {
             }
             let pipeline = &resident[&key];
             let mut source = RecordedNoise::new(noise.clone());
-            let out = pipeline.synthesize(&args, &mut source as &mut dyn NoiseSource)?;
+            let out = match pipeline.synthesize(&args, &mut source as &mut dyn NoiseSource) {
+                Ok(out) => out,
+                Err(err) => {
+                    // One scenario failing must not hide the other thirty.
+                    failures.push(format!("{name}/{spec}: {err:#}"));
+                    continue;
+                }
+            };
 
             // Same input, same noise, same process -> the same bytes. Run with
             // M5_SCENARIO_REPEAT=1: a kernel that reads memory it never wrote

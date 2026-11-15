@@ -31,6 +31,10 @@ PROMPT_WAV = r"D:\M5-TTS\assets\aslp_default_voice.wav"
 # rate (`torchaudio.functional.resample`), which the port carries as
 # `audio::resample`. Real reference audio is usually 44.1/48 kHz.
 PROMPT_WAV_44K = r"D:\M5-TTS\assets\aslp_default_voice_44k.wav"
+# 13.4 s and stereo copies: `prepare_prompt` branches on recording length (>10 s
+# takes a 0.02 silence threshold instead of 0.015) and averages the channels.
+PROMPT_WAV_LONG = r"D:\M5-TTS\assets\aslp_default_voice_long10s.wav"
+PROMPT_WAV_STEREO = r"D:\M5-TTS\assets\aslp_default_voice_stereo.wav"
 PROMPT_TEXT = "猪携带该疾病，然后通过蚊子传染给人类。"
 
 # A bedtime script: 571 characters, 498 text tokens, ~90 s of speech. The
@@ -99,11 +103,31 @@ def scenarios():
         "clone_temp05": s(temperature=0.5, text="你好，今天天气很好。"),
         # --- long text: 498 tokens and ~90 s, i.e. positions well past 1024 ---
         "clone_zh_verylong": s(text=LONG_TEXT, max_audio_length_ms=90000),
+        # --- reference-audio shapes and the app's text-length boundary ---
+        "clone_prompt_long10s": s(prompt_wav=PROMPT_WAV_LONG, text="你好，今天天气很好。"),
+        "clone_prompt_stereo": s(prompt_wav=PROMPT_WAV_STEREO, text="你好，今天天气很好。"),
+        "clone_text_tiny": s(text="好。"),
+        "clone_text_250": s(text=(
+            "夜深了，城市的灯一盏一盏慢慢安静下来，你也终于有了一点属于自己的时间。"
+            "或许今天并不轻松，可能有些事情没有按照期待发展，也可能只是单纯地感到疲惫。"
+            "但没关系，现在这一刻，你不需要证明什么，也不需要赶着去完成什么，"
+            "只需要好好待在这里，和自己待一会儿，让呼吸慢下来。")),
+        "clone_text_nopunct": s(text="今天天气很好我们出去走走吧"),
+        # --- conditioning combinations and sampler extremes ---
+        "clone_caption_accent": s(accent="chuan", caption="用开心的语气说",
+                                  text="你好，今天天气很好。"),
+        "clone_temp01": s(temperature=0.1, text="你好，今天天气很好。"),
+        "clone_temp15": s(temperature=1.5, text="你好，今天天气很好。"),
+        "clone_topk7": s(topk=7, text="你好，今天天气很好。"),
         # --- preset voices (CustomVoice checkpoint) ---
         "preset_1_zh": s(kind="preset", speaker_id=1, text="你好，今天的天气很好。"),
         "preset_2_zh": s(kind="preset", speaker_id=2, text="你好，今天的天气很好。"),
         "preset_1_en": s(kind="preset", speaker_id=1, lang="English",
                          text="Hello, the weather is nice today."),
+        "preset_3_zh": s(kind="preset", speaker_id=3, text="你好，今天的天气很好。"),
+        "preset_4_zh": s(kind="preset", speaker_id=4, text="你好，今天的天气很好。"),
+        "preset_1_ja": s(kind="preset", speaker_id=1, lang="Japanese",
+                         text="こんにちは、今日はいい天気ですね。"),
     }
 
 
@@ -111,6 +135,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default=r"D:\m5-tts-wgpu\goldens\scenarios")
     parser.add_argument("--only", default=None, help="substring filter on scenario names")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="keep scenarios already dumped (the reference run is minutes each)")
     args = parser.parse_args()
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -160,6 +186,8 @@ def main():
     todo = scenarios()
     if args.only:
         todo = {k: v for k, v in todo.items() if args.only in k}
+    if args.skip_existing:
+        todo = {k: v for k, v in todo.items() if not (out_root / k / "meta.json").is_file()}
 
     summary = []
     for name, spec in todo.items():

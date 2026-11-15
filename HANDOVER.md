@@ -787,6 +787,44 @@ rope 全表、两个 kernel 的 score 暂存、`synthesize` 的越界检查全�
 
 ---
 
+## 6.13 覆盖率审计（2026-11 第六轮）：31 个场景，30 个逐 code 对齐
+
+按官方 `M5TTS.infer` 的参数空间铺开（`scripts/dump_scenarios.py` 的 31 个场景，每个都录
+参考自己的采样噪声回放）：
+
+| 维度 | 覆盖 | 结果 |
+|---|---|---|
+| 模型包 | VoiceClone（克隆）、CustomVoice（预设音色） | 0 mismatch |
+| 语言 | 中/英/日/德/法/韩 | 0 mismatch |
+| 口音 | 无 / chuan / yue | 0 mismatch |
+| caption | 有 / 无 / caption+accent 同时 | 0 mismatch |
+| speaker id | 1 / 2 / 3 / 4 | 0 mismatch |
+| temperature | 0.1 / 0.5 / 0.9 / 1.5 | 0 mismatch |
+| top-k | 1 / 7 / 10 / 50 | 0 mismatch |
+| 文本长度 | 1 字（8 帧）、常规、**250 字（app 上限，284 帧）**、无标点、571 字（1125 帧） | 0 mismatch |
+| 音频时长 | 0.54 s → **89.90 s** | 0 mismatch |
+| 参考音频 | 24 kHz 3.4 s、**44.1 kHz**、**立体声**、**13.36 s（>10 s，触发 0.02 静音阈值）** | 前三者 0 mismatch，**13.36 s 不过** |
+| 生成预算 | 1.6 s / 40 s / 90 s（含"跑满不出 EOS"的截断场景） | 0 mismatch |
+
+**唯一没对齐的一项**：13.36 s 的参考录音（`clone_prompt_long10s`）。
+
+* `prepare_prompt` 对它**逐样本相同**（242326 样本，max|diff| = 0），所以不是前端问题；
+* 但**编码器的 prompt codes 在最后约 2 帧（共 127 帧）不同**：第二末帧差 1 个 code，
+  末帧 16 个全差 → 17/2032。这 2 帧的 latent 被尾部 padding 主导，落在 codebook 决策边界上，
+  我们编码器的 f32 累加顺序差（≤2e-4，`parity_codec` 的门限）足以翻掉。
+* 后果：prompt codes 变了 → LM 从头分叉 → 该场景跑到噪声用尽。
+* 已验证与"是否 hop 整数倍"无关：4.3 s 那支 82211 样本（也非整数倍）逐 code 全同；
+  给 242326 样本尾巴补 1920 个零，仍只有第 125~127 帧不同。
+* **定位方向**：像 `dump_acoustic.py` 对解码器那样，给**编码器**做逐阶段 dump
+  （seanet → transformer → downsample → latent），确认第 125 帧之前是否已经分叉；
+  若 latent 已分叉，就要查 HF `MimiConv1d` 的 per-layer `extra_padding` /
+  `pad_mode` 在尾部的处理（`replicate` 的右端、`ceil(...)-1` 的帧长公式）。
+
+其余 30 个场景：**codes 逐值相同，PCM SNR 103-116 dB**，且 GPU 侧在
+`M5_SCENARIO_REPEAT=1`（同进程跑两遍要求逐位相同）下全过。
+
+---
+
 ## 7. 优化建议（**仅供参考**，按性价比排序）
 
 1. **大权重首次上传**（6.8⑦）：codec 一次 run 传 ~457 MB、encoder ~225 MB，实测在真流程里只有
