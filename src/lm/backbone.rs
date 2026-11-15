@@ -9,15 +9,30 @@ use anyhow::{bail, Result};
 
 use super::*;
 use crate::cpu_ops;
+use crate::gpu::WgpuBuffer as Buffer;
 use crate::ops;
 
 /// Per-layer KV cache, already expanded to `heads` (GQA is resolved on write, so
 /// decode does not re-expand 360 rows every frame).
+/// Per-layer resident bf16 weights for the depth decode GEMVs, packed
+/// 2-per-u32 exactly as the checkpoint stores them (little-endian bf16 pairs).
+pub struct DepthBf16Weights {
+    pub q: Buffer,
+    pub k: Buffer,
+    pub v: Buffer,
+    pub o: Buffer,
+    pub gate: Buffer,
+    pub up: Buffer,
+    pub down: Buffer,
+}
+
 /// Arena kernels + persistent per-layer scratch for the GPU depth pass
 /// (ming qwen_lm.rs pattern: stable buffer sets, cached bind groups, params
 /// through the uniform arena).
 pub struct DepthGpu {
     pub kernels: DepthGpuKernels,
+    /// Per-layer resident bf16 weights (None for f32 checkpoints).
+    pub bf16: Option<Vec<DepthBf16Weights>>,
     pub layers: Vec<RefCell<DepthLayerGpuScratch>>,
     /// Double-buffered: step k's logits read one, step k's final norm writes
     /// the other - a same-pass read->write on one buffer is a wgpu hazard.
@@ -37,6 +52,7 @@ pub struct DepthGpu {
 pub struct DepthGpuKernels {
     pub rms: crate::gpu::Kernel,
     pub gemv: crate::gpu::Kernel,
+    pub gemv_bf16: crate::gpu::Kernel,
     pub rope: crate::gpu::Kernel,
     pub repeat_kv: crate::gpu::Kernel,
     pub write_rows: crate::gpu::Kernel,
@@ -87,6 +103,52 @@ fn q_rows() -> usize {
     HEADS * HEAD_DIM
 }
 
+/// Persistent scratch for one fused arena depth layer: the six intermediates of
+/// the 6-dispatch fused step, allocated once and reused every codebook step so
+/// the arena bind groups stay valid for the whole run.
+pub struct DepthFusedScratch {
+    pub x_in: Tensor,      // layer-0 input (projected embedding)
+    pub normed: Tensor,
+    pub qkv: Tensor,
+    pub attended: Tensor,
+    pub x1: Tensor,
+    pub gate_up: Tensor,
+    pub x_out: Tensor,
+}
+
+/// Fused arena depth pass: 6 dispatches per layer through cached bind groups and
+/// the uniform arena (ming nn.rs pattern), persistent per-layer scratch and a
+/// persistent KV cache. No per-layer sync: wgpu compute passes scope usage per
+/// dispatch, so the residual chain stays inside one batch.
+/// Per-layer resident bf16 weights, packed 2-per-u32 (little-endian pairs), for
+/// the fused depth GEMVs: half the weight traffic, bit-identical f32 accumulate.
+pub struct DepthBf16W {
+    pub qkv: Buffer,
+    pub o: Buffer,
+    pub gate: Buffer,
+    pub up: Buffer,
+    pub down: Buffer,
+}
+
+pub struct DepthFusedGpu {
+    pub rms: crate::gpu::Kernel,
+    pub gemv: crate::gpu::Kernel,
+    pub qkv_attend: crate::gpu::Kernel,
+    pub gemv_add: crate::gpu::Kernel,
+    pub norm_gateup: crate::gpu::Kernel,
+    pub silu_down: crate::gpu::Kernel,
+    pub gemv_bf16: crate::gpu::Kernel,
+    pub gemv_add_bf16: crate::gpu::Kernel,
+    pub norm_gateup_bf16: crate::gpu::Kernel,
+    pub silu_down_bf16: crate::gpu::Kernel,
+    /// Packed bf16 weights per layer (None for f32 checkpoints).
+    pub bf16: Option<Vec<DepthBf16W>>,
+    pub layers: Vec<DepthFusedScratch>,
+    pub kv: RefCell<KvCache>,
+    pub norm_out: Tensor,
+    pub zero1: Tensor,
+}
+
 /// Fixed decode-step scratch buffers for the fused GPU layer (see
 /// `llama_layer_gpu_fused_step`): allocated once, reused every layer step.
 pub struct GpuLayerScratch {
@@ -99,8 +161,8 @@ pub struct GpuLayerScratch {
 }
 
 pub struct KvCache {
-    k: Vec<Tensor>,
-    v: Vec<Tensor>,
+    pub(crate) k: Vec<Tensor>,
+    pub(crate) v: Vec<Tensor>,
     pub len: usize,
     pub capacity: usize,
 }
@@ -112,6 +174,28 @@ impl KvCache {
         for _ in 0..layers {
             k.push(dev.zeros([capacity, HEADS * HEAD_DIM])?);
             v.push(dev.zeros([capacity, HEADS * HEAD_DIM])?);
+        }
+        Ok(Self { k, v, len: 0, capacity })
+    }
+
+    /// KV cache in FRESH (non-pooled) buffers, for the persistent depth cache:
+    /// its buffers are bound by cached arena bind groups and must never be
+    /// recycled into another tensor mid-run.
+    pub fn new_fresh(dev: &Device, layers: usize, capacity: usize) -> Result<Self> {
+        let gpu = dev.gpu()?;
+        let rc = match dev {
+            Device::Gpu(g) => Rc::clone(g),
+            _ => unreachable!("fresh KV cache is GPU-only"),
+        };
+        let mut k = Vec::with_capacity(layers);
+        let mut v = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            for slot in [&mut k, &mut v] {
+                let raw = gpu.empty("depth-kv", capacity * HEADS * HEAD_DIM);
+                slot.push(Tensor::Gpu(crate::device::GpuBuffer {
+                    raw, gpu: Rc::clone(&rc), owned: false,
+                }, [capacity, HEADS * HEAD_DIM]));
+            }
         }
         Ok(Self { k, v, len: 0, capacity })
     }
@@ -606,9 +690,10 @@ impl Lm {
         crate::gpu_ops::silu_down_f32(gpu, gate_up.gpu_buffer()?, down_w.gpu_buffer()?,
                                x1.gpu_buffer()?, x_out.gpu_buffer()?,
                                INTERMEDIATE, HIDDEN);
-        // the residual chain (x_out RW -> next layer's RO -> RW) trips wgpu's
-        // exclusive read_write rule within a pass: end the pass per layer
-        gpu.sync();
+        // No per-layer sync: wgpu compute passes give each dispatch its own
+        // usage scope (wgpu-core command/compute.rs), so x_out written here and
+        // read by the next layer's norm is legal inside one pass - ming's DiT
+        // does the same RW->RO->RW on shared scratch in a 120-dispatch pass.
         lap("down", &mut tick);
         // A fresh handle over the pooled scratch buffer (the scratch outlives
         // the returned tensor, and the next layer's K4 overwrites it anyway).
@@ -625,6 +710,7 @@ impl Lm {
         let kernels = DepthGpuKernels {
             rms: gpu.kernel_params("d.rms", crate::shaders::RMS_NORM_F32, "ro,ro,rw"),
             gemv: gpu.kernel_params("d.gemv", crate::shaders::GEMV_F32, "ro,ro,ro,rw"),
+            gemv_bf16: gpu.kernel_params("d.gemv_bf16", crate::shaders::GEMV_BF16W_M5, "ro,ro,rw"),
             rope: gpu.kernel_params("d.rope", crate::shaders::ROPE_TABLED_F32, "rw,ro,ro"),
             repeat_kv: gpu.kernel_params("d.repeat_kv", crate::shaders::REPEAT_KV_F32, "ro,rw"),
             write_rows: gpu.kernel_params("d.write_rows", crate::shaders::WRITE_ROWS_F32, "rw,ro"),
@@ -651,6 +737,26 @@ impl Lm {
                 owned: false,
             }, [1, len])
         };
+        let bf16 = (|| -> Option<Vec<DepthBf16Weights>> {
+            let mut sets = Vec::with_capacity(DEPTH_LAYERS);
+            for index in 0..DEPTH_LAYERS {
+                let p = format!("decoder.layers.{index}");
+                let mut pack = |name: String| -> Option<Buffer> {
+                    let bytes = self.bf16_bytes(&name)?;
+                    Some(gpu.upload("depth-bf16-w", bytemuck::cast_slice(&bytes)))
+                };
+                sets.push(DepthBf16Weights {
+                    q: pack(format!("{p}.self_attn.q_proj.weight"))?,
+                    k: pack(format!("{p}.self_attn.k_proj.weight"))?,
+                    v: pack(format!("{p}.self_attn.v_proj.weight"))?,
+                    o: pack(format!("{p}.self_attn.o_proj.weight"))?,
+                    gate: pack(format!("{p}.mlp.gate_proj.weight"))?,
+                    up: pack(format!("{p}.mlp.up_proj.weight"))?,
+                    down: pack(format!("{p}.mlp.down_proj.weight"))?,
+                });
+            }
+            Some(sets)
+        })();
         let mut layers = Vec::with_capacity(DEPTH_LAYERS);
         for _ in 0..DEPTH_LAYERS {
             layers.push(RefCell::new(DepthLayerGpuScratch {
@@ -677,6 +783,7 @@ impl Lm {
         let logits_ring = (0..4).map(|_| fresh(AUDIO_VOCAB)).collect::<Vec<_>>();
         let d = std::rc::Rc::new(DepthGpu {
             kernels,
+            bf16,
             layers,
             norm_out,
             norm_flip: std::cell::Cell::new(false),
@@ -717,15 +824,39 @@ impl Lm {
         let q_w = self.tensor(&format!("{p}.self_attn.q_proj.weight"), [q_dim, HIDDEN])?;
         let k_w = self.tensor(&format!("{p}.self_attn.k_proj.weight"), [kv_dim, HIDDEN])?;
         let v_w = self.tensor(&format!("{p}.self_attn.v_proj.weight"), [kv_dim, HIDDEN])?;
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 1, s.normed.gpu_buffer()?,
-                               q_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.q.gpu_buffer()?, q_dim, HIDDEN);
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 2, s.normed.gpu_buffer()?,
-                               k_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.k.gpu_buffer()?, kv_dim, HIDDEN);
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 3, s.normed.gpu_buffer()?,
-                               v_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.v.gpu_buffer()?, kv_dim, HIDDEN);
+        // The GEMVs: resident bf16 weights (half the traffic, bit-identical f32
+        // accumulate) when the checkpoint stores bf16, f32 otherwise. The slot
+        // selector maps to the packed-weight set: 1=q 2=k 3=v 4=o 6=gate 7=up 0=down.
+        let wsets = d.bf16.as_ref();
+        let gemv = |slot: u64, x: &Buffer, w_f32: &Tensor, out: &Buffer,
+                    rows: usize| -> Result<()> {
+            match wsets {
+                Some(sets) => {
+                    let wb = &sets[index];
+                    let w = match slot & 7 {
+                        1 => &wb.q,
+                        2 => &wb.k,
+                        3 => &wb.v,
+                        4 => &wb.o,
+                        6 => &wb.gate,
+                        7 => &wb.up,
+                        _ => &wb.down,
+                    };
+                    crate::gpu_ops::a_gemv_bf16w(&d.kernels.gemv_bf16, gpu, key | slot, x,
+                                                 w, out, rows, HIDDEN);
+                    Ok(())
+                }
+                None => {
+                    crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | slot, x,
+                                           w_f32.gpu_buffer()?,
+                                           d.kernels.zero1.gpu_buffer()?, out, rows, HIDDEN);
+                    Ok(())
+                }
+            }
+        };
+        gemv(1, s.normed.gpu_buffer()?, &q_w, s.q.gpu_buffer()?, q_dim)?;
+        gemv(2, s.normed.gpu_buffer()?, &k_w, s.k.gpu_buffer()?, kv_dim)?;
+        gemv(3, s.normed.gpu_buffer()?, &v_w, s.v.gpu_buffer()?, kv_dim)?;
         let (cos_t, sin_t) = self.gpu_rope_tables()?;
         crate::gpu_ops::a_rope(&d.kernels.rope, gpu, key | 4, s.q.gpu_buffer()?,
                                cos_t.gpu_buffer()?, sin_t.gpu_buffer()?, 1, HEADS, HEAD_DIM);
@@ -749,9 +880,7 @@ impl Lm {
                                                position + 1, HEADS, HEAD_DIM);
         }
         let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 11, s.attended.gpu_buffer()?,
-                               o_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.projected.gpu_buffer()?, HIDDEN, q_dim);
+        gemv(4, s.attended.gpu_buffer()?, &o_w, s.projected.gpu_buffer()?, HIDDEN)?;
         crate::gpu_ops::a_add(&d.kernels.add, gpu, key | 12, input.gpu_buffer()?,
                               s.projected.gpu_buffer()?, s.x1.gpu_buffer()?, HIDDEN);
         let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
@@ -760,20 +889,165 @@ impl Lm {
                               1, HIDDEN, 1e-5);
         let gate_w = self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
         let up_w = self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 14, s.normed2.gpu_buffer()?,
-                               gate_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.gate.gpu_buffer()?, INTERMEDIATE, HIDDEN);
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 15, s.normed2.gpu_buffer()?,
-                               up_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.up.gpu_buffer()?, INTERMEDIATE, HIDDEN);
+        gemv(6, s.normed2.gpu_buffer()?, &gate_w, s.gate.gpu_buffer()?, INTERMEDIATE)?;
+        gemv(7, s.normed2.gpu_buffer()?, &up_w, s.up.gpu_buffer()?, INTERMEDIATE)?;
         crate::gpu_ops::a_silu_mul(&d.kernels.silu_mul, gpu, key | 16, s.gate.gpu_buffer()?,
                                    s.up.gpu_buffer()?, s.act.gpu_buffer()?, INTERMEDIATE);
         let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
-        crate::gpu_ops::a_gemv(&d.kernels.gemv, gpu, key | 17, s.act.gpu_buffer()?,
-                               down_w.gpu_buffer()?, d.kernels.zero1.gpu_buffer()?,
-                               s.mlp.gpu_buffer()?, HIDDEN, INTERMEDIATE);
+        gemv(0, s.act.gpu_buffer()?, &down_w, s.mlp.gpu_buffer()?, HIDDEN)?;
         crate::gpu_ops::a_add(&d.kernels.add, gpu, key | 18, s.x1.gpu_buffer()?,
                               s.mlp.gpu_buffer()?, s.x_out.gpu_buffer()?, HIDDEN);
+        Ok(())
+    }
+
+    /// Fused arena depth state (lazy): 6 arena kernels, persistent per-layer
+    /// scratch, a persistent fresh KV cache. Bind groups cache per (layer, op)
+    /// because every buffer they reference lives for the whole run.
+    pub fn depth_fused_gpu(&self) -> Result<Rc<DepthFusedGpu>> {
+        if let Some(d) = self.depth_fused.borrow().as_ref() {
+            return Ok(Rc::clone(d));
+        }
+        let dev = self.device();
+        let gpu = dev.gpu()?;
+        let rc = match dev {
+            Device::Gpu(g) => Rc::clone(g),
+            _ => unreachable!("fused arena depth is GPU-only"),
+        };
+        let fresh = |len: usize| -> Tensor {
+            let raw = gpu.empty("depth-fused", len);
+            Tensor::Gpu(crate::device::GpuBuffer {
+                raw, gpu: Rc::clone(&rc), owned: false,
+            }, [1, len])
+        };
+        let q_dim = HEADS * HEAD_DIM;
+        let mut layers = Vec::with_capacity(DEPTH_LAYERS);
+        for _ in 0..DEPTH_LAYERS {
+            layers.push(DepthFusedScratch {
+                x_in: fresh(HIDDEN),
+                normed: fresh(HIDDEN),
+                qkv: fresh(q_dim + 2 * KV_HEADS * HEAD_DIM),
+                attended: fresh(q_dim),
+                x1: fresh(HIDDEN),
+                gate_up: fresh(2 * INTERMEDIATE),
+                x_out: fresh(HIDDEN),
+            });
+        }
+        // Pre-build the concatenated qkv weights (a host readback each) now, so
+        // none lands in the middle of a recorded depth frame later.
+        for index in 0..DEPTH_LAYERS {
+            self.qkv_weight("decoder", index)?;
+        }
+        // Resident packed bf16 weights (VoiceClone). None for f32 checkpoints.
+        let bf16 = (|| -> Option<Vec<DepthBf16W>> {
+            let pack = |bytes: &[u8]| -> Buffer {
+                gpu.upload("depth-bf16-w", bytemuck::cast_slice::<u8, f32>(bytes))
+            };
+            let mut sets = Vec::with_capacity(DEPTH_LAYERS);
+            for index in 0..DEPTH_LAYERS {
+                let p = format!("decoder.layers.{index}");
+                let qkv = self.qkv_bf16("decoder", index)?;
+                sets.push(DepthBf16W {
+                    qkv: pack(&qkv),
+                    o: pack(&self.bf16_bytes(&format!("{p}.self_attn.o_proj.weight"))?),
+                    gate: pack(&self.bf16_bytes(&format!("{p}.mlp.gate_proj.weight"))?),
+                    up: pack(&self.bf16_bytes(&format!("{p}.mlp.up_proj.weight"))?),
+                    down: pack(&self.bf16_bytes(&format!("{p}.mlp.down_proj.weight"))?),
+                });
+            }
+            Some(sets)
+        })();
+        let d = Rc::new(DepthFusedGpu {
+            rms: gpu.kernel_params("f.rms", crate::shaders::RMS_NORM_F32, "ro,ro,rw"),
+            gemv: gpu.kernel_params("f.gemv", crate::shaders::GEMV_F32, "ro,ro,ro,rw"),
+            qkv_attend: gpu.kernel_params("f.qkv_attend", crate::shaders::QKV_ATTEND_F32,
+                                          "ro,rw,rw,rw,ro,ro"),
+            gemv_add: gpu.kernel_params("f.gemv_add", crate::shaders::GEMV_ADD_F32, "ro,ro,ro,rw"),
+            norm_gateup: gpu.kernel_params("f.norm_gateup", crate::shaders::NORM_GATEUP_F32,
+                                           "ro,ro,ro,ro,rw"),
+            silu_down: gpu.kernel_params("f.silu_down", crate::shaders::SILU_DOWN_F32, "ro,ro,ro,rw"),
+            gemv_bf16: gpu.kernel_params("fb.gemv", crate::shaders::GEMV_BF16_F32, "ro,ro,ro,rw"),
+            gemv_add_bf16: gpu.kernel_params("fb.gemv_add", crate::shaders::GEMV_ADD_BF16_F32, "ro,ro,ro,rw"),
+            norm_gateup_bf16: gpu.kernel_params("fb.norm_gateup", crate::shaders::NORM_GATEUP_BF16_F32,
+                                                "ro,ro,ro,ro,rw"),
+            silu_down_bf16: gpu.kernel_params("fb.silu_down", crate::shaders::SILU_DOWN_BF16_F32, "ro,ro,ro,rw"),
+            bf16,
+            layers,
+            kv: RefCell::new(KvCache::new_fresh(dev, DEPTH_LAYERS, CODEBOOKS + 2)?),
+            norm_out: fresh(HIDDEN),
+            zero1: dev.tensor([1, 1], &[0.0])?,
+        });
+        *self.depth_fused.borrow_mut() = Some(Rc::clone(&d));
+        Ok(d)
+    }
+
+    /// One fused depth layer step (6 dispatches) on cached-bind-group kernels.
+    /// The input is layer 0's `x_in` or the previous layer's `x_out`; the output
+    /// is this layer's `x_out`. `step` (the codebook index) makes each dispatch's
+    /// cache key unique within the open batch, so its per-key params buffer is
+    /// never overwritten before the batch executes. No sync: wgpu compute passes
+    /// scope usage per dispatch, so the residual chain stays inside one batch.
+    pub fn llama_layer_depth_fused(&self, index: usize, position: usize, step: usize,
+                                   d: &DepthFusedGpu) -> Result<()> {
+        let gpu = self.device().gpu()?;
+        let s = &d.layers[index];
+        let p = format!("decoder.layers.{index}");
+        let q_dim = HEADS * HEAD_DIM;
+        let kv_dim = KV_HEADS * HEAD_DIM;
+        let key = ((index as u64) << 16) | ((step as u64) << 8);
+        let input = if index == 0 { &s.x_in } else { &d.layers[index - 1].x_out };
+
+        let input_norm = self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+        crate::gpu_ops::f_rms(&d.rms, gpu, key, input.gpu_buffer()?,
+                              input_norm.gpu_buffer()?, s.normed.gpu_buffer()?, 1, HIDDEN, 1e-5);
+        let (cos_t, sin_t) = self.gpu_rope_tables()?;
+        let post_norm = self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+        if let Some(sets) = &d.bf16 {
+            let w = &sets[index];
+            crate::gpu_ops::f_gemv(&d.gemv_bf16, gpu, key | 1, s.normed.gpu_buffer()?,
+                                   &w.qkv, d.zero1.gpu_buffer()?, s.qkv.gpu_buffer()?,
+                                   q_dim + 2 * kv_dim, HIDDEN);
+            {
+                let kv = d.kv.borrow();
+                crate::gpu_ops::f_qkv_attend(&d.qkv_attend, gpu, key | 2, s.qkv.gpu_buffer()?,
+                                             kv.k[index].gpu_buffer()?, kv.v[index].gpu_buffer()?,
+                                             s.attended.gpu_buffer()?, cos_t.gpu_buffer()?,
+                                             sin_t.gpu_buffer()?, position, HEADS, q_dim, kv_dim);
+            }
+            crate::gpu_ops::f_gemv_add(&d.gemv_add_bf16, gpu, key | 3, s.attended.gpu_buffer()?,
+                                       &w.o, input.gpu_buffer()?, s.x1.gpu_buffer()?, HIDDEN, q_dim);
+            crate::gpu_ops::f_norm_gateup(&d.norm_gateup_bf16, gpu, key | 4, s.x1.gpu_buffer()?,
+                                          post_norm.gpu_buffer()?, &w.gate, &w.up,
+                                          s.gate_up.gpu_buffer()?, INTERMEDIATE, HIDDEN, 1e-5);
+            crate::gpu_ops::f_silu_down(&d.silu_down_bf16, gpu, key | 5, s.gate_up.gpu_buffer()?,
+                                        &w.down, s.x1.gpu_buffer()?, s.x_out.gpu_buffer()?,
+                                        INTERMEDIATE, HIDDEN);
+            return Ok(());
+        }
+        let qkv_w = self.qkv_weight("decoder", index)?;
+        crate::gpu_ops::f_gemv(&d.gemv, gpu, key | 1, s.normed.gpu_buffer()?,
+                               qkv_w.gpu_buffer()?, d.zero1.gpu_buffer()?, s.qkv.gpu_buffer()?,
+                               q_dim + 2 * kv_dim, HIDDEN);
+        {
+            let kv = d.kv.borrow();
+            crate::gpu_ops::f_qkv_attend(&d.qkv_attend, gpu, key | 2, s.qkv.gpu_buffer()?,
+                                         kv.k[index].gpu_buffer()?, kv.v[index].gpu_buffer()?,
+                                         s.attended.gpu_buffer()?, cos_t.gpu_buffer()?,
+                                         sin_t.gpu_buffer()?, position, HEADS, q_dim, kv_dim);
+        }
+        let o_w = self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, q_dim])?;
+        crate::gpu_ops::f_gemv_add(&d.gemv_add, gpu, key | 3, s.attended.gpu_buffer()?,
+                                   o_w.gpu_buffer()?, input.gpu_buffer()?, s.x1.gpu_buffer()?,
+                                   HIDDEN, q_dim);
+        let gate_w = self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        let up_w = self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+        crate::gpu_ops::f_norm_gateup(&d.norm_gateup, gpu, key | 4, s.x1.gpu_buffer()?,
+                                      post_norm.gpu_buffer()?, gate_w.gpu_buffer()?,
+                                      up_w.gpu_buffer()?, s.gate_up.gpu_buffer()?,
+                                      INTERMEDIATE, HIDDEN, 1e-5);
+        let down_w = self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
+        crate::gpu_ops::f_silu_down(&d.silu_down, gpu, key | 5, s.gate_up.gpu_buffer()?,
+                                    down_w.gpu_buffer()?, s.x1.gpu_buffer()?, s.x_out.gpu_buffer()?,
+                                    INTERMEDIATE, HIDDEN);
         Ok(())
     }
 

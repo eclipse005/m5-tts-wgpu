@@ -46,13 +46,17 @@ impl TensorEntry {
     /// Widen to f32. bf16 -> f32 is exact; f16 -> f32 is exact as well.
     pub fn to_f32(&self) -> Result<Vec<f32>> {
         match self.dtype {
-            DType::F32 => Ok(self
-                .data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()),
+            // The checkpoint's f32 bytes are already the in-memory image, so
+            // this is a memcpy: the per-element `from_le_bytes` it used to do
+            // ran at a fraction of that, and the codec's transposed-conv
+            // weights alone are 75 MB.
+            DType::F32 => {
+                let len = self.data.len() / 4;
+                let mut out = vec![0.0f32; len];
+                bytemuck::cast_slice_mut::<f32, u8>(&mut out)
+                    .copy_from_slice(&self.data[..len * 4]);
+                Ok(out)
+            }
             DType::Bf16 => Ok(self
                 .data
                 .as_chunks::<2>()

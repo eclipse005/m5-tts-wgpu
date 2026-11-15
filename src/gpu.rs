@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 use wgpu::{BindGroupEntry, Buffer, BufferUsages, Device, Queue};
 
+/// The wgpu buffer handle, re-exported for the model crates.
+pub use wgpu::Buffer as WgpuBuffer;
+
 /// One recorded dispatch plus everything the command buffer still points at.
 ///
 /// wgpu does not keep a bind group's buffers alive for a *recorded* command
@@ -84,6 +87,56 @@ impl Kernel {
         // staged per submit), and each (layer, op) owns its buffer exclusively.
         gpu.write_u32(&params_buffer, uni);
         gpu.record(&self.pipe, &bind, workgroups);
+    }
+}
+
+/// A uniform-arena kernel (ming nn.rs `Kernel`): binding 0 is the shared uniform
+/// arena selected by a dynamic offset, bindings 1.. are the storage buffers.
+/// The bind group is cached per key (the arena and the storage buffers are
+/// stable for the model's lifetime); each dispatch reserves a fresh 256 B arena
+/// slot for its params, so a key may repeat inside one batch without its params
+/// being overwritten. Recording costs one host memcpy + a push, no buffer
+/// creation and no per-dispatch `write_buffer`.
+pub struct ArenaKernel {
+    pub bgl: wgpu::BindGroupLayout,
+    pub pipe: wgpu::ComputePipeline,
+    cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
+}
+
+impl ArenaKernel {
+    /// `bufs` are the storage bindings in order (binding 1..); `uni` is the
+    /// parameter block copied into a fresh arena slot.
+    pub fn run(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
+               workgroups: (u32, u32, u32)) {
+        let hit = self.cache.borrow().get(&key).cloned();
+        let bind = if let Some(b) = hit {
+            b
+        } else {
+            let mut entries = Vec::with_capacity(bufs.len() + 1);
+            entries.push(wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: gpu.arena_buffer(),
+                    offset: 0,
+                    size: wgpu::BufferSize::new(UNIFORM_SLOT as u64),
+                }),
+            });
+            for (i, b) in bufs.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: (i + 1) as u32,
+                    resource: b.as_entire_binding(),
+                });
+            }
+            let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("arena-kernel"),
+                layout: &self.bgl,
+                entries: &entries,
+            });
+            self.cache.borrow_mut().insert(key, bind.clone());
+            bind
+        };
+        let offset = gpu.alloc_uniform(bytemuck::cast_slice(uni));
+        gpu.record_dyn_off(&self.pipe, &bind, offset, workgroups);
     }
 }
 
@@ -367,7 +420,7 @@ impl Gpu {
     /// once and stay cached; pooled buffers only help per-op scratch tensors.
     pub fn upload_pooled(&self, data: &[f32]) -> Buffer {
         let buffer = self.take_pooled(data.len());
-        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        self.write_chunked(&buffer, data);
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
         buffer
     }
@@ -380,7 +433,7 @@ impl Gpu {
     /// is what ming-3.0-tts uses on the same card.
     pub fn upload(&self, label: &str, data: &[f32]) -> Buffer {
         let buffer = self.storage((data.len() * 4) as u64, label);
-        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+        self.write_chunked(&buffer, data);
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
         *self.upload_labels.borrow_mut().entry(label.to_string()).or_insert(0) += (data.len() * 4) as u64;
         buffer
@@ -502,8 +555,26 @@ impl Gpu {
 
     /// Upload into an existing buffer (uniforms / small params).
     pub fn write(&self, buffer: &Buffer, data: &[f32]) {
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        self.write_chunked(buffer, data);
         self.stats.borrow_mut().bytes_uploaded += (data.len() * 4) as u64;
+    }
+
+    /// `queue.write_buffer` in 16 MB slices.
+    ///
+    /// One call per whole weight makes wgpu allocate and map a staging buffer of
+    /// that size: a 75 MB transposed-conv weight cost 118 ms of submit-side copy
+    /// that way, 89 ms with the same bytes in slices (the staging belt then
+    /// reuses its buffers). Slower than the 2.5-5.9 GB/s a clean process
+    /// measures, so the destination buffer's first-touch is also in there.
+    fn write_chunked(&self, buffer: &Buffer, data: &[f32]) {
+        const CHUNK: usize = 4 << 20; // floats: 16 MB
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let end = (offset + CHUNK).min(data.len());
+            self.queue.write_buffer(buffer, (offset * 4) as u64,
+                                    bytemuck::cast_slice(&data[offset..end]));
+            offset = end;
+        }
     }
 
     pub fn pipeline(&self, key: &str, shader: &str, entry: &str) -> wgpu::ComputePipeline {
@@ -702,12 +773,17 @@ impl Gpu {
         }
     }
 
-    /// Kernel for the existing storage-params shaders: the params binding (the
-    /// LAST one) gets has_dynamic_offset, fed from the params ring per dispatch.
+    /// Kernel for the existing storage-params shaders: the params binding is
+    /// the LAST one, a read-only storage buffer bound whole at offset 0. (It
+    /// used to carry has_dynamic_offset for the shared params ring; since the
+    /// per-key params buffers each dispatch owns its whole small buffer, and a
+    /// dynamic-offset binding replayed without its offset fails validation.)
     pub fn kernel_params(&self, key: &str, shader: &str, kinds: &str) -> Kernel {
-        let kinds_full = format!("{kinds},dyn");
+        // The params binding is the LAST one: a read-only storage buffer bound
+        // whole at offset 0 (one per cached key). It must be in the layout too.
+        let kinds_full = format!("{kinds},ro");
         let (bgl, pipe) = self.arena_layout_plain(key, shader, &kinds_full);
-        let kinds = kinds_full.split(',').map(|k| k.trim() == "ro").collect();
+        let kinds = kinds.split(',').map(|k| k.trim() == "ro").collect();
         Kernel {
             bgl,
             pipe,
@@ -715,6 +791,14 @@ impl Gpu {
             name: key.to_string(),
             cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Build a uniform-arena kernel: `kinds` describes the storage bindings
+    /// (binding 1..), e.g. "ro,ro,rw". The shader must declare a uniform `p` at
+    /// binding 0. Params ride the shared arena via a dynamic offset.
+    pub fn arena_kernel(&self, key: &str, shader: &str, kinds: &str) -> ArenaKernel {
+        let (bgl, pipe) = self.arena_layout(key, shader, kinds);
+        ArenaKernel { bgl, pipe, cache: RefCell::new(HashMap::new()) }
     }
 
     /// Record a dispatch (no dynamic offsets) into the current batch.

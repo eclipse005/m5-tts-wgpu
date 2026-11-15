@@ -81,17 +81,27 @@ impl Device {
         })
     }
 
-    /// Uninitialised tensor (every op overwrites its output).
+    /// A tensor whose contents are zero.
+    ///
+    /// GPU: pooled buffer + an on-device fill dispatch. It used to upload a
+    /// host-side zero vec (`queue.write_buffer`), which at codec block-4 sizes
+    /// pushed 72 MB per tensor over a x1 PCIe link; the fill kernel moves
+    /// nothing. CPU: `vec![0.0; n]` is an `alloc_zeroed`, so the OS hands out
+    /// lazily committed zero pages and the page faults land inside whatever
+    /// writes them first.
     pub fn zeros(&self, shape: [usize; 2]) -> Result<Tensor> {
         match self {
-            // `vec![0.0; n]` on f32 is an `alloc_zeroed`: the OS hands out lazily
-            // committed zero pages, so the allocation is free and the pages fault
-            // in (in parallel, inside the writing op) on first touch. Copying that
-            // fresh vec into a second one — what `tensor()` would do — instead
-            // forced every page to materialise on a single thread: ~31 ms per
-            // 72 MB tensor, paid once per codec output buffer.
             Device::Cpu => Ok(Tensor::Cpu(vec![0.0; shape[0] * shape[1]], shape)),
-            _ => self.tensor(shape, &vec![0.0; shape[0] * shape[1]]),
+            Device::Gpu(gpu) => {
+                let len = shape[0] * shape[1];
+                let tensor = Tensor::Gpu(GpuBuffer {
+                    raw: gpu.take_pooled(len),
+                    gpu: Rc::clone(gpu),
+                    owned: true,
+                }, shape);
+                crate::gpu_ops::fill(gpu, tensor.gpu_buffer()?, len, 0.0);
+                Ok(tensor)
+            }
         }
     }
 
@@ -111,6 +121,10 @@ impl Device {
                 if data.len() != shape[0] * shape[1] {
                     bail!("write size {} != tensor {:?}", data.len(), shape);
                 }
+                // The tensor may have been created by `zeros`, whose fill is a
+                // recorded dispatch: submit it first, or the host bytes land
+                // before the zeroing kernel and get overwritten.
+                gpu.flush();
                 gpu.write(&buffer.raw, data);
                 Ok(())
             }
@@ -149,7 +163,16 @@ impl Device {
 
     /// Explicit tensor copy (device-to-device on the GPU, `Vec` clone on the CPU).
     pub fn copy(&self, tensor: &Tensor) -> Result<Tensor> {
-        let mut out = self.zeros(tensor.shape())?;
+        // GPU: the copy overwrites every element, so skip the zero fill that
+        // `zeros` would dispatch first.
+        let mut out = match self {
+            Device::Gpu(gpu) => Tensor::Gpu(GpuBuffer {
+                raw: gpu.take_pooled(tensor.numel()),
+                gpu: Rc::clone(gpu),
+                owned: true,
+            }, tensor.shape()),
+            Device::Cpu => Tensor::Cpu(vec![0.0; tensor.numel()], tensor.shape()),
+        };
         match (self, tensor, &mut out) {
             (Device::Gpu(gpu), Tensor::Gpu(src, shape), Tensor::Gpu(dst, _)) => {
                 crate::gpu_ops::copy(gpu, &src.raw, &dst.raw, shape[0] * shape[1]);

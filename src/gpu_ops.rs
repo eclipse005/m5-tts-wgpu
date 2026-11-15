@@ -157,6 +157,13 @@ pub fn gelu(gpu: &Gpu, x: &Buffer, len: usize) {
 }
 
 /// `y = x`.
+/// Fill `len` f32 with `value` on the device (no host traffic).
+pub fn fill(gpu: &Gpu, y: &Buffer, len: usize, value: f32) {
+    let params = gpu.params_u32(&[len as u32, value.to_bits()]);
+    let groups = len.div_ceil(4);
+    gpu.dispatch_params("fill_f32", shaders::FILL_F32, "main", &[(0, y)], &params, grid(groups));
+}
+
 pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
     let params = gpu.params_u32(&[len as u32]);
     gpu.dispatch_params("copy_f32", shaders::COPY_F32, "main", &[(0, x), (1, y)], &params, grid(len));
@@ -221,6 +228,14 @@ pub fn a_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer
           ((hidden as u32).div_ceil(8).max(1), 1u32, 1u32));
 }
 
+/// Single-token GEMV with resident bf16 weights packed 2-per-u32.
+pub fn a_gemv_bf16w(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+                    y: &Buffer, rows: usize, in_features: usize) {
+    let uni: [u32; 2] = [rows as u32, (in_features / 2) as u32];
+    k.run_params(gpu, key, &uni, &[w, x, y],
+                 ((rows as u32).div_ceil(8).max(1), 1u32, 1u32));
+}
+
 pub fn a_rope(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, cos: &Buffer,
               sin: &Buffer, tokens: usize, heads: usize, head_dim: usize) {
     // in-place: x is the read_write binding; cos/sin read-only
@@ -257,6 +272,96 @@ pub fn a_add(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, a: &Buffer, b: &Buffer
 pub fn a_silu_mul(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate: &Buffer, up: &Buffer,
                   y: &Buffer, len: usize) {
     k.run_params(gpu, key, &[len as u32], &[gate, up, y], (1u32, 1u32, 1u32));
+}
+
+// ---- uniform-arena fused decode launchers (ming nn.rs pattern) ----
+// Each takes a cached-bind-group ArenaKernel; params ride the shared uniform
+// arena (fresh slot per dispatch), so a layer's key can repeat within a batch.
+
+pub fn af_rms(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+              y: &Buffer, rows: usize, cols: usize, eps: f32) {
+    k.run(gpu, key, &[rows as u32, cols as u32, eps.to_bits(), 0], &[x, w, y],
+          (rows as u32, 1, 1));
+}
+
+pub fn af_gemv(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+               bias: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    k.run(gpu, key, &[1, n as u32, kk as u32, 0], &[x, w, bias, y],
+          ((n as u32).div_ceil(8).max(1), 1, 1));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn af_qkv_attend(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, qkv: &Buffer,
+                     cache_k: &Buffer, cache_v: &Buffer, attended: &Buffer,
+                     cos: &Buffer, sin: &Buffer, position: usize, heads: usize,
+                     q_rows: usize, kv_rows: usize) {
+    k.run(gpu, key, &[q_rows as u32, kv_rows as u32, 64, position as u32, heads as u32, 0, 0, 0],
+          &[qkv, cache_k, cache_v, attended, cos, sin], (heads as u32, 1, 1));
+}
+
+pub fn af_gemv_add(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+                   res: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    k.run(gpu, key, &[n as u32, kk as u32, 0, 0], &[x, w, res, y],
+          ((n as u32).div_ceil(8).max(1), 1, 1));
+}
+
+pub fn af_norm_gateup(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer,
+                      norm_w: &Buffer, gate_w: &Buffer, up_w: &Buffer, y: &Buffer,
+                      inter: usize, hidden: usize, eps: f32) {
+    k.run(gpu, key, &[inter as u32, hidden as u32, eps.to_bits(), 0],
+          &[x, norm_w, gate_w, up_w, y], (((2 * inter) as u32).div_ceil(64).max(1), 1, 1));
+}
+
+pub fn af_silu_down(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, gate_up: &Buffer,
+                    down_w: &Buffer, x1: &Buffer, y: &Buffer, inter: usize, hidden: usize) {
+    k.run(gpu, key, &[inter as u32, hidden as u32, 0, 0], &[gate_up, down_w, x1, y],
+          ((hidden as u32).div_ceil(8).max(1), 1, 1));
+}
+
+// ---- fused decode launchers on cached-bind-group storage-params kernels ----
+// Same fused shaders as the regular path, but dispatched through a Kernel whose
+// bind group is cached per key. The caller must give each dispatch a key that is
+// unique within the open submit batch (the per-key params buffer is overwritten
+// on reuse), e.g. (layer, op, codebook-step).
+
+pub fn f_rms(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+             y: &Buffer, rows: usize, cols: usize, eps: f32) {
+    k.run_params(gpu, key, &[rows as u32, cols as u32, eps.to_bits(), 0], &[x, w, y],
+                 (rows as u32, 1, 1));
+}
+
+pub fn f_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+              bias: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    k.run_params(gpu, key, &[1, n as u32, kk as u32, 0], &[x, w, bias, y],
+                 ((n as u32).div_ceil(8).max(1), 1, 1));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn f_qkv_attend(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, qkv: &Buffer,
+                    cache_k: &Buffer, cache_v: &Buffer, attended: &Buffer,
+                    cos: &Buffer, sin: &Buffer, position: usize, heads: usize,
+                    q_rows: usize, kv_rows: usize) {
+    k.run_params(gpu, key, &[q_rows as u32, kv_rows as u32, 64, position as u32, heads as u32],
+                 &[qkv, cache_k, cache_v, attended, cos, sin], (heads as u32, 1, 1));
+}
+
+pub fn f_gemv_add(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
+                  res: &Buffer, y: &Buffer, n: usize, kk: usize) {
+    k.run_params(gpu, key, &[n as u32, kk as u32], &[x, w, res, y],
+                 ((n as u32).div_ceil(8).max(1), 1, 1));
+}
+
+pub fn f_norm_gateup(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer,
+                     norm_w: &Buffer, gate_w: &Buffer, up_w: &Buffer, y: &Buffer,
+                     inter: usize, hidden: usize, eps: f32) {
+    k.run_params(gpu, key, &[inter as u32, hidden as u32, eps.to_bits()],
+                 &[x, norm_w, gate_w, up_w, y], (((2 * inter) as u32).div_ceil(64).max(1), 1, 1));
+}
+
+pub fn f_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer,
+                   down_w: &Buffer, x1: &Buffer, y: &Buffer, inter: usize, hidden: usize) {
+    k.run_params(gpu, key, &[inter as u32, hidden as u32], &[gate_up, down_w, x1, y],
+                 ((hidden as u32).div_ceil(8).max(1), 1, 1));
 }
 
 /// Fused decode-step attention block (one workgroup per query head).
@@ -377,18 +482,15 @@ pub fn conv1d_reg8(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: &Buffer, y: &Buffer,
                         &[(0, x), (1, w), (2, bias), (3, y)], &params, groups);
 }
 
-/// Phased transposed conv (weights pre-packed as `[(co*stride+q)*taps*cin + tap*cin + ci]`).
+/// Scatter the phased transposed-conv result `[t_in, cout*stride]` into
+/// `[cout, t_in*stride]` (`out[co][m*stride + q] = y[m][co*stride + q]`).
 #[allow(clippy::too_many_arguments)]
-pub fn conv_transpose_phased(gpu: &Gpu, x: &Buffer, w2: &Buffer, bias: &Buffer, y: &Buffer,
-                             cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize) {
-    let taps = ks / stride;
-    let rows_total = cout * stride;
-    let params = gpu.params_u32(&[
-        cin as u32, rows_total as u32, stride as u32, t_in as u32,
-        cout as u32, (t_in * stride) as u32, taps as u32,
-    ]);
-    let groups = (rows_total.div_ceil(32) as u32, t_in.div_ceil(8) as u32, 1);
-    gpu.dispatch_params("ct_phased", shaders::CONV_TRANSPOSE_PHASED_F32, "main", &[(0, x), (1, w2), (2, bias), (3, y)], &params, groups);
+pub fn phased_interleave(gpu: &Gpu, y: &Buffer, out: &Buffer, rows: usize, stride: usize,
+                         t_in: usize) {
+    let params = gpu.params_u32(&[rows as u32, stride as u32, t_in as u32, 0]);
+    gpu.dispatch_params("phased_interleave", shaders::PHASED_INTERLEAVE_F32, "main",
+                        &[(0, y), (1, out)], &params,
+                        grid((rows / stride) * t_in));
 }
 
 /// Channels-last conv with packed weights `[tap*cin+ci][cout]`.

@@ -5,6 +5,20 @@
 
 最后更新：见 `git log -1`。当前 HEAD 的提交信息会告诉你最后一步动了什么。
 
+**2026-11 第二轮（RTF 攻坚，6.8 有完整复盘）**：GPU RTF **2.66 → 0.86**（同会话 CPU 0.83，
+即 GPU 现在只比 20 核 CPU 慢 4%；Python CUDA 0.77 仍是参照）。四个已确认的收益：
+①**top-k 采样器是 depth 的真正黑洞**（O(vocab²) 排名，2.8 ms × 16 次/帧 = 45 ms，占 59 ms
+的 depth 帧）→ 改成基数选择后 **0.12 ms**，depth 59 → 20 ms/帧，这是单项最大的一笔；
+②`Device::zeros` 走 PCIe 上传零页（codec 每块 72 MB）→ 改为设备端 fill，codec 5.2 → 2.6 s，
+上传量 4508 → 1240 MB；③conv kernel 的 `stage` 工作组内存 36 KB 把占用率压到 2 组/SM →
+收到 8 KB，卷积 **500 → 1300-1700 GFLOP/s**（block1-4 的 conv7 全部 -60%）；
+④分相转置卷积改跑 reg8 卷积 + 一次 interleave（50 → ~1000 GFLOP/s）。
+另有三处小项：host 端权重打包改并行（50 → 2.3 ms/权重）、safetensors f32 读取改 memcpy、
+大权重上传分片。融合 depth 路径现在是默认（`M5_DEPTH_PLAIN=1` 回退）。
+
+**2026-11 第一轮（GPU depth 攻坚，结论见 6.7）**：GPU RTF 2.66 → 2.23（唯一确认的收益是
+删掉每层 sync）。融合 depth 路径当时查不出收益，**因为采样器的 45 ms/帧把它盖住了**。
+
 **2025-11 本轮成果**（提交 603eb7c 起）：RTF 1.21 → **0.75-0.87**（配对 best-of-3 0.75，对
 Python CPU 1.36 快 45%，**纯 CPU 已追平 Python CUDA 的 0.77**）。十步：①修好 9 倍回归
 （`env::var_os` 环境锁）；②大张量双重分配 → lazy 零页；③转置卷积分相分解；④大权重转置卷积
@@ -115,7 +129,7 @@ goldens/              从参考实现导出的黄金数据（13 MB，已入库�
 tn_data/              6 种语言的 OpenFST 自动机 + token 重排表（22 MB，已入库）
 scripts/dump_*.py     生成 goldens（用参考实现的 Python 环境跑）
 bench/compare.sh      ★成对基准：Rust vs Python，同会话、同线程、best-of-N
-examples/*.rs         25 个微基准/诊断程序，每个文件顶部都写了它回答什么问题
+examples/*.rs         ~35 个微基准/诊断程序，每个文件顶部都写了它回答什么问题
 ```
 
 **分层原则**：`codec`/`lm` 只通过 `ops` 调算子，从不直接碰 wgpu 或 `Vec`。
@@ -191,6 +205,7 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 `M5_PROFILE=1`（pipeline/codec 分阶段计时）、`M5_PROFILE_DEEP=1`（block 级）、
 `M5_PROFILE_LAYER=1`（融合层内部，f32 与 bf16 都有）、`M5_NO_SIMD=1`（强制通用路径）、
 `M5_NO_FUSED=1`、`M5_NO_BF16=1`、`M5_MAX_PENDING=N`、`M5_TN_DIR`、`M5_MODEL`、
+`M5_DEPTH_PLAIN=1`（depth 走逐 op 路径，默认是融合路径）、`M5_DEPTH_ARENA=1`、
 `M5_CODEC`、`RAYON_NUM_THREADS`。
 
 ---
@@ -216,9 +231,10 @@ $PYTHON D:/m5-tts-wgpu/scripts/dump_golden.py  --out D:/m5-tts-wgpu/goldens
 
 ### 6.2 最后一次可信的对齐状态
 
-* 端到端 parity（提交 4e49264，`parity_pipeline`）：帧数相同、**codes 0 mismatch**、
-  **CPU SNR 109.4 dB / GPU 108.2 dB**
-* 两个 SIMD 模式下 9 个测试套件全绿
+* 端到端 parity（本轮结束时，`parity_pipeline`）：帧数相同、**codes 0 mismatch**、
+  **CPU SNR 110.9 dB / GPU 108.5 dB**
+* 两个 SIMD 模式下 9 个测试套件全绿（GPU 侧的改动也在里面：`parity_codec` 的逐阶段
+  ≤2e-4、PCM SNR ≥60 dB 都过）
 
 ### 6.3 已解问题与新发现的机制（都实测过，别重蹈覆辙）
 
@@ -383,18 +399,20 @@ arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + ro
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
 
-### 6.4 与参考实现的对比（配对基准，best-of-3，提交 4e49264）
+### 6.4 与参考实现的对比（配对基准，best-of-3；GPU 行是 2026-11 第二轮）
 
 | | RTF | 说明 |
 |---|---|---|
-| **Rust AVX2** | **0.94 ~ 0.95** | 比 Python AVX2 快 ~30%，已破实时 |
+| **Rust GPU（本轮结束时）** | **0.86 ~ 0.90** | 98 帧样例，背景负载 16~38%；起点是本轮的 2.47 |
+| **Rust AVX2** | **0.83** | 20 线程，同会话复测（本轮没动 CPU 路径） |
 | Rust 通用（无 AVX2） | 1.10 | 比 Python 通用快 ~31% |
 | PyTorch CPU（AVX2 / oneDNN） | 1.36 | 同会话实测 |
 | PyTorch CPU（无 AVX） | 1.59 ~ 1.82 | 同会话实测 |
 | PyTorch CUDA（P104，fp32） | 0.77 | 仍是 GPU 目标的参照 |
 
 PyTorch 对 ISA 只敏感 17%（它 101 ms/帧里主要是逐帧 kernel 调度开销）；
-我们曾对 ISA 敏感 4.4 倍，现在 codec 只差 15%，与原版同量级。
+我们曾对 ISA 敏感 4.4 倍，现在 codec 只差 15%，与原版同量级。CPU 那一行的 0.83 是本轮
+同会话复测（改动只在 GPU 路径，数字与 6.4 旧值 0.94~0.95 的差别来自后台负载，别跨会话比）。
 
 单帧对比（同一会话、同样受后台干扰）：**LM 生成 ~31 ms/帧 vs 原版 101 ms/帧**
 （depth 26.8 + backbone ~4）。本轮 RTF 三级跳的会话内读数：1.21 → 1.02（分配修复）
@@ -403,39 +421,179 @@ PyTorch 对 ISA 只敏感 17%（它 101 ms/帧里主要是逐帧 kernel 调度�
 ### 6.5 GPU 硬件事实（别再重复测）
 
 ```
-纯 FMA 探针          2107 GFLOP/s (1.05 TMAC/s)   ← 卡的实际上限
-GEMM 2048³           86.8 GFLOP/s                 ← 我的 kernel，4% 上限
-conv（打包 CL，8×4）  120~185 GFLOP/s              ← 我的 kernel
-dev copy             0.6 GB/s（≈ x1 PCIe，矿卡）
-trivial dispatch     9.8 µs
-GEMV 512×512         13.9 µs（warp-per-row）
+纯 FMA 探针              2107 GFLOP/s (1.05 TMAC/s)   ← 卡的实际上限
+conv1d_reg8（ks7，四个块） 1148~1669 GFLOP/s            ← 占用率修好后（6.8③）
+conv（打包 CL，8×4，旧）   120~185 GFLOP/s              ← 当时被 36 KB 的 stage 卡住
+GEMM 2048³               86.8 GFLOP/s                 ← 旧的 16×16 tile，已过时
+snake（72 MB，就地）      0.71 ms = 204 GB/s
+dev copy（72 MB）         1.0~1.5 GB/s（含池化分配）
+上传 write_buffer（复用）  5.9 GB/s；新建 2.5 GB/s；真流程里 75 MB 只有 0.85 GB/s
+trivial dispatch         9.8 µs
+GEMV 512×512             13.9 µs（warp-per-row）
 ```
 
-cuDNN 在同一张卡上能让 codec 解码跑 0.2s（≈790 GMAC/s = 75% 上限），所以瓶颈是 kernel 而不是卡。
-提升方向只有一个：**提高每字节权重的 FMA 次数**（现在 1~2，需要 8+，即 8×8 累加器 + 权重块进 shared）。
+cuDNN 在同一张卡上能让 codec 解码跑 0.2s（≈790 GMAC/s = 75% 上限）。本轮之后卷积 kernel
+已经到上限的 55-80%，**剩余空间不在算术而在“首次准备权重”和 DRAM 往返**（6.8⑦）。
+
+### 6.7 2026-11 第一轮：GPU depth 攻坚复盘（结论被 6.8 部分推翻，见 ① 的说明）
+
+**基线**（98 帧样例，seed 1234，`M5_PROFILE=1`）：RTF 2.66，depth 82 ms/帧、codec 解码
+5.7s、encode 0.75s、prefill 0.21s；37524 dispatch / **4849 submit**（每层 sync 把批切成
+~6 dispatch 的小提交）。
+
+**① 唯一确认的收益：删掉 GPU 融合层的每层 `gpu.sync()`**（`llama_layer_gpu_fused_step`）。
+submit 4849→879，RTF 2.66→**2.23**，depth 82→66 ms/帧，`parity_pipeline` 双设备全绿。
+**这推翻了 6.6 里"RO→RW 同 pass 独占"的认识**：wgpu-core 30 的 compute pass 是
+**逐 dispatch 的 usage scope**（`wgpu-core/src/command/compute.rs:308` 注释明说），
+同一 buffer 上一 dispatch 写、下一 dispatch 读完全合法；ming 的 DiT 在同卡上一个
+120-dispatch pass 里对共享 scratch 做 RW→RO→RW 就是活证据。之前那堵"墙"是误诊。
+（真正的限制只在**单个 dispatch 内**：同一 buffer 不能同时绑成 ro 和 rw 两个 binding。）
+
+**② 新建融合 depth 路径**（`depth_codes_device_fused` +
+`llama_layer_depth_fused` + `DepthFusedGpu`）：6 dispatch/层，走 `kernel_params`
+（storage params + **缓存 bind group**），持久 per-layer scratch + 持久 fresh KV cache，
+cache key = `(layer<<16)|(step<<8)|op`（**step 必须进 key**：per-key params buffer 会在
+同批内 key 重复时被覆盖）。`parity_pipeline` 全绿、codes 0 mismatch。**但 depth 仍 ~65 ms/帧，
+没比默认快**——缓存 bind group 不是瓶颈。
+
+**③ bf16 常驻权重**（`GEMV_BF16_F32`/`GEMV_ADD_BF16_F32`/`NORM_GATEUP_BF16_F32`/
+`SILU_DOWN_BF16_F32`，2-per-u32 打包、shader 内移位展开、**按 f32 的 lane/lane+32 顺序累加**
+所以逐位一致）。`DepthFusedGpu.bf16` 存打包权重，层内分支选用。parity 全绿。
+**depth 仍 ~67 ms/帧——权重带宽也不是瓶颈**（减半流量没用）。
+
+**④ 死胡同：uniform arena + 动态偏移**（`ArenaKernel` + `AF_*` shader，ming nn.rs 形式）。
+隔离探针正确，但**在 depth 上下文里读"常规 op 写过的 fresh buffer"会读到 0/旧值**，
+params 经核对完全正确、bind group 新建也一样错。根因未完全隔离，疑似该 Vulkan/P104
+驱动对 dynamic-offset uniform binding 的处理 bug。**storage-params 缓存 bind group
+（`kernel_params`）则完全正确**——所以融合路径用的是后者。`ArenaKernel`/`AF_*`/
+`arena_kernel()` 是死代码，**建议删**。
+
+**⑤ 顺手修的 WIP bug**：上一轮把 `kernel_params` 的 params binding 从 bgl 里删了
+（去掉 `,dyn` 时没补 `,ro`），bind group 与 layout 不匹配。已改回 `format!("{kinds},ro")`。
+
+**⑥ 关键诊断数据（别再重复测）**：
+* `switch_probe`：单 kernel 重复 11.5 µs/dispatch，3-kernel 轮换 **8.6 µs**——
+  **pipeline 切换不贵**。
+* `depth_kernel_probe`（隔离、back-to-back）：rms 10.6 / qkv gemv 13.7 / qkv_attend 15.9 /
+  gemv_add 11.6 / **norm_gateup 82.3** / silu_down 29.4 µs。一层合计 ~163 µs × 70 层
+  ≈ **11.4 ms/帧**。
+* **但实测 depth ~65 ms/帧**—— layer kernel 只占 ~11ms，**剩下 ~54ms 没解释**。
+  嫌疑：`sample_topk`（14/帧，单 workgroup、O(vocab²) 排名）、`audio_head` GEMV
+  （2051×512，14/帧）、以及真实序列里的逐 dispatch 在位开销（隔离探针 back-to-back
+  与真实交错序列的差异）。**下一步先隔离量 `sample_topk` 和 `audio_head` 的耗时**，
+  别再动 layer kernel（它们已经只占 11ms）。
+
+**当前 GPU 分解**（本轮结束时，RTF 0.86-0.90）：depth 26.4 ms/帧（1.62s generation）>
+codec 1.13-1.46s > encode 0.50s > prefill 0.14s。明细见 6.8。
+
+**给接手的优先级建议**（已由 6.8 兑现 1~2、判定 3 部分无效）：
+1. ~~codec 是最大头~~ → 已做（占用率 + zeros 上传 + 分相转置卷积，见 6.8）。
+2. ~~depth 先量 `sample_topk`/`audio_head`~~ → 量了，44 ms 在采样器（6.8①）。
+3. 清理：删 `ArenaKernel`/`AF_*`/`arena_kernel`（死代码）；删旧 arena 路径
+   `llama_layer_depth_arena`/`DepthBf16Weights`/`a_gemv_bf16w`/`M5_DEPTH_ARENA`
+   （被融合路径取代，且旧路径 down_proj 的 in_features 误传 HIDDEN 是 bug）。尚未做。
+4. 双 SIMD 门已补齐：`cargo test --release` 与 `M5_NO_SIMD=1 cargo test --release` 均 9 套全绿。
+
+**新增探针**：`arena_probe`（uniform arena 机制隔离）、`depth_compare`（default vs fused
+逐帧 codes 对比）、`depth_kernel_probe`（各融合 kernel 隔离耗时）、`switch_probe`
+（pipeline 切换惩罚）、`depth_frame_probe`（整帧 depth 耗时 + dispatch/submit 计数）、
+`conv_block_probe`（四个 decoder 块的卷积形状）、`snake_probe`（snake 是否带宽受限）、
+`gpu_alloc_probe`（大 scratch buffer 创建成本）、`upload_probe`（上传路径带宽）、
+`tconv_gpu_probe`（分相转置卷积三步拆分）。
+
+---
+
+## 6.8 2026-11 第二轮：GPU RTF 2.66 → 0.86 的复盘
+
+**测法**：所有结论都来自同一会话内的 A/B 或 `M5_PROFILE`/`M5_PROFILE_DEEP` 的分段读数；
+机器负载 9~40% 波动，因此下面的绝对值只代表“同一会话内的相对变化”。
+
+**① 采样器是 depth 的黑洞（单项最大收益，45 ms/帧）**
+`SAMPLE_TOPK_F32` 用“每个元素和全部元素比一遍”求 top-k cutoff：vocab 2051，单 workgroup
+256 轨，每轨 8×2051 次比较 + 每次一个 f32 除法。实测 **2.8 ms/次**，depth 每帧采样 16 次
+= **45 ms**，而整帧只有 59 ms。改成 **radix select**（f32 位元保序 u32 镜像，4 趟 8 bit，
+每趟 O(vocab/256) 扫描 + 256 bin 回走）：**0.12 ms/次**，数值逐位不变（max/sum/argmax 的
+归约顺序故意不动，argmax 平局按更小下标打破，等价于原来的串行扫描）。
+→ depth 59 → **20 ms/帧**。**教训：先量整帧的分段，再信“kernel 已经很便宜”的直觉。**
+
+**② `Device::zeros` 在往 PCIe 上推零页**
+GPU 的 `zeros` 走 `tensor()` → `queue.write_buffer(全尺寸零 vec)`：codec block4 的每个
+72 MB 输出缓冲都这么来一遍，实测 ~1.1 GB/s。改成“池化 buffer + 设备端 fill kernel”后：
+codec 解码 5.21 → **2.57 s**，一次 run 的上传量 **4508 → 1240 MB**。`copy` 同理跳过零填充。
+
+**③ 卷积 kernel 的占用率被 `stage` 数组卡死**
+`CONV1D_REG8_F32` 的 `var<workgroup> stage` 按 16×576 f32 = 36 KB 静态分配，而实际窗口
+`TT*stride + (ks-1)*dilation + 1` 最多 119（调用方只有 stride=1、ks∈{1,3,7}、dilation∈{1,3,9}）。
+P104 每 SM 96 KB 共享内存 → **2 组/SM**。收到 16×128（8 KB）后 → **500 → 1300-1700 GFLOP/s**
+（`conv_block_probe` 全量实测；block1 的 conv7 在真流程里 61 → 10 ms）。
+
+**④ 分相转置卷积：换 kernel 而不是优化它**
+`ks == stride*taps` 的转置卷积本来就是 `taps` 个因果 tap 跑在 (co,q) 相位行上，而旧 kernel
+一个线程只算一个输出、单累加器串行 1536 次 → ~50 GFLOP/s。现在直接跑 `CONV1D_REG8_F32`
+（`cout := cout*stride`，打包时把 tap 序反转），再用一个新 kernel `PHASED_INTERLEAVE_F32`
+把 `[t_in, cout*stride]` 撒回 `[cout, t_in*stride]`：block2/3/4 的转置卷积 72/45/29 →
+38/18/26 ms，block4 整块 0.155 → 0.131 s。**数字上用 `tconv_gpu_probe` 复核：三步合计
+≤7 ms/块，剩下的 180 ms 是首次使用时的权重大小（75 MB）上传，见 ⑦。**
+
+**⑤ 融合 depth 路径转正**：`M5_DEPTH_FUSED=1` 现在是默认（`M5_DEPTH_PLAIN=1` 回退），
+720 dispatch/帧 vs 1178，depth 22.4 → **19.9 ms/帧**（`depth_frame_probe`）。
+
+**⑥ host 端“准备权重”不是一个恒定量**：`pack_conv_weights` 串行打包 4.1 M 权重 ~50 ms
+（block1 第一次卷积的 62 ms 里占 50）→ 并行后 **2.3 ms**；`TensorEntry::to_f32` 对 f32 权重
+逐元素 `from_le_bytes` → 改成 memcpy；`causal_conv` 以前把 checkpoint 布局的 f32 权重也传上卡
+（`codec.tensor`）再传一份打包副本 → 现在只传打包副本。
+
+**⑦ 仍未解的最大单笔：大权重的首次上传。** 75 MB 的分相权重在真流程里 89 ms（0.84 GB/s），
+干净进程里同样 128 MB 的 `create_buffer + write_buffer` 是 2.47 GB/s、复用 buffer 是 5.94 GB/s
+（`upload_probe`）。按 16 MB 分片 `write_buffer` 把 118 → 89 ms，**根因未定位**（怀疑运行中
+1.5~2 GB 常驻下的设备内存分配/映射）。codec 一次 run 要传 ~457 MB 权重（encoder 另 ~225 MB），
+按 0.85 GB/s 计 ≈ 0.5 s，是当前 codec 1.1-1.4 s 里最大的一块。**下一步：在 upload_probe 里
+先占 1.5 GB 常驻再测，确认是显存压力；若是，考虑权重分块预取到 GPU 并让它在 depth 生成期间
+落地（试过一次“预热整个 decoder”，因为预处理抢占 CPU 记录时间而不赚，见下）。**
+
+**⑧ 失败/回退过的尝试**（别重复）：
+* `Pipeline` 里在生成前预热整个 codec decoder（一帧 dummy 解码）：codec 从 1.85 → 1.02 s，
+  但 generation 1.73 → 2.54 s，**总时间反而 +0.13 s**（预热是 host 侧准备权重，抢占 CPU 录制）。
+* 在 `causal_conv` 里插 sync 分段：codec 总时间不变，说明那里不是“批太大”的问题。
+* snake kernel 不是瓶颈：72 MB 的 snake 单独跑 0.71 ms（204 GB/s），`sin` 与去掉 `sin` 同速
+  （`snake_probe`）。之前 profile 里 snake 显示 32 ms，其实是它前面 `dev.copy` 的零页上传。
+
+**当前 GPU 分解**（RTF 0.86-0.90，98 帧 4.30 s 音频）：
+| 阶段 | 时间 | 说明 |
+|---|---|---|
+| depth | 1.62 s（26.4 ms/帧） | 层 kernel ~14 ms/帧（420 dispatch，权重 bf16）+ 采样 0.12 ms/帧；差距是 qkv/attention/head/norm 的在位开销 |
+| codec 解码 | 1.13-1.46 s | block1-4 合计 ~0.67-0.93 s（首次权重准备 ~0.3 s 在里面）、pre_transformer 0.14、upsample 0.17、quantise 0.11 |
+| encode | 0.50 s | seanet_encode 0.22 + transformer 0.22（encoder 权重 ~225 MB 的上传在里面） |
+| prefill | 0.14 s | |
+
+**下一步的最大三项**：①（⑦的）大权重上传，若能藏到 depth 生成期间 ≈ -0.4 s；
+②depth 的层 kernel（14 ms/帧 × 0.79 s 总计）：bf16 GEMV 现在 50-70 GB/s（`norm_gateup` 82 µs），
+靠 4 累加器/宽 load 提 ILP 是唯一方向，注意会改归约顺序；③encoder（0.50 s）。
 
 ---
 
 ## 7. 优化建议（**仅供参考**，按性价比排序）
 
-1. **depth 解码器的权重流**（LM 现在是最大头，~45% 端到端）：26.8 ms/帧 ≈ 38MB 权重 /
-   DRAM 带宽，L3 30MB 装不下、codebook 严格串行。可行方向：多线程预取池（单线程
-   prefetch 只有 ~13 GB/s，试过不够，见 6.3⑤）、或把 gateup+down 的带宽窗口与
-   qkv/o 的延迟重叠。收益上限 ~7 ms/帧。**动手前先在安静窗口（负载 <15%）复测**，
-   本机负载 20~45% 波动能吞掉这个量级的信号。
-2. **LM 在位的每帧开销**：depth_bench 26.8 ms/帧 vs 端到端 31~34 ms/帧，差的 4~7ms
-   是 backbone 步 + 采样 + KV 写。还没逐段profile过，先量再动手。
-3. **codec block4 残差单元已近 kernel 峰值**（~250-290 GFLOP/s vs conv_bench 244），
-   剩余空间有限。下一个 codec 目标是 upsample（0.17s）与 pre_transformer（0.15s）。
-4. **GPU 8×8 寄存器分块**（权重复用 8 次/字节）→ 目标 ≥400 GFLOP/s。然后把
-   `conv1d_cl` 接进 codec 的 GPU 路径（需要 GPU 版的 snake / 转置卷积 CL kernel）。
-   CPU 的分相转置卷积（37469b1）值得原样搬到 GPU。
+1. **大权重首次上传**（6.8⑦）：codec 一次 run 传 ~457 MB、encoder ~225 MB，实测在真流程里只有
+   ~0.85 GB/s（干净进程 2.5-5.9 GB/s，见 `upload_probe`）。先把“显存压力是否是原因”测清楚
+   （probe 里先占 1.5 GB 再测），再决定走“分块预取 + 与 depth 生成重叠”还是别的路。上限 ~0.4-0.5 s。
+2. **depth 的层 kernel**（14 ms/帧，占端到端 20%）：bf16 GEMV 实测 50-70 GB/s（`norm_gateup` 82 µs、
+   `silu_down` 29 µs），是 warp-per-row 单累加器 + 每元素一次 4 B load 的延迟问题。方向是
+   4 累加器 / vec4 宽 load / split-K（注意都会改归约顺序，需 `parity_lm` + `parity_pipeline` 双门）。
+3. **codec 的 DRAM 往返**：残差单元现在仍 = 2×(transpose+conv+transpose) + 2×snake(copy+kernel) + add。
+   把 snake 融进 conv 输入、residual 融进 conv 输出（CPU `snake_conv1d` 的 GPU 版），以及
+   snake 的 out-of-place 版本（现在多一次 72 MB 的 copy）。
+4. **encoder**（0.50 s）：seanet_encode 仍走 channels-first 朴素卷积（当年测过 CL 绕行更慢）。
+   现在 CL 卷积的占用率修好了（6.8③），值得重测。
 5. **torch RNG 对齐**：现在 CLI 的 `--seed` 用自研 xoshiro PRNG（可复现，但与
    `torch.manual_seed` 不同流）。要做到"同 seed 与参考逐 token 相同"，需要复刻 torch CPU 的
    MT19937 + `exponential_`（golden 里 `noise_all` 是参考的真实抽样，可用于校验）。
 6. **粤语 TN**：从 `opencc-python-reimplemented` 抽 s2hk 表入库。
 7. **流式解码**（chunk 300 / left context 25，参考 `chunked_decode`）、**场景矩阵**、
    **README**。
+8. **清理死代码**：`ArenaKernel`/`AF_*`/`arena_kernel`、旧 arena depth 路径
+   （`llama_layer_depth_arena`/`DepthBf16Weights`/`M5_DEPTH_ARENA`，其中 down_proj 的
+   in_features 误传 HIDDEN 是 bug）。
 
 ---
 

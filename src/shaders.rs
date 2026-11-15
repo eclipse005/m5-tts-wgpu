@@ -181,6 +181,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+/// Single-token GEMV with bf16 weights packed 2-per-u32 (resident, decoded
+/// in-shader): warp-per-row, 8 rows per workgroup, f32 accumulate. Halves the
+/// weight traffic for the LM decode GEMVs. Port of ming-3.0-tts GEMV_BF16W.
+pub const GEMV_BF16W_M5: &str = r#"
+// 0=rows 1=in_words (in_features / 2)
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 2>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+fn bf_lo(u: u32) -> f32 { return bitcast<f32>((u & 0xFFFFu) << 16u); }
+fn bf_hi(u: u32) -> f32 { return bitcast<f32>((u & 0xFFFF0000u)); }
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wg.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p[0]) {
+        let wbase = row * p[1];
+        var wi = lane;
+        loop {
+            if (wi >= p[1]) { break; }
+            let u = w[wbase + wi];
+            acc = acc + bf_lo(u) * x[wi * 2u] + bf_hi(u) * x[wi * 2u + 1u];
+            wi = wi + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        y[row] = sum;
+    }
+}
+"#;
+
 /// Tiled 2-D transpose: both sides coalesced via a padded shared tile.
 ///
 /// The naive one-element-per-thread kernel read x rows 752 KB apart - every
@@ -520,37 +563,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// output, measured 16-25 GFLOP/s on the P104). Weights are pre-packed on the
 /// host as `[(co*stride + q)*taps*cin + tap*cin + ci]` - one cache line's worth
 /// of broadcast reads per input channel per thread.
-pub const CONV_TRANSPOSE_PHASED_F32: &str = r#"
-// 0=cin 1=rows_total(cout*stride) 2=stride 3=t_in 4=cout 5=t_out 6=taps
-@group(0) @binding(0) var<storage, read> x: array<f32>;    // [cin, t_in]
-@group(0) @binding(1) var<storage, read> w2: array<f32>;   // [(tap*cin+ci)*rows + cq]
-@group(0) @binding(2) var<storage, read> b: array<f32>;
-@group(0) @binding(3) var<storage, read_write> y: array<f32>; // [cout, t_out]
-@group(0) @binding(4) var<storage, read> p: array<u32, 7>;
+/// Scatter for the phased transposed conv: `out[co][m*stride+q] = y[m][co*stride+q]`.
+///
+/// The convolution itself is the register-blocked causal one (`CONV1D_REG8_F32`
+/// with `cout := cout*stride`, tap order reversed in the packed weight): a
+/// transposed conv with `ks == stride * taps` is `taps`-tap causal conv on the
+/// phase rows, and reusing that kernel is what took the codec's upsampling from
+/// ~50 GFLOP/s to the same rate as its forward convolutions.
+pub const PHASED_INTERLEAVE_F32: &str = r#"
+// 0=rows(cout*stride) 1=stride 2=t_in
+@group(0) @binding(0) var<storage, read> y: array<f32>;        // [t_in, rows]
+@group(0) @binding(1) var<storage, read_write> out: array<f32>; // [rows/stride, t_in*stride]
+@group(0) @binding(2) var<storage, read> p: array<u32, 4>;
 
-const LANES: u32 = 8u;   // m per workgroup: consecutive lanes read x coalesced
-const SLOTS: u32 = 32u;  // (co,q) slots per workgroup: ci-major w2 reads coalesce
-
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let cq = wid.x * SLOTS + lid.x / LANES;   // co*stride + q
-    let m = wid.y * LANES + lid.x % LANES;
-    // one accumulator per thread: a runtime-indexed local array spills to local
-    // memory on this backend and cost ~3x (measured).
-    var acc = 0.0;
-    if (cq < p[1] && m < p[3]) {
-        let co = cq / p[2];
-        let q = cq % p[2];
-        for (var tap = 0u; tap < p[6]; tap = tap + 1u) {
-            // the m >= tap edge is thread-uniform, so the branch leaves the ci loop
-            if (m >= tap) {
-                for (var ci = 0u; ci < p[0]; ci = ci + 1u) {
-                    acc = acc + x[ci * p[3] + m - tap] * w2[(tap * p[0] + ci) * p[1] + cq];
-                }
-            }
-        }
-        let t = m * p[2] + q;
-        y[co * p[5] + t] = acc + b[co];
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    let cout = p[0] / p[1];
+    if (i >= cout * p[2]) { return; }
+    let co = i / p[2];
+    let m = i % p[2];
+    let src = m * p[0] + co * p[1];
+    let dst = co * p[2] * p[1] + m * p[1];
+    for (var q = 0u; q < p[1]; q = q + 1u) {
+        out[dst + q] = y[src + q];
     }
 }
 "#;
@@ -578,6 +614,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#;
 
 /// `y = x`, used by [`crate::device::Device::copy`].
+/// `y[0..len] = value`, 4 stores per thread.
+///
+/// `Device::zeros` used to reach the device by uploading a host-side zero vec
+/// through `queue.write_buffer`: at codec block-4 sizes that is a 72 MB copy over
+/// a x1 PCIe link (~2 GB/s measured) for data the GPU could write itself in a
+/// fraction of a millisecond.
+pub const FILL_F32: &str = r#"
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32, 2>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let base = (gid.x + gid.y * nwg.x * 128u) * 4u;
+    let v = bitcast<f32>(p[1]);
+    if (base + 3u < p[0]) {
+        y[base] = v;
+        y[base + 1u] = v;
+        y[base + 2u] = v;
+        y[base + 3u] = v;
+    } else {
+        for (var i = base; i < p[0]; i = i + 1u) { y[i] = v; }
+    }
+}
+"#;
+
 pub const COPY_F32: &str = r#"
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -803,9 +864,15 @@ pub const CONV1D_REG8_F32: &str = r#"
 const TT: u32 = 64u;
 const CT: u32 = 64u;
 const CI: u32 = 16u;
-const WIN_MAX: u32 = 64u * 8u + 64u;
+/// Input window per staged channel: `TT * stride + (ks - 1) * dilation + 1`.
+/// The only caller (`codec::seanet::causal_conv`) runs stride 1 with ks in
+/// {1, 3, 7} and dilation in {1, 3, 9}, so the widest window is 64 + 54 + 1 =
+/// 119. The array used to be sized 576 per channel (36 KB of workgroup memory),
+/// which capped occupancy at two workgroups per SM on the P104 and ran these
+/// convolutions at ~500 GFLOP/s instead of the kernel's ~1 TFLOP/s ceiling.
+const WIN_MAX: u32 = 128u;
 
-var<workgroup> stage: array<f32, 16 * 576>;
+var<workgroup> stage: array<f32, 16 * 128>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
@@ -1894,6 +1961,501 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 "#;
 
+// ---- uniform-arena fused decode kernels (ming nn.rs pattern) ----
+// Same math as the storage-params fused kernels above, but the parameter block
+// is a uniform at binding 0 selected by a dynamic offset into the shared arena.
+// That lets a cached bind group be replayed with a fresh params slot per
+// dispatch (no per-dispatch buffer write, no params overwrite when a layer's
+// key repeats inside one batch). Storage bindings shift to 1..
+
+/// RMSNorm, uniform params {rows, cols, eps_bits, pad}.
+pub const AF_RMS: &str = r#"
+struct P { rows: u32, cols: u32, eps_bits: u32, pad: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = p.cols;
+    let row = wid.x;
+    let lane = lid.x;
+    let base = row * cols;
+    var acc = 0.0;
+    var c = lane;
+    loop {
+        if (c >= cols) { break; }
+        let v = x[base + c];
+        acc = acc + v * v;
+        c = c + 64u;
+    }
+    partial[lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + partial[i]; }
+        let eps = bitcast<f32>(p.eps_bits);
+        partial[0] = inverseSqrt(total / f32(cols) + eps);
+    }
+    workgroupBarrier();
+    let inv = partial[0];
+    var c2 = lane;
+    loop {
+        if (c2 >= cols) { break; }
+        y[base + c2] = x[base + c2] * inv * w[c2];
+        c2 = c2 + 64u;
+    }
+}
+"#;
+
+/// Single-token GEMV, uniform params {m, n, k, has_bias}.
+pub const AF_GEMV: &str = r#"
+struct P { m: u32, n: u32, k: u32, has_bias: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    let kdim = p.k;
+    var acc = 0.0;
+    if (row < p.n) {
+        let base = row * kdim;
+        var i = lane;
+        loop {
+            if (i >= kdim) { break; }
+            acc = acc + x[i] * w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.n) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        if (p.has_bias == 1u) { sum = sum + b[row]; }
+        y[row] = sum;
+    }
+}
+"#;
+
+/// Fused rope + KV append + decode attention, uniform params
+/// {q_rows, kv_rows, head_dim, position, heads, pad0, pad1, pad2}.
+pub const AF_QKV_ATTEND: &str = r#"
+struct P { q_rows: u32, kv_rows: u32, head_dim: u32, position: u32,
+           heads: u32, pad0: u32, pad1: u32, pad2: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> cache_k: array<f32>;
+@group(0) @binding(3) var<storage, read_write> cache_v: array<f32>;
+@group(0) @binding(4) var<storage, read_write> attended: array<f32>;
+@group(0) @binding(5) var<storage, read> cos_t: array<f32>;
+@group(0) @binding(6) var<storage, read> sin_t: array<f32>;
+
+var<workgroup> qs: array<f32, 64>;
+var<workgroup> ks: array<f32, 64>;
+var<workgroup> scores: array<f32, 1024>;
+var<workgroup> red123: array<f32, 1>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let hd = p.head_dim;
+    let t = lid.x;
+    let qo = head * hd;
+    let kvh = head / (p.q_rows / p.kv_rows);
+
+    qs[t] = qkv[qo + t];
+    ks[t] = qkv[p.q_rows + kvh * hd + t];
+    let vv = qkv[p.q_rows + p.kv_rows + kvh * hd + t];
+
+    workgroupBarrier();
+    if (t < hd / 2u) {
+        let c = cos_t[p.position * hd + t];
+        let sn = sin_t[p.position * hd + t];
+        let ha = qs[t]; let hb = qs[t + hd / 2u];
+        qs[t] = ha * c - hb * sn;
+        qs[t + hd / 2u] = hb * c + ha * sn;
+        let ka = ks[t]; let kb = ks[t + hd / 2u];
+        ks[t] = ka * c - kb * sn;
+        ks[t + hd / 2u] = kb * c + ka * sn;
+    }
+    workgroupBarrier();
+
+    let off = p.position * p.q_rows + qo;
+    cache_k[off + t] = ks[t];
+    cache_v[off + t] = vv;
+    workgroupBarrier();
+
+    let len = p.position + 1u;
+    let scale = 1.0 / sqrt(f32(hd));
+    for (var j = t; j < len; j = j + 64u) {
+        var acc = 0.0;
+        for (var i = 0u; i < hd; i = i + 1u) { acc = acc + qs[i] * cache_k[j * p.q_rows + qo + i]; }
+        scores[j] = acc * scale;
+    }
+    workgroupBarrier();
+    if (t == 0u) {
+        var maxs = -1e30;
+        for (var j = 0u; j < len; j = j + 1u) { maxs = max(maxs, scores[j]); }
+        var sum = 0.0;
+        for (var j = 0u; j < len; j = j + 1u) {
+            let e = exp(scores[j] - maxs);
+            scores[j] = e;
+            sum = sum + e;
+        }
+        red123[0u] = 1.0 / sum;
+    }
+    workgroupBarrier();
+    let inv_sum = red123[0u];
+    if (t < hd) {
+        var acc = 0.0;
+        for (var j = 0u; j < len; j = j + 1u) {
+            acc = acc + scores[j] * cache_v[j * p.q_rows + qo + t];
+        }
+        attended[qo + t] = acc * inv_sum;
+    }
+}
+"#;
+
+/// GEMV + residual, uniform params {n, k, pad0, pad1}.
+pub const AF_GEMV_ADD: &str = r#"
+struct P { n: u32, k: u32, pad0: u32, pad1: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> res: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p.n) {
+        let base = row * p.k;
+        var i = lane;
+        loop {
+            if (i >= p.k) { break; }
+            acc = acc + x[i] * w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.n) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        y[row] = sum + res[row];
+    }
+}
+"#;
+
+/// Fused RMSNorm -> gate+up, uniform params {inter, hidden, eps_bits, pad}.
+pub const AF_NORM_GATEUP: &str = r#"
+struct P { inter: u32, hidden: u32, eps_bits: u32, pad: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(3) var<storage, read> gate_w: array<f32>;
+@group(0) @binding(4) var<storage, read> up_w: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+var<workgroup> normed: array<f32, 512>;
+var<workgroup> nred: array<f32, 256>;
+var<workgroup> wred: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let hidden = p.hidden;
+    let inter = p.inter;
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+
+    var sq = 0.0;
+    for (var i = lid.x; i < hidden; i = i + 256u) { sq = sq + x[i] * x[i]; }
+    nred[lid.x] = sq;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var sum = 0.0;
+        for (var i = 0u; i < 256u; i = i + 1u) { sum = sum + nred[i]; }
+        nred[0u] = 1.0 / sqrt(sum / f32(hidden) + bitcast<f32>(p.eps_bits));
+    }
+    workgroupBarrier();
+    let inv = nred[0u];
+    for (var i = lid.x; i < hidden; i = i + 256u) {
+        normed[i] = x[i] * inv * norm_w[i];
+    }
+    workgroupBarrier();
+
+    for (var r = 0u; r < 8u; r = r + 1u) {
+        let row = wid.x * 64u + warp + 8u * r;
+        if (row < 2u * inter) {
+            var acc = 0.0;
+            if (row < inter) {
+                let wrow = row * hidden;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    acc = acc + normed[i] * gate_w[wrow + i];
+                }
+            } else {
+                let wrow = (row - inter) * hidden;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    acc = acc + normed[i] * up_w[wrow + i];
+                }
+            }
+            wred[warp][lane] = acc;
+            workgroupBarrier();
+            if (lane == 0u) {
+                var sum = 0.0;
+                for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + wred[warp][i]; }
+                y[row] = sum;
+            }
+            workgroupBarrier();
+        }
+    }
+}
+"#;
+
+/// Fused silu-mul -> down -> residual, uniform params {inter, hidden, pad0, pad1}.
+pub const AF_SILU_DOWN: &str = r#"
+struct P { inter: u32, hidden: u32, pad0: u32, pad1: u32, }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(2) var<storage, read> down_w: array<f32>;
+@group(0) @binding(3) var<storage, read> x1: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let inter = p.inter;
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p.hidden) {
+        let base = row * inter;
+        var i = lane;
+        loop {
+            if (i >= inter) { break; }
+            let g = gate_up[i];
+            let u = gate_up[inter + i];
+            let act = g / (1.0 + exp(-g)) * u;
+            acc = acc + act * down_w[base + i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p.hidden) {
+        var sum = 0.0;
+        for (var i = 0u; i < 32u; i = i + 1u) { sum = sum + red[warp][i]; }
+        out[row] = sum + x1[row];
+    }
+}
+"#;
+
+// ---- bf16-weight fused decode kernels (storage params, cached bind groups) ----
+// Weights are resident bf16 packed 2-per-u32 (little-endian pairs); activations
+// stay f32. The inner loop walks elements in the SAME order as the f32 kernels
+// (lane, lane+32, ...) and expands each bf16 exactly, so the result is
+// bit-identical to the f32 path while reading half the weight bytes.
+
+/// GEMV with bf16 weights, params {m, n, k, has_bias}.
+pub const GEMV_BF16_F32: &str = r#"
+// 0=m 1=n 2=k 3=has_bias
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    let kdim = p[2];
+    var acc = 0.0;
+    if (row < p[1]) {
+        let base = row * (kdim / 2u);
+        var i = lane;
+        loop {
+            if (i >= kdim) { break; }
+            let u = w[base + (i >> 1u)];
+            let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
+            acc = acc + v * x[i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p[1]) {
+        var sum = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + red[warp][j]; }
+        if (p[3] == 1u) { sum = sum + b[row]; }
+        y[row] = sum;
+    }
+}
+"#;
+
+/// GEMV + residual with bf16 weights, params {n, k}.
+pub const GEMV_ADD_BF16_F32: &str = r#"
+// 0=n 1=k
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<u32>;
+@group(0) @binding(2) var<storage, read> res: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 2>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p[0]) {
+        let base = row * (p[1] / 2u);
+        var i = lane;
+        loop {
+            if (i >= p[1]) { break; }
+            let u = w[base + (i >> 1u)];
+            let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
+            acc = acc + v * x[i];
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p[0]) {
+        var sum = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + red[warp][j]; }
+        y[row] = sum + res[row];
+    }
+}
+"#;
+
+/// Fused RMSNorm -> gate+up with bf16 weights, params {inter, hidden, eps_bits}.
+pub const NORM_GATEUP_BF16_F32: &str = r#"
+// 0=inter 1=hidden 2=eps_bits
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read> gate_w: array<u32>;
+@group(0) @binding(3) var<storage, read> up_w: array<u32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+@group(0) @binding(5) var<storage, read> p: array<u32, 3>;
+var<workgroup> normed: array<f32, 512>;
+var<workgroup> nred: array<f32, 256>;
+var<workgroup> wred: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let hidden = p[1];
+    let inter = p[0];
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+
+    var sq = 0.0;
+    for (var i = lid.x; i < hidden; i = i + 256u) { sq = sq + x[i] * x[i]; }
+    nred[lid.x] = sq;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var sum = 0.0;
+        for (var i = 0u; i < 256u; i = i + 1u) { sum = sum + nred[i]; }
+        nred[0u] = 1.0 / sqrt(sum / f32(hidden) + bitcast<f32>(p[2]));
+    }
+    workgroupBarrier();
+    let inv = nred[0u];
+    for (var i = lid.x; i < hidden; i = i + 256u) {
+        normed[i] = x[i] * inv * norm_w[i];
+    }
+    workgroupBarrier();
+
+    let half = hidden / 2u;
+    for (var r = 0u; r < 8u; r = r + 1u) {
+        let row = wid.x * 64u + warp + 8u * r;
+        if (row < 2u * inter) {
+            var acc = 0.0;
+            if (row < inter) {
+                let wrow = row * half;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    let u = gate_w[wrow + (i >> 1u)];
+                    let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
+                    acc = acc + normed[i] * v;
+                }
+            } else {
+                let wrow = (row - inter) * half;
+                for (var i = lane; i < hidden; i = i + 32u) {
+                    let u = up_w[wrow + (i >> 1u)];
+                    let v = select(bitcast<f32>(u & 0xFFFF0000u), bitcast<f32>((u & 0xFFFFu) << 16u), (i & 1u) == 0u);
+                    acc = acc + normed[i] * v;
+                }
+            }
+            wred[warp][lane] = acc;
+            workgroupBarrier();
+            if (lane == 0u) {
+                var sum = 0.0;
+                for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
+                y[row] = sum;
+            }
+            workgroupBarrier();
+        }
+    }
+}
+"#;
+
+/// Fused silu-mul -> down -> residual with bf16 weights, params {inter, hidden}.
+pub const SILU_DOWN_BF16_F32: &str = r#"
+// 0=inter 1=hidden
+@group(0) @binding(0) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(1) var<storage, read> down_w: array<u32>;
+@group(0) @binding(2) var<storage, read> x1: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 2>;
+var<workgroup> red: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let inter = p[0];
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 8u + warp;
+    var acc = 0.0;
+    if (row < p[1]) {
+        let base = row * (inter / 2u);
+        var i = lane;
+        loop {
+            if (i >= inter) { break; }
+            let g = gate_up[i];
+            let u = gate_up[inter + i];
+            let act = g / (1.0 + exp(-g)) * u;
+            let wu = down_w[base + (i >> 1u)];
+            let v = select(bitcast<f32>(wu & 0xFFFF0000u), bitcast<f32>((wu & 0xFFFFu) << 16u), (i & 1u) == 0u);
+            acc = acc + act * v;
+            i = i + 32u;
+        }
+    }
+    red[warp][lane] = acc;
+    workgroupBarrier();
+    if (lane == 0u && row < p[1]) {
+        var sum = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + red[warp][j]; }
+        out[row] = sum + x1[row];
+    }
+}
+"#;
+
 /// Copy `rows` rows into `dst` starting at row `offset` (KV-cache append).
 pub const WRITE_ROWS_F32: &str = r#"
 // 0=cols 1=offset 2=rows
@@ -2104,20 +2666,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// top-k sampler, port of `sample_topk` + `_multinomial_sample_one_no_sync`.
 ///
 /// Mask EOS, divide by temperature, keep the top-k, then `argmax(probs / noise)`.
-/// Parallel max/sum over 256 lanes; the final scans are serial in lane 0, which is
-/// a few microseconds and still far cheaper than a host round-trip.
+/// The cutoff is the exact k-th largest score, found by radix select on the
+/// order-preserving u32 image of the f32 bits: four 8-bit passes, each one
+/// O(vocab/256) scan plus a 256-bin walk, so ~50 element visits per lane
+/// instead of the O(vocab^2) ranking this kernel used to do (2.8 ms a call,
+/// 45 ms of a 59 ms depth frame; the whole decode loop samples 16 times).
+/// max / sum / argmax then stay single strided passes; their reduction order is
+/// unchanged from the parity-verified version, so results are bit-identical.
 pub const SAMPLE_TOPK_F32: &str = r#"
 // 0=vocab 1=topk 2=temperature(bits) 3=allow_eos*2 + out_offset 4=noise row offset
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> noise: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<u32>;
 @group(0) @binding(3) var<storage, read> p: array<u32, 5>;
+var<workgroup> bins: array<atomic<u32>, 256>;
 var<workgroup> part: array<f32, 256>;
+var<workgroup> pidx: array<u32, 256>;
+// 0 = key prefix chosen so far, 1 = rank still to skip inside that prefix
+var<workgroup> state: array<u32, 2>;
 
 fn score(i: u32) -> f32 {
-    var v = logits[i] / bitcast<f32>(p[2]);
-    if (i == 0u && (p[3] & 1u) == 0u) { v = -1e5; }
-    return v;
+    if (i == 0u && (p[3] & 1u) == 0u) { return -1e5; }
+    return logits[i] / bitcast<f32>(p[2]);
+}
+
+// Monotone map f32 -> u32: comparing keys orders the floats, ties and all.
+fn okey(v: f32) -> u32 {
+    let b = bitcast<u32>(v);
+    if ((b & 0x80000000u) != 0u) { return ~b; }
+    return b | 0x80000000u;
 }
 
 @compute @workgroup_size(256)
@@ -2125,40 +2702,55 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let lane = lid.x;
     let vocab = p[0];
     let topk = min(p[1], vocab);
-
-    // Cutoff = k-th largest. Each lane ranks its own strided subset by counting how
-    // many scores beat it (O(vocab) per element, /256 lanes), then the kept scores'
-    // minimum is reduced across the workgroup.
-    var local_min = 1e30;
-    var i = lane;
-    loop {
-        if (i >= vocab) { break; }
-        let vi = score(i);
-        var greater = 0u;
-        for (var j = 0u; j < vocab; j = j + 1u) {
-            let vj = score(j);
-            if (vj > vi || (vj == vi && j < i)) { greater = greater + 1u; }
-        }
-        if (greater < topk) { local_min = min(local_min, vi); }
-        i = i + 256u;
-    }
-    part[lane] = local_min;
-    workgroupBarrier();
     if (lane == 0u) {
-        var m = 1e30;
-        for (var j = 0u; j < 256u; j = j + 1u) { m = min(m, part[j]); }
-        part[0] = m;
+        state[0] = 0u;
+        state[1] = topk - 1u;
     }
+    atomicStore(&bins[lane], 0u);
     workgroupBarrier();
-    let cutoff = part[0];
+
+    // Radix select, most significant digit first. `prefix` is the high digits
+    // already fixed, so digit_pass p only counts keys inside that prefix; `rank` is
+    // the number of keys still to skip inside it.
+    for (var digit_pass = 0u; digit_pass < 4u; digit_pass = digit_pass + 1u) {
+        let shift = 24u - 8u * digit_pass;
+        let prefix = state[0];
+        var i = lane;
+        loop {
+            if (i >= vocab) { break; }
+            let key = okey(score(i));
+            if (((key >> shift) >> 8u) == prefix) {
+                atomicAdd(&bins[(key >> shift) & 255u], 1u);
+            }
+            i = i + 256u;
+        }
+        workgroupBarrier();
+        if (lane == 0u) {
+            var acc = 0u;
+            let rank = state[1];
+            for (var d = 255u; ; d = d - 1u) {
+                let c = atomicLoad(&bins[d]);
+                if (acc + c > rank) {
+                    state[0] = (prefix << 8u) | d;
+                    state[1] = rank - acc;
+                    break;
+                }
+                acc = acc + c;
+            }
+        }
+        workgroupBarrier();
+        atomicStore(&bins[lane], 0u);
+        workgroupBarrier();
+    }
+    let cutoff = state[0];
 
     // Parallel max over surviving scores.
     var local_max = -1e30;
-    i = lane;
+    var i = lane;
     loop {
         if (i >= vocab) { break; }
         let v = score(i);
-        if (v >= cutoff && v > local_max) { local_max = v; }
+        if (okey(v) >= cutoff && v > local_max) { local_max = v; }
         i = i + 256u;
     }
     part[lane] = local_max;
@@ -2177,7 +2769,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     loop {
         if (i >= vocab) { break; }
         let v = score(i);
-        if (v >= cutoff) { local_sum = local_sum + exp(v - maxv); }
+        if (okey(v) >= cutoff) { local_sum = local_sum + exp(v - maxv); }
         i = i + 256u;
     }
     part[lane] = local_sum;
@@ -2190,18 +2782,36 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     workgroupBarrier();
     let total = part[0];
 
-    // argmax(probs / noise) over survivors.
+    // argmax(probs / noise) over survivors: per-lane best, then a reduce that
+    // breaks exact ties towards the lower index, i.e. the same token the old
+    // serial scan produced.
+    var best_ratio = -1e30;
+    var best = 0u;
+    i = lane;
+    loop {
+        if (i >= vocab) { break; }
+        let v = score(i);
+        if (okey(v) >= cutoff) {
+            let ratio = (exp(v - maxv) / total) / noise[p[4] + i];
+            if (ratio > best_ratio) { best_ratio = ratio; best = i; }
+        }
+        i = i + 256u;
+    }
+    part[lane] = best_ratio;
+    pidx[lane] = best;
+    workgroupBarrier();
     if (lane == 0u) {
-        var best_i = 0u;
-        var best_ratio = -1e30;
-        for (var j = 0u; j < vocab; j = j + 1u) {
-            let v = score(j);
-            if (v >= cutoff) {
-                let ratio = (exp(v - maxv) / total) / noise[p[4] + j];
-                if (ratio > best_ratio) { best_ratio = ratio; best_i = j; }
+        var pick_ratio = -1e30;
+        var pick = 0u;
+        for (var j = 0u; j < 256u; j = j + 1u) {
+            let r = part[j];
+            let index = pidx[j];
+            if (r > pick_ratio || (r == pick_ratio && index < pick)) {
+                pick_ratio = r;
+                pick = index;
             }
         }
-        out[p[3] >> 1u] = best_i;
+        out[p[3] >> 1u] = pick;
     }
 }
 "#;

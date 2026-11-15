@@ -1063,13 +1063,16 @@ mod perf_tests {
 /// `[tap * cin + ci][co]`, adding the bias later (biases stay separate).
 pub fn pack_conv_weights(w: &[f32], cout: usize, cin: usize, ks: usize) -> Vec<f32> {
     let mut packed = vec![0.0f32; ks * cin * cout];
-    for co in 0..cout {
-        for ci in 0..cin {
-            for tap in 0..ks {
-                packed[(tap * cin + ci) * cout + co] = w[(co * cin + ci) * ks + tap];
-            }
+    // One task per destination row: the decoder's block-1 convolutions alone pack
+    // 4.1 M weights, and serial this pass cost ~50 ms per weight on the way to the
+    // card (it showed up as "setup" inside the first convolution of each block).
+    packed.par_chunks_mut(cout).enumerate().for_each(|(row, out)| {
+        let tap = row / cin;
+        let ci = row % cin;
+        for (co, value) in out.iter_mut().enumerate() {
+            *value = w[(co * cin + ci) * ks + tap];
         }
-    }
+    });
     packed
 }
 
@@ -1098,16 +1101,18 @@ pub fn pack_conv_transpose_phased(w: &[f32], cin: usize, cout: usize, ks: usize,
     let taps = ks / stride;
     let rows = cout * stride;
     let mut out = vec![0.0f32; rows * taps * cin];
-    for tap in 0..taps {
-        for ci in 0..cin {
-            for co in 0..cout {
-                for q in 0..stride {
-                    out[(tap * cin + ci) * rows + co * stride + q] =
-                        w[(ci * cout + co) * ks + q + tap * stride];
-                }
-            }
+    // Taps are stored in reverse: the phased form sums `x[m - tap] * w[tap]`,
+    // while the register-blocked causal conv this feeds sums
+    // `x[t - (taps - 1) + k] * w[k]`, so row block `k` carries the model's tap
+    // `taps - 1 - k`. Nothing else reads this layout.
+    out.par_chunks_mut(rows).enumerate().for_each(|(row, dst)| {
+        let tap = taps - 1 - row / cin;
+        let ci = row % cin;
+        for co in 0..cout {
+            let src = &w[(ci * cout + co) * ks + tap * stride..][..stride];
+            dst[co * stride..co * stride + stride].copy_from_slice(src);
         }
-    }
+    });
     out
 }
 

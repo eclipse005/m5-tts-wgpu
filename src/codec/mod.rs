@@ -246,6 +246,8 @@ impl Codec {
             bail!("phased transposed conv is GPU-only");
         };
         let [cin, t_in] = x.shape();
+        let taps = ks / stride;
+        let rows = cout * stride;
         let key = format!("phased.{weight_name}");
         let hit = self.cache.borrow().get(&key).cloned();
         let w2 = if let Some(t) = hit {
@@ -253,15 +255,36 @@ impl Codec {
         } else {
             let raw = self.weights.get_f32(weight_name)?;
             let packed = cpu_ops::pack_conv_transpose_phased(&raw, cin, cout, ks, stride);
-            let t = Rc::new(self.dev.tensor([cout * ks, cin], &packed)?);
+            let t = Rc::new(self.dev.tensor([taps * cin, rows], &packed)?);
             self.cache.borrow_mut().insert(key, t.clone());
             t
         };
-        let bias = self.vector(bias_name, cout)?;
+        // The conv epilogue indexes the bias by output row, so replicate each
+        // channel's bias over its `stride` phase rows once per layer.
+        let bkey = format!("phased-bias.{bias_name}");
+        let bhit = self.cache.borrow().get(&bkey).cloned();
+        let b_rows = if let Some(t) = bhit {
+            t
+        } else {
+            let raw = self.weights.get_f32(bias_name)?;
+            let mut expanded = vec![0.0f32; rows];
+            for (row, value) in expanded.iter_mut().enumerate() {
+                *value = raw[row / stride];
+            }
+            let t = Rc::new(self.dev.tensor([rows, 1], &expanded)?);
+            self.cache.borrow_mut().insert(bkey, t.clone());
+            t
+        };
+        // Transposed conv with ks == stride * taps == taps causal taps over the
+        // phase rows, so it runs on the same register-blocked kernel the
+        // forward convolutions use (8x8 per thread, inputs staged).
+        let x_cl = gpu.empty("tconv.x_cl", t_in * cin);
+        crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, &x_cl, cin, t_in);
+        let y_cl = gpu.empty("tconv.y_cl", t_in * rows);
+        crate::gpu_ops::conv1d_reg8(gpu, &x_cl, w2.gpu_buffer()?, b_rows.gpu_buffer()?, &y_cl,
+                                    cin, rows, taps, 1, 1, taps - 1, t_in, t_in);
         let out = self.dev.zeros([cout, t_in * stride])?;
-        crate::gpu_ops::conv_transpose_phased(gpu, x.gpu_buffer()?, w2.gpu_buffer()?,
-                                              bias.gpu_buffer()?, out.gpu_buffer()?,
-                                              cin, cout, ks, stride, t_in);
+        crate::gpu_ops::phased_interleave(gpu, &y_cl, out.gpu_buffer()?, rows, stride, t_in);
         Ok(out)
     }
 
