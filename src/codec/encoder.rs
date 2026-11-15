@@ -39,12 +39,41 @@ impl Codec {
                 ks: usize, stride: usize) -> Result<Tensor> {
         let dev = self.device();
         let [cin, t_in] = x.shape();
-        let weight = self.tensor(weight_name, [cout, cin * ks])?;
         let bias = self.vector(bias_name, cout)?;
-        let mut geometry = causal(ks, stride, t_in);
+        let geometry = causal(ks, stride, t_in);
+        let t_out = geometry.t_out;
+        let mut out = dev.zeros([cout, t_out])?;
+        if let crate::device::Device::Gpu(gpu) = dev {
+            // Channels-last register-blocked kernel, the same one the decoder
+            // uses: the channels-first fallback is one thread per output with no
+            // weight reuse, and the encoder ran at ~70 GFLOP/s (3% of this card)
+            // because of it. Earlier the CL detour measured slower here - that
+            // was before the 8x8 blocking and before the workgroup staging array
+            // was cut from 36 KB to 8 KB (six times the occupancy).
+            let packed = self.packed_conv1d(weight_name, cout, cin, ks)?;
+            let x_cl = gpu.empty("enc.x_cl", t_in * cin);
+            crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, &x_cl, cin, t_in);
+            let y_cl = gpu.empty("enc.y_cl", t_out * cout);
+            // The 8x8-blocked kernel stages 64 output timesteps, i.e.
+            // `64*stride + kernel` input samples per channel; its 8 KB window
+            // covers the decoder's stride-1 shapes but not the encoder's strided
+            // ones (528 samples at stride 8). Those go to the older channels-last
+            // kernel, whose staging holds 640.
+            let win_len = 64 * stride + ks;
+            if win_len <= 128 {
+                crate::gpu_ops::conv1d_reg8(gpu, &x_cl, packed.gpu_buffer()?, bias.gpu_buffer()?,
+                                            &y_cl, cin, cout, ks, 1, stride, ks - stride, t_in, t_out);
+            } else {
+                crate::gpu_ops::conv1d_cl(gpu, &x_cl, packed.gpu_buffer()?, bias.gpu_buffer()?, &y_cl,
+                                          cin, cout, ks, 1, stride, ks - stride, t_in, t_out);
+            }
+            crate::gpu_ops::transpose(gpu, &y_cl, out.gpu_buffer()?, t_out, cout);
+            return Ok(out);
+        }
+        let weight = self.tensor(weight_name, [cout, cin * ks])?;
+        let mut geometry = geometry;
         geometry.cin = cin;
         geometry.cout = cout;
-        let mut out = dev.zeros([cout, geometry.t_out])?;
         ops::conv1d(dev, x, &weight, &bias, &mut out, &geometry)?;
         Ok(out)
     }

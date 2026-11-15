@@ -914,7 +914,13 @@ kernel 单独测是 92 µs/步，而真实帧里每步要 190 µs——**每个"
 | GEMV 类 kernel 全部 16 字节宽 load（`array<vec4<u32>>`/`vec4<f32>`）+ 4 累加器 | 一层步 163 → 92 µs；norm_gateup 82 → 20-28 µs |
 | `norm_gateup` 每 WG 行数 64 → 32（= 64 → 128 个 WG） | depth 21.2 → 18.9 ms/帧（**注意：512 个 WG 反而更慢**，见 6.14） |
 | rms 融进 qkv 投影（`NORM_GEMV_BF16_F32`） | 层步 6 → 5 dispatch |
-| **每帧 2-token prefill 换掉 16×16 tile GEMM**：新增 `LINEAR_ROW_F32`（m ≤ 8 时用，一行一线程，**保持同一累加顺序**所以数值逐位相同） | prefill 5.8 → 2.8 ms/帧，depth 17.7 → 15.0 ms，RTF **0.54 → 0.47-0.48** |
+| **每帧 2-token prefill 换掉 16×16 tile GEMM**：新增 `LINEAR_ROW_F32`（m ≤ 8 时用，一行一线程，**保持同一累加顺序**所以数值逐位相同） | prefill 5.8 → 2.8 ms/帧，depth 17.7 → 15.0 ms |
+| **编码器（encode 阶段）改走 channels-last 卷积**（`conv1d_reg8` 窗口不够的 strided 层用 `conv1d_cl`） | `encode/seanet_encode` 0.213 → **0.058 s**（朴素 channels-first 只有 ~70 GFLOP/s，峰值的 3%）；encode 0.289 → 0.131 s，RTF **0.47 → 0.44** |
+
+**codec 解码的实测构成**（`examples/codec_unit_probe.rs`，block4 = 96ch × 188k）：
+transpose 1.35 ms（×4/单元）、snake(copy+kernel) 4.07（×2）、add 0.95、conv7 **19.5**（1245 GFLOP/s，
+峰值的 59%）、conv1 6.37、整个单元 73.6 ms。**conv 已近峰值，剩下的是 6 趟 DRAM 往返**；
+再往下要靠"snake 融进 conv 输入 + residual 融进 conv epilogue"（估计省 ~13 ms/单元 = codec -13%）。
 
 **踩到的两个坑**（都回滚了，别重蹈）：
 
