@@ -44,10 +44,14 @@ struct Cli {
     temperature: f32,
     #[arg(long, default_value_t = 10)]
     topk: usize,
-    /// Longest utterance, in milliseconds (reference `max_audio_length_ms`,
-    /// default 40 s; generation stops there even without an EOS).
-    #[arg(long, default_value_t = 40000.0)]
-    max_audio_length_ms: f64,
+    /// Longest utterance, in milliseconds (the reference's `max_audio_length_ms`),
+    /// for callers that want its exact behaviour: the budget is used as given and
+    /// an utterance that cannot fit the model's context is an error. Omit it for
+    /// the default, which gives each pass the whole context (so a long script is
+    /// read to its end instead of being cut at 40 s) and splits text that cannot
+    /// fit one pass into sentences.
+    #[arg(long)]
+    max_audio_length_ms: Option<f64>,
     #[arg(long, default_value_t = 1234)]
     seed: u64,
     #[arg(long, default_value = "output.wav")]
@@ -103,8 +107,12 @@ fn main() -> Result<()> {
         temperature: cli.temperature,
         topk: cli.topk,
         max_audio_frames: 500,
-    }
-    .with_max_audio_length_ms(cli.max_audio_length_ms)?;
+        auto_length: cli.max_audio_length_ms.is_none(),
+    };
+    let args = match cli.max_audio_length_ms {
+        Some(ms) => args.with_max_audio_length_ms(ms)?,
+        None => args,
+    };
     let mut noise = PrngNoise::new(cli.seed);
     let started = std::time::Instant::now();
     let out = pipeline.synthesize(&args, &mut noise as &mut dyn NoiseSource)?;

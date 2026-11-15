@@ -64,6 +64,12 @@ pub struct Args {
     pub temperature: f32,
     pub topk: usize,
     pub max_audio_frames: usize,
+    /// Automatic length: each pass gets the model's whole context, and text that
+    /// cannot fit one pass is split into sentences (see `plan_fragments`). The
+    /// default for the CLI; the reference's explicit `max_audio_length_ms`
+    /// semantics - budget exactly as given, error when it cannot fit - are what
+    /// `with_max_audio_length_ms` selects.
+    pub auto_length: bool,
 }
 
 impl Args {
@@ -75,6 +81,7 @@ impl Args {
             bail!("max_audio_length_ms must be at least 800");
         }
         self.max_audio_frames = (ms / 80.0) as usize;
+        self.auto_length = false;
         Ok(self)
     }
 }
@@ -92,6 +99,7 @@ impl Default for Args {
             temperature: 0.9,
             topk: 10,
             max_audio_frames: 500,
+            auto_length: false,
         }
     }
 }
@@ -169,6 +177,138 @@ impl Pipeline {
         Ok(codes)
     }
 
+    /// Tokens the conditioning costs before any target text (control tokens plus
+    /// the reference transcript), i.e. what every fragment pays once.
+    fn fixed_prompt_tokens(&self, args: &Args) -> Result<usize> {
+        let cloning = args.prompt_wav.is_some();
+        let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
+        let spoken = args.prompt_text.clone().unwrap_or_default();
+        let conditioned = format_conditioned_text(&spoken, Some(&speaker), args.accent.as_deref(),
+                                                  Some(&args.lang), args.caption.as_deref())?;
+        Ok(self.lm.tok.encode(&conditioned)?.len())
+    }
+
+    /// Split the target text into fragments that each fit one pass.
+    ///
+    /// Only the automatic path calls this. Sentences first, then clauses, then a
+    /// plain character cut for a run with no punctuation at all; every boundary is
+    /// checked by encoding the conditioned text, so a fragment is guaranteed to
+    /// leave room for at least one generated frame.
+    fn plan_fragments(&self, args: &Args, text: &str, budget: usize) -> Result<Vec<String>> {
+        let cloning = args.prompt_wav.is_some();
+        let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
+        let fits = |fragment: &str| -> Result<bool> {
+            let spoken = match (cloning, args.prompt_text.as_deref()) {
+                (true, Some(prompt_text)) => format!("{prompt_text}{fragment}"),
+                _ => fragment.to_string(),
+            };
+            let conditioned = format_conditioned_text(&spoken, Some(&speaker),
+                                                      args.accent.as_deref(),
+                                                      Some(&args.lang), args.caption.as_deref())?;
+            Ok(self.lm.tok.encode(&conditioned)?.len() <= budget)
+        };
+
+        // Sentence, then clause boundaries; the delimiter stays with its piece.
+        let pieces = |text: &str, delimiters: &[char]| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut current = String::new();
+            for ch in text.chars() {
+                current.push(ch);
+                if delimiters.contains(&ch) {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            if !current.trim().is_empty() {
+                out.push(current);
+            }
+            out
+        };
+
+        let mut fragments: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut flush = |current: &mut String, fragments: &mut Vec<String>| {
+            if !current.trim().is_empty() {
+                fragments.push(std::mem::take(current));
+            }
+        };
+        for sentence in pieces(text, &['。', '！', '？', '；', '\n', '!', '?', ';']) {
+            let candidate = format!("{current}{sentence}");
+            if fits(&candidate)? {
+                current = candidate;
+                continue;
+            }
+            flush(&mut current, &mut fragments);
+            if fits(&sentence)? {
+                current = sentence;
+                continue;
+            }
+            // One sentence that does not fit: try its clauses, then cut characters.
+            let mut clause_run = String::new();
+            for clause in pieces(&sentence, &['，', '、', '：', ',', ':']) {
+                let candidate = format!("{clause_run}{clause}");
+                if fits(&candidate)? {
+                    clause_run = candidate;
+                    continue;
+                }
+                flush(&mut clause_run, &mut fragments);
+                if fits(&clause)? {
+                    clause_run = clause;
+                    continue;
+                }
+                let mut run = String::new();
+                for ch in clause.chars() {
+                    let candidate = format!("{run}{ch}");
+                    if fits(&candidate)? {
+                        run = candidate;
+                    } else {
+                        flush(&mut run, &mut fragments);
+                        run.push(ch);
+                    }
+                }
+                clause_run = run;
+            }
+            current = clause_run;
+        }
+        flush(&mut current, &mut fragments);
+        if fragments.is_empty() {
+            bail!("text produced no synthesizable fragments");
+        }
+        Ok(fragments)
+    }
+
+    /// Synthesize each fragment with the same prompt and concatenate the audio.
+    ///
+    /// Each fragment takes the ordinary single-pass path (so it is byte-identical
+    /// to a standalone call with that text) and keeps its own 0.1 s tail trim; the
+    /// seams are plain concatenation, which is what the model's own trim leaves
+    /// room for. `codes` here are the *generated* codes only - a prompt prefix
+    /// repeated per fragment would be a lie about the frame count.
+    fn synthesize_fragments(&self, args: &Args, fragments: Vec<String>, prompt_frames: usize,
+                            noise: &mut dyn NoiseSource) -> Result<Synthesis> {
+        let mut audio = Vec::new();
+        let mut generated = Vec::new();
+        let mut frames = prompt_frames;
+        let total = fragments.len();
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            let out = self.synthesize(&Args { text: fragment, auto_length: true,
+                                              ..args.clone() }, noise)?;
+            let produced = out.generated.len() / CODEBOOKS;
+            eprintln!("  fragment {}/{total}: {produced} frames, {:.1}s",
+                      index + 1, out.audio.len() as f64 / out.sample_rate as f64);
+            audio.extend_from_slice(&out.audio);
+            generated.extend_from_slice(&out.generated);
+            frames += produced;
+        }
+        Ok(Synthesis {
+            codes: generated.clone(),
+            frames,
+            prompt_frames,
+            generated,
+            audio,
+            sample_rate: self.codec.sample_rate,
+        })
+    }
+
     /// Full synthesis. `noise` supplies one `Exp(1)` draw per codebook per frame.
     pub fn synthesize(&self, args: &Args, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         if args.text.trim().is_empty() {
@@ -224,14 +364,49 @@ impl Pipeline {
         // The EOS frame stays all zero and is dropped below.
         let prompt_len = total_input - 1;
 
+        // Automatic length: one pass gets everything the context leaves, which is
+        // what makes a long script read to its end instead of being cut at the
+        // reference's 40 s default. Text that cannot fit one pass at all is split
+        // into sentences and synthesized fragment by fragment (the same prompt
+        // every time), so the result is the whole text - something the reference
+        // cannot do at any setting.
+        let max_frames = if args.auto_length {
+            crate::lm::MAX_CONTEXT.saturating_sub(prompt_len + 1)
+        } else {
+            args.max_audio_frames
+        };
+        // How much audio the text needs. Calibrated on the scenarios: 473 text
+        // tokens spoke for 1104 frames (2.4 frames per token), i.e. ~6.2 characters
+        // a second at 80 ms a frame. Splitting on the estimate - rather than on
+        // "does not fit at all" - is what keeps a long script from being squeezed
+        // into the handful of frames a nearly-full context would leave.
+        const FRAMES_PER_TOKEN: f64 = 2.4;
+        if args.auto_length {
+            let estimate = (text_tokens.len() as f64 * FRAMES_PER_TOKEN * 1.2).ceil() as usize;
+            if estimate > max_frames || max_frames < 1 {
+                // A fragment of T tokens needs ~FRAMES_PER_TOKEN*T frames, and both
+                // share the context, so T ~ context / (1 + FRAMES_PER_TOKEN). (Using
+                // the *whole text's* remaining frames here instead made fragments of
+                // a hundred characters each.)
+                let fixed = self.fixed_prompt_tokens(args)?;
+                let room = crate::lm::MAX_CONTEXT
+                    .saturating_sub(fixed + prompt_frames + 2);
+                let budget = ((room as f64 / (1.0 + FRAMES_PER_TOKEN * 1.2)) as usize).max(1);
+                let fragments = self.plan_fragments(args, &text, budget)?;
+                eprintln!("long text: {} tokens need ~{} frames, one pass allows {} -> {} fragments of <= {} tokens",
+                          text_tokens.len(), estimate, max_frames, fragments.len(), budget);
+                return self.synthesize_fragments(args, fragments, prompt_frames, noise);
+            }
+        }
         // The backbone's positional range (the reference's `max_seq_len`). The
         // rope tables and the attention kernels' score staging are both sized to
         // it, so this is the one place the limit is enforced.
-        if prompt_len + args.max_audio_frames > crate::lm::MAX_CONTEXT {
+        if prompt_len + max_frames > crate::lm::MAX_CONTEXT {
             let frames = args.max_audio_frames;
             bail!("inputs too long: {prompt_len} prompt tokens + {frames} audio frames exceed the model's {} -token context; shorten the text or lower --max-audio-length-ms",
                   crate::lm::MAX_CONTEXT);
         }
+        let args = &Args { max_audio_frames: max_frames, ..args.clone() };
 
         let embedded = self.lm.embed_frames(&tokens[..prompt_len * (CODEBOOKS + 1)], prompt_len)?;
         let mut kv = KvCache::new(self.lm.device(), crate::lm::BACKBONE_LAYERS,
