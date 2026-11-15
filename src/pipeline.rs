@@ -108,6 +108,14 @@ impl Pipeline {
         let dev = Device::open(dev_spec)?;
         let lm = Lm::load(bundle, dev.shared())?;
         let codec = Codec::load(codec_dir, dev, 24000)?;
+        // Weights to the card now, not on first use: the decoder alone pushes
+        // 594 MB, the encoder 225 MB and the LM's tables ~230 MB, and staged
+        // uploads crawl while the GPU has work queued (~1.5 GB/s measured
+        // against 4-12 in an idle process). Model loading is also where the
+        // reference implementation pays for this (`from_pretrained`).
+        codec.warm_encoder()?;
+        codec.warm_decoder()?;
+        lm.warm_tables()?;
         Ok(Self { lm, codec, tn: Tn::bundled() })
     }
 
@@ -298,6 +306,8 @@ impl Pipeline {
             eprintln!("  codec decode: {:.3}s", phase.elapsed().as_secs_f64());
             if let Device::Gpu(gpu) = self.lm.device() {
                 let st = gpu.snapshot();
+                eprintln!("  gpu upload staging: {:.0} ms of client time in write_buffer",
+                          gpu.upload_host_nanos.get() as f64 / 1e6);
                 eprintln!("  gpu stats: {} dispatches, {} submits, uploaded {:.1} MB, readback {:.1} MB",
                           st.dispatches, st.submits,
                           st.bytes_uploaded as f64 / 1e6, st.bytes_readback as f64 / 1e6);

@@ -83,8 +83,10 @@ fn main() -> Result<()> {
     }
 
     let text = cli.text.clone().context("--text is required")?;
+    let load_start = std::time::Instant::now();
     let pipeline = Pipeline::load(&cli.model, &cli.codec, &cli.device)?;
-    eprintln!("device: {}", pipeline.describe());
+    eprintln!("device: {} (weights resident in {:.2}s)", pipeline.describe(),
+              load_start.elapsed().as_secs_f64());
 
     let args = Args {
         text,

@@ -903,6 +903,44 @@ impl Lm {
     /// Fused arena depth state (lazy): 6 arena kernels, persistent per-layer
     /// scratch, a persistent fresh KV cache. Bind groups cache per (layer, op)
     /// because every buffer they reference lives for the whole run.
+    /// Make every weight the decode needs resident, with dispatches dropped.
+    ///
+    /// Called from `Pipeline::load` (outside the synthesis timer, where the
+    /// reference implementation loads its weights). Left lazy, these ~230 MB of
+    /// tables arrive during the first frames at the rate a busy queue allows.
+    pub fn warm_tables(&self) -> Result<()> {
+        if !self.device().is_gpu() {
+            return Ok(());
+        }
+        let gpu = self.device().gpu()?;
+        gpu.set_no_record(true);
+        let walked = (|| -> Result<()> {
+            self.audio_embedding_device()?;
+            for codebook in 0..CODEBOOKS - 1 {
+                self.audio_head_matrix(codebook)?;
+            }
+            self.tensor("projection.weight", [HIDDEN, HIDDEN])?;
+            self.depth_fused_gpu()?;
+            // Backbone: the same tensors the prefill and every decode step touch.
+            for layer in 0..BACKBONE_LAYERS {
+                let p = format!("backbone.layers.{layer}");
+                self.vector(&format!("{p}.input_layernorm.weight"), HIDDEN)?;
+                self.vector(&format!("{p}.post_attention_layernorm.weight"), HIDDEN)?;
+                self.qkv_weight("backbone", layer)?;
+                self.tensor(&format!("{p}.self_attn.o_proj.weight"), [HIDDEN, HIDDEN])?;
+                self.tensor(&format!("{p}.mlp.gate_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+                self.tensor(&format!("{p}.mlp.up_proj.weight"), [INTERMEDIATE, HIDDEN])?;
+                self.tensor(&format!("{p}.mlp.down_proj.weight"), [HIDDEN, INTERMEDIATE])?;
+            }
+            self.vector("backbone.norm.weight", HIDDEN)?;
+            self.gpu_rope_tables()?;
+            Ok(())
+        })();
+        gpu.set_no_record(false);
+        gpu.sync();
+        walked
+    }
+
     pub fn depth_fused_gpu(&self) -> Result<Rc<DepthFusedGpu>> {
         if let Some(d) = self.depth_fused.borrow().as_ref() {
             return Ok(Rc::clone(d));

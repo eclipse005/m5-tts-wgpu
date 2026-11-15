@@ -156,7 +156,7 @@ impl Lm {
 
 impl Lm {
     /// Audio embedding table on the device, uploaded once (67 MB).
-    fn audio_embedding_device(&self) -> Result<std::rc::Rc<Tensor>> {
+    pub(super) fn audio_embedding_device(&self) -> Result<std::rc::Rc<Tensor>> {
         let key = "audio_embeddings.device";
         if let Some(tensor) = self.cache_ref().borrow().get(key) {
             return Ok(tensor.clone());

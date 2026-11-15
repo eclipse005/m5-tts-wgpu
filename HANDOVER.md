@@ -5,8 +5,14 @@
 
 最后更新：见 `git log -1`。当前 HEAD 的提交信息会告诉你最后一步动了什么。
 
-**2026-11 第二轮（RTF 攻坚，6.8 有完整复盘）**：GPU RTF **2.66 → 0.86**（同会话 CPU 0.83，
-即 GPU 现在只比 20 核 CPU 慢 4%；Python CUDA 0.77 仍是参照）。四个已确认的收益：
+**2026-11 第三轮（权重常驻 + 上传路径，6.9）**：GPU RTF **0.86 → 0.56**（同会话 CPU 0.75，
+PyTorch CUDA 0.77）。要读这一节的**口径**：RTF 现在只计合成（`--device gpu` 的
+`in X s, RTF Y` 行），权重在 `Pipeline::load` 阶段上卡，和 Python 基线的
+`from_pretrained` 同口径。整进程 wall 5.3~5.5 s（load 2.94 s + 合成 2.4 s），比上一轮
+的 5.1 s 略长——**别把 RTF 的降低当成 wall 的降低**。
+
+**2026-11 第二轮（RTF 攻坚，6.8 有完整复盘）**：GPU RTF **2.66 → 0.86**（同会话 CPU 0.83）。
+四个已确认的收益：
 ①**top-k 采样器是 depth 的真正黑洞**（O(vocab²) 排名，2.8 ms × 16 次/帧 = 45 ms，占 59 ms
 的 depth 帧）→ 改成基数选择后 **0.12 ms**，depth 59 → 20 ms/帧，这是单项最大的一笔；
 ②`Device::zeros` 走 PCIe 上传零页（codec 每块 72 MB）→ 改为设备端 fill，codec 5.2 → 2.6 s，
@@ -399,12 +405,12 @@ arena 路径现状（91077a9）：6 个 arena kernel + 每层持久 scratch + ro
 **风险**：P104 shared memory 48KB/WG（64×64 tile 失败教训在 shaders.rs:756）；dispatch
 下限 9.8µs；TDR 2s（M5_MAX_PENDING=8）；VRAM 8GB 充裕；PCIe x1 禁 per-stage 回读。CPU 的分相转置卷积思路（③）大概率也适用于 GPU。
 
-### 6.4 与参考实现的对比（配对基准，best-of-3；GPU 行是 2026-11 第二轮）
+### 6.4 与参考实现的对比（配对基准，best-of-3；GPU 行是 2026-11 第三轮）
 
 | | RTF | 说明 |
 |---|---|---|
-| **Rust GPU（本轮结束时）** | **0.86 ~ 0.90** | 98 帧样例，背景负载 16~38%；起点是本轮的 2.47 |
-| **Rust AVX2** | **0.83** | 20 线程，同会话复测（本轮没动 CPU 路径） |
+| **Rust GPU** | **0.56** | 98 帧样例，负载 8%；权重在 `load` 阶段常驻（与 `from_pretrained` 同口径），见 6.9。整进程 wall 5.3 s |
+| **Rust AVX2** | **0.75 ~ 0.82** | 20 线程 / 默认线程数，同会话复测（CPU 路径未改动） |
 | Rust 通用（无 AVX2） | 1.10 | 比 Python 通用快 ~31% |
 | PyTorch CPU（AVX2 / oneDNN） | 1.36 | 同会话实测 |
 | PyTorch CPU（无 AVX） | 1.59 ~ 1.82 | 同会话实测 |
@@ -569,6 +575,69 @@ P104 每 SM 96 KB 共享内存 → **2 组/SM**。收到 16×128（8 KB）后 �
 **下一步的最大三项**：①（⑦的）大权重上传，若能藏到 depth 生成期间 ≈ -0.4 s；
 ②depth 的层 kernel（14 ms/帧 × 0.79 s 总计）：bf16 GEMV 现在 50-70 GB/s（`norm_gateup` 82 µs），
 靠 4 累加器/宽 load 提 ILP 是唯一方向，注意会改归约顺序；③encoder（0.50 s）。
+
+---
+
+## 6.9 2026-11 第三轮：权重常驻（0.86 → 0.56）
+
+**发现**：把同一个 98 帧序列**在一个进程里解码两遍**（`examples/codec_repeat_probe.rs`）
+才看清成本结构：
+
+```
+pass 0: 0.875 s   (上传 594 MB)     ← 全部是"准备权重"
+pass 1: 0.080 s   (上传 0 MB)       ← 真正的计算
+```
+
+即 **codec 解码的 0.8 s 是每 run 一次的权重准备**，不是计算。逐项拆开（`weight_prep_probe`
++ 计时段 `upload_host_nanos`）：`Weights::get_f32` 拷贝、host 侧打包/展开、以及
+`queue.write_buffer` 的 host 时间（594 MB 占 ~0.5 s，≈1.2-1.5 GB/s）。encode 阶段同理
+（225 MB 权重、0.45 s 里 0.4 s 是准备）。
+
+**为什么快不起来**（三个都白试了，写在这里免得重来）：
+* `queue.write_buffer` 每次调用**新建并 map 一块 staging buffer**（wgpu-core
+  `queue.rs: StagingBuffer::new`），实测 host 侧只有 1-1.5 GB/s。自制"持久 staging + 显式
+  copy"反而更差：往 mapped 的 host-visible 内存写本身只有 1.4 GB/s（`staging_probe`）。
+* `mapped_at_creation`（`create_buffer_init`）在干净进程里 2-4 GB/s，但在这个驱动上会把
+  权重放进 **host-visible 内存**：GPU 之后每次读权重都走 PCIe，compute 慢一个数量级，
+  98 帧直接 OOM。**永久放弃**这条路。
+* 探测里"写进从不被 dispatch 使用的 buffer"能到 10-17 GB/s，那是假象（拷贝被推迟到首次
+  使用）。真实带宽就是 **~1.5 GB/s**，和 6.6 记的 "PCIe x1 矿卡 0.6 GB/s" 同量级。
+* 顺带：`Weights::load` 的逐张量拷贝改成 rayon 并行（load 2.94 → 2.4 s）；host 侧的
+  safetensors 零拷贝 mmap 反而更差（RTF 0.89，页错误被搬进计时段），已回退；
+* 其它失败：
+  bf16 GEMV 加 4 累加器（+0.4 ms/帧，测试还挂了——helper 落错 kernel，已回退）。
+
+**做法**：`Pipeline::load` 里把两半模型都"走一遍"——`Gpu::set_no_record(true)` 让
+dispatch 全部丢弃，图遍历照样把每个权重（打包副本、展开的 bias、snake 表、rope 表、
+15 个 audio_head、depth scratch、backbone 的 bf16 块）都建好并上传。没有 dispatch 就没有
+队列积压，上传拿到最好的速率。（试过直接在生成循环里预热：那是用 host 时间换 GPU 时间，
+总时长 +0.13 s，已删。）
+
+**结果**（98 帧 4.30 s 音频，负载 8%，3 次）：
+
+| 阶段 | 第二轮 | 第三轮 |
+|---|---|---|
+| encode | 0.50 s | **0.287 s** |
+| prefill | 0.14 s | 0.14 s |
+| generation | 1.62 s（26.4 ms/帧） | **1.29 s（23.4 ms/帧）** |
+| codec 解码 | 1.13-1.46 s | **0.77 s** |
+| **合成合计** | 3.62 s（RTF 0.84） | **2.42 s（RTF 0.56）** |
+| load（含常驻） | ~1.5 s | 2.4-2.5 s |
+| 整进程 wall | ~5.1 s | **5.2-5.6 s**（GPU）/ 4.6 s（CPU） |
+
+对照：CPU(AVX2, 20 线程) 0.75；PyTorch CPU 1.36；PyTorch CUDA 0.77。输出音频与上一轮
+**逐样本相同**（改的只是权重什么时候上卡）。
+
+**注意 wall 与 RTF 的区别**：常驻把 1.5 s 的上传从计时段挪到 load，所以 RTF 掉到 0.56，
+但整进程 wall 仍是 5.2-5.6 s（其中 ~0.6 s 是 912 MB 权重跑 1.5 GB/s 的 PCIe 硬底，~0.5 s 是
+`Weights::load` 的拷贝——已并行化，~0.5 s 是 pipeline 编译）。**一次性的 CLI 调用，wall 上
+CPU 路径仍然更快（4.6 s）；RTF 的意义在服务化/重复调用。** 想压 wall 的话，下一步是
+`wgpu::PipelineCache` 落盘（首次仍要付）。
+
+**下一轮最大的两项**（针对 RTF）：generation 1.29 s（depth 23.4 ms/帧：720 dispatch、层 kernel ~14 ms，
+其余是 dispatch 在位开销 + 每帧一次 token 回读的整队排空）与 codec 解码 0.77 s（剩下是计算：
+卷积 22 ms/块量级 + 4 个块 + pre_transformer/upsample）。要做深度的 2 倍提升，只能走
+vec4 宽 load + 8 值/线程（改归约顺序，需过 `parity_lm` + `parity_pipeline` 双门）。
 
 ---
 

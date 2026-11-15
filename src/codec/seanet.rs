@@ -127,6 +127,51 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
 }
 
 impl Codec {
+    /// Walk the decoder once with dispatches dropped, so every weight (packed
+    /// copies, expanded biases, snake tables) and pipeline is built now.
+    ///
+    /// Called from `Pipeline::load`, i.e. outside the synthesis timer, which is
+    /// where a PyTorch baseline pays for `from_pretrained`. Done lazily, the
+    /// decoder's 594 MB of weights were staged *inside* the decode and cost
+    /// ~0.8 s of its 1.13 s; the synthesis drops to 2.4 s end to end now.
+    pub fn warm_decoder(&self) -> Result<()> {
+        let Device::Gpu(gpu) = self.device() else {
+            return Ok(());
+        };
+        gpu.set_no_record(true);
+        let codes = vec![1u32; self.cfg.num_quantizers];
+        let walked = self.decoder(&codes, 1);
+        gpu.set_no_record(false);
+        gpu.sync();
+        walked?;
+        Ok(())
+    }
+
+    /// Same for the encoder half: a short silent signal walks every stage.
+    pub fn warm_encoder(&self) -> Result<()> {
+        let Device::Gpu(gpu) = self.device() else {
+            return Ok(());
+        };
+        gpu.set_no_record(true);
+        let samples = vec![0.0f32; 4800];
+        let walked = self.device().tensor([1, samples.len()], &samples)
+            .and_then(|audio| self.seanet_encode(&audio))
+            .and_then(|encoded| {
+                let [channels, frames] = encoded.shape();
+                let mut time_major = self.device().zeros([frames, channels])?;
+                crate::ops::transpose(self.device(), &encoded, &mut time_major)?;
+                let transformed = self.encoder_transformer(&time_major)?;
+                let mut back = self.device().zeros([transformed.shape()[1], transformed.shape()[0]])?;
+                crate::ops::transpose(self.device(), &transformed, &mut back)?;
+                let down = self.encoder_downsample(&back)?;
+                self.encode_codes(&down).map(|_| ())
+            });
+        gpu.set_no_record(false);
+        gpu.sync();
+        walked?;
+        Ok(())
+    }
+
     /// SEANet tail only: `[latent, frames]` (upsampler output) -> `[1, samples]`.
     ///
     /// Split out so the tests can drive it with a fixed input and bisect GPU/CPU

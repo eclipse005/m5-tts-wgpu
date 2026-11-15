@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
+use rayon::prelude::*;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::Path;
@@ -105,17 +106,22 @@ impl Weights {
         let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         let st = SafeTensors::deserialize(&mmap).context("parse safetensors")?;
-        let mut map = HashMap::with_capacity(st.len());
-        for (name, view) in st.iter() {
-            map.insert(
-                name.to_string(),
-                TensorEntry {
-                    shape: view.shape().to_vec(),
-                    dtype: DType::from_safetensors(view.dtype()),
-                    data: view.data().to_vec(),
-                },
-            );
-        }
+        // One contiguous copy per tensor, spread over the thread pool: the codec
+        // checkpoint is 682 MB and a serial copy of it ran at ~1.5 GB/s (0.45 s
+        // of process start-up, which the CLI pays before it says anything).
+        let entries: Vec<(String, Vec<usize>, DType, &[u8])> = st
+            .iter()
+            .map(|(name, view)| {
+                (name.to_string(), view.shape().to_vec(),
+                 DType::from_safetensors(view.dtype()), view.data())
+            })
+            .collect();
+        let map: HashMap<String, TensorEntry> = entries
+            .into_par_iter()
+            .map(|(name, shape, dtype, bytes)| {
+                (name, TensorEntry { shape, dtype, data: bytes.to_vec() })
+            })
+            .collect();
         Ok(Self { map })
     }
 

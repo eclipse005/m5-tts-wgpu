@@ -13,6 +13,13 @@ use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let frames: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(10);
+    // Deep queue: with the batch cap lifted, a frame is one submit, so three
+    // frames fit in the four in-flight slots and the CPU never waits on the
+    // GPU - the loop time is then the recording cost alone.
+    if std::env::var_os("M5_PROBE_RECORD_ONLY").is_some() {
+        // SAFETY: single-threaded probe setup, before any thread is spawned.
+        unsafe { std::env::set_var("M5_MAX_PENDING", "100000") };
+    }
     let dev = Device::open("gpu")?;
     let gpu = dev.gpu()?;
     let lm = Lm::load(Path::new("D:/M5-TTS/weights/M5-TTS-50M-VoiceClone"), dev.shared())?;
@@ -43,6 +50,21 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     };
 
+    if std::env::var_os("M5_PROBE_RECORD_ONLY").is_some() {
+        // Recording cost only (the GPU runs behind, never waited on).
+        for _ in 0..3 { lm.depth_codes_device_fused(&last_h, &noise, 0.9, 10, true)?; }
+        gpu.sync();
+        let before = gpu.snapshot();
+        let start = Instant::now();
+        for _ in 0..3 { lm.depth_codes_device_fused(&last_h, &noise, 0.9, 10, true)?; }
+        let record = start.elapsed().as_secs_f64() * 1e3 / 3.0;
+        gpu.sync();
+        let total = start.elapsed().as_secs_f64() * 1e3 / 3.0;
+        let after = gpu.snapshot();
+        println!("record-only {record:7.2} ms/frame   with drain {total:7.2} ms/frame   {} dispatch/frame",
+                 (after.dispatches - before.dispatches) / 3);
+        return Ok(());
+    }
     run("default", &|| lm.depth_codes_device(&last_h, &noise, 0.9, 10, true))?;
     run("fused", &|| lm.depth_codes_device_fused(&last_h, &noise, 0.9, 10, true))?;
 

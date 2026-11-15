@@ -32,11 +32,15 @@ pub struct Kernel {
     pub pipe: wgpu::ComputePipeline,
     kinds: Vec<bool>,
     name: String,
-    /// key -> (bind group, its own params buffer). The params buffer is written
-    /// per dispatch (queue.write_buffer, staged with the batch that reads it)
-    /// and bound whole at offset 0 - no arena slots, no dynamic offsets, no
-    /// cross-pass usage-state reuse.
+    /// key -> (bind group, its own params buffer). The params buffer is bound
+    /// whole at offset 0 - no arena slots, no dynamic offsets, no cross-pass
+    /// usage-state reuse. It is rewritten only when the bytes change.
     cache: RefCell<HashMap<u64, (wgpu::BindGroup, Buffer)>>,
+    /// key -> the params last uploaded for it. The fused decode re-uses each
+    /// (layer, step, op) key with *identical* params every frame (the position is
+    /// baked into the key), so this drops ~700 `write_buffer` calls from a
+    /// 720-dispatch frame; each of those stages a fresh host-visible buffer.
+    params: RefCell<HashMap<u64, Vec<u32>>>,
 }
 
 impl Kernel {
@@ -85,7 +89,21 @@ impl Kernel {
         };
         // The params bytes land with the batch that reads them (write_buffer is
         // staged per submit), and each (layer, op) owns its buffer exclusively.
-        gpu.write_u32(&params_buffer, uni);
+        // Unchanged params skip the write: wgpu allocates and maps a staging
+        // buffer for every `write_buffer`, and 700 of them a frame is pure churn.
+        let changed = {
+            let mut params = self.params.borrow_mut();
+            match params.get(&key) {
+                Some(previous) if previous.as_slice() == uni => false,
+                _ => {
+                    params.insert(key, uni.to_vec());
+                    true
+                }
+            }
+        };
+        if changed {
+            gpu.write_u32(&params_buffer, uni);
+        }
         gpu.record(&self.pipe, &bind, workgroups);
     }
 }
@@ -212,6 +230,13 @@ pub struct Gpu {
     arena: Buffer,
     arena_host: RefCell<Vec<u8>>,
     arena_used: Cell<usize>,
+    /// Client time spent inside `queue.write_buffer` (diagnostic: separates the
+    /// host staging cost from the device copy).
+    pub upload_host_nanos: Cell<u64>,
+    /// Drop recorded dispatches. Set while walking a graph at load time to make
+    /// every weight resident: nothing executes, so the queue stays empty, which
+    /// is what lets `write_buffer` stage at full speed.
+    no_record: Cell<bool>,
 }
 
 /// A parameter block from the pool: bound whole, offset always 0.
@@ -222,8 +247,6 @@ pub struct Params {
     pub size: u64,
 }
 
-
-
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Stats {
     pub dispatches: u64,
@@ -233,6 +256,11 @@ pub struct Stats {
 }
 
 impl Gpu {
+    /// Drop dispatches while a load-time graph walk makes weights resident.
+    pub fn set_no_record(&self, on: bool) {
+        self.no_record.set(on);
+    }
+
     /// Snapshot of the counters (dispatches, submits, transfer bytes).
     pub fn snapshot(&self) -> Stats {
         *self.stats.borrow()
@@ -247,6 +275,7 @@ impl Gpu {
     pub fn arena_buffer(&self) -> &Buffer {
         &self.arena
     }
+
 
     /// Block until everything queued so far has executed. `flush` alone only
     /// submits — profiling laps need the wait too, or elapsed measures command
@@ -361,6 +390,8 @@ impl Gpu {
             arena,
             arena_host: RefCell::new(Vec::new()),
             arena_used: Cell::new(0),
+            upload_host_nanos: Cell::new(0),
+            no_record: Cell::new(false),
         })
     }
 
@@ -568,6 +599,7 @@ impl Gpu {
     /// measures, so the destination buffer's first-touch is also in there.
     fn write_chunked(&self, buffer: &Buffer, data: &[f32]) {
         const CHUNK: usize = 4 << 20; // floats: 16 MB
+        let start = std::time::Instant::now();
         let mut offset = 0usize;
         while offset < data.len() {
             let end = (offset + CHUNK).min(data.len());
@@ -575,6 +607,8 @@ impl Gpu {
                                     bytemuck::cast_slice(&data[offset..end]));
             offset = end;
         }
+        self.upload_host_nanos.set(self.upload_host_nanos.get()
+            + start.elapsed().as_nanos() as u64);
     }
 
     pub fn pipeline(&self, key: &str, shader: &str, entry: &str) -> wgpu::ComputePipeline {
@@ -676,6 +710,7 @@ impl Gpu {
     /// that separates object-creation cost from plain recording.
     pub fn reuse(&self, _key: &str, pipeline: &wgpu::ComputePipeline,
                  group: &wgpu::BindGroup, workgroups: (u32, u32, u32)) {
+        if self.no_record.get() { return; }
         self.pending.borrow_mut().push(Pending {
             pipeline: pipeline.clone(),
             group: group.clone(),
@@ -770,6 +805,7 @@ impl Gpu {
             kinds,
             name: key.to_string(),
             cache: RefCell::new(HashMap::new()),
+            params: RefCell::new(HashMap::new()),
         }
     }
 
@@ -790,6 +826,7 @@ impl Gpu {
             kinds,
             name: key.to_string(),
             cache: RefCell::new(HashMap::new()),
+            params: RefCell::new(HashMap::new()),
         }
     }
 
@@ -804,6 +841,7 @@ impl Gpu {
     /// Record a dispatch (no dynamic offsets) into the current batch.
     pub fn record(&self, pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup,
                   workgroups: (u32, u32, u32)) {
+        if self.no_record.get() { return; }
         self.pending.borrow_mut().push(Pending {
             pipeline: pipeline.clone(),
             group: group.clone(),
@@ -861,6 +899,7 @@ impl Gpu {
             entries: &entries,
         });
         self.stats.borrow_mut().dispatches += 1;
+        if self.no_record.get() { return; }
         self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups, label: key.to_string() });
         self.maybe_flush();
     }
