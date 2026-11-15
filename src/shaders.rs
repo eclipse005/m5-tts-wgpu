@@ -155,6 +155,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 }
 "#;
 
+/// SnakeBeta on a channels-last tensor `[time, channels]`, in place.
+///
+/// Same arithmetic as [`SNAKE_BETA_F32`]; only the channel index differs
+/// (`idx % channels` instead of `idx / time`). The decoder's residual units are
+/// then free to stay channels-last end to end - the convolutions already are -
+/// instead of paying two 72 MB transposes per convolution to hand elementwise
+/// kernels a channels-first tensor.
+pub const SNAKE_BETA_CL_F32: &str = r#"
+// 0=time 1=channels
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read> alpha: array<f32>;
+@group(0) @binding(2) var<storage, read> beta: array<f32>;
+@group(0) @binding(3) var<storage, read> p: array<u32, 2>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
+    if (idx >= p[0] * p[1]) { return; }
+    let c = idx % p[1];
+    let v = x[idx];
+    let s = sin(v * alpha[c]);
+    x[idx] = v + s * s / beta[c];
+}
+"#;
+
 /// `y += x` in place. A separate kernel because wgpu forbids binding one buffer
 /// as both `read` and `read_write` inside a single dispatch, which the general
 /// `ADD_F32` would need for an in-place residual.

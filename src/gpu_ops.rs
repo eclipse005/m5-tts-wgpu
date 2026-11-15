@@ -503,6 +503,14 @@ pub fn sample_topk_offset(gpu: &Gpu, logits: &Buffer, noise: &Buffer, out: &Buff
     gpu.dispatch_params("sample_topk_f32", shaders::SAMPLE_TOPK_F32, "main", &[(0, logits), (1, noise), (2, out)], &params, (1, 1, 1));
 }
 
+/// SnakeBeta in place on a channels-last `[time, channels]` tensor.
+pub fn snake_beta_cl(gpu: &Gpu, x: &Buffer, alpha: &Buffer, beta: &Buffer, time: usize,
+                     channels: usize) {
+    let params = gpu.params_u32(&[time as u32, channels as u32]);
+    gpu.dispatch_params("snake_beta_cl_f32", shaders::SNAKE_BETA_CL_F32, "main",
+                        &[(0, x), (1, alpha), (2, beta)], &params, grid(time * channels));
+}
+
 /// Register-blocked channels-last conv (8x8 per thread). Same contract as
 /// `conv1d_cl`; dispatched by the codec for stride <= 2 shapes.
 #[allow(clippy::too_many_arguments)]

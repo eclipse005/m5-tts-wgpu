@@ -1,7 +1,7 @@
 //! SEANet decoder tail: `decoder.0` conv, four upsampling blocks, final SnakeBeta
 //! and the mono output conv. This is where codes become a waveform.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use super::Codec;
 use crate::cpu_ops;
@@ -59,9 +59,68 @@ fn copy_range(dev: &Device, src: &Tensor, src_off: usize, dst: &mut Tensor, dst_
 }
 
 /// One `DecoderResidualUnit`: snake -> conv7(dilated) -> snake -> conv1 -> add.
-fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Result<Tensor> {
+/// One channels-last convolution: `[t_in, cin]` -> `[t_in, cout]`, no transposes.
+///
+/// The register-blocked kernel works channels-last; the channels-first tensors
+/// around it exist only because the elementwise kernels were written that way.
+/// Keeping a whole residual unit in this layout removes four transposes per unit
+/// (0.36 ms each at block 4, and 40 MB of DRAM traffic apiece) and lets each
+/// convolution read what the previous dispatch just wrote.
+fn causal_conv_cl(codec: &Codec, x_cl: &Tensor, weight_name: &str, bias_name: &str,
+                  cout: usize, ks: usize, dilation: usize) -> Result<Tensor> {
+    let Device::Gpu(gpu) = codec.device() else {
+        bail!("causal_conv_cl is GPU-only");
+    };
+    let [t_in, cin] = x_cl.shape();
+    let packed = codec.packed_conv1d(weight_name, cout, cin, ks)?;
+    let bias = codec.vector(bias_name, cout)?;
+    let y = gpu.empty("unit.y_cl", t_in * cout);
+    crate::gpu_ops::conv1d_reg8(gpu, x_cl.gpu_buffer()?, packed.gpu_buffer()?, bias.gpu_buffer()?,
+                                &y, cin, cout, ks, dilation, 1, (ks - 1) * dilation, t_in, t_in);
+    Ok(Tensor::Gpu(crate::device::GpuBuffer { raw: y, gpu: std::rc::Rc::clone(gpu), owned: false },
+                   [t_in, cout]))
+}
+
+/// SnakeBeta over a channels-last `[time, channels]` tensor, out of place.
+fn snake_cl(codec: &Codec, x_cl: &Tensor, alpha_name: &str, beta_name: &str) -> Result<Tensor> {
+    let Device::Gpu(gpu) = codec.device() else {
+        bail!("snake_cl is GPU-only");
+    };
+    let [time, channels] = x_cl.shape();
+    let (ea, eb) = codec.snake_tables(alpha_name, beta_name, channels)?;
+    let out = codec.device().copy(x_cl)?;
+    crate::gpu_ops::snake_beta_cl(gpu, out.gpu_buffer()?, ea.gpu_buffer()?, eb.gpu_buffer()?,
+                                  time, channels);
+    Ok(out)
+}
+
+/// Channels-last `[t, c]` -> channels-first `[c, t]`.
+fn to_channels_first(codec: &Codec, x_cl: &Tensor) -> Result<Tensor> {
+    let Device::Gpu(gpu) = codec.device() else {
+        bail!("to_channels_first is GPU-only");
+    };
+    let [t, c] = x_cl.shape();
+    let mut out = codec.device().zeros([c, t])?;
+    crate::gpu_ops::transpose(gpu, x_cl.gpu_buffer()?, out.gpu_buffer()?, t, c);
+    Ok(out)
+}
+
+/// Channels-first `[c, t]` -> channels-last `[t, c]`.
+fn to_channels_last(codec: &Codec, x: &Tensor) -> Result<Tensor> {
+    let Device::Gpu(gpu) = codec.device() else {
+        bail!("to_channels_last is GPU-only");
+    };
+    let [c, t] = x.shape();
+    let mut out = codec.device().zeros([t, c])?;
+    crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, out.gpu_buffer()?, c, t);
+    Ok(out)
+}
+
+fn residual_unit(codec: &Codec, x_cl: &Tensor, prefix: &str, dilation: usize) -> Result<Tensor> {
     let dev: &Device = codec.device();
-    let channels = x.shape()[0];
+    // GPU: `x_cl` is channels-last `[time, channels]`; CPU keeps channels-first.
+    let channels = if dev.is_gpu() { x_cl.shape()[1] } else { x_cl.shape()[0] };
+    let x = x_cl;
     // CPU: fuse each snake into its convolution and the residual into the last one.
     if !dev.is_gpu() {
         let cv1 = codec.snake_conv(x, &format!("{prefix}.act1"), &format!("{prefix}.conv1.conv.weight"),
@@ -80,17 +139,20 @@ fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Re
         *tick = std::time::Instant::now();
     };
     lap("unit-start", &mut tick);
-    let h = codec.snake_beta_gpu(x, &format!("{prefix}.act1.alpha"),
-                                 &format!("{prefix}.act1.beta"), channels)?;
+    // `x` arrives channels-last (the block converts once, see `decoder_block`):
+    // snake -> conv7 -> snake -> conv1 -> residual add stays in that layout, so
+    // the four per-convolution transposes disappear.
+    let h = snake_cl(codec, x, &format!("{prefix}.act1.alpha"),
+                     &format!("{prefix}.act1.beta"))?;
     lap("snake1", &mut tick);
-    let h3 = causal_conv(codec, &h, &format!("{prefix}.conv1.conv.weight"),
-                         &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation)?;
+    let h3 = causal_conv_cl(codec, &h, &format!("{prefix}.conv1.conv.weight"),
+                            &format!("{prefix}.conv1.conv.bias"), channels, 7, dilation)?;
     lap("conv7", &mut tick);
-    let h4 = codec.snake_beta_gpu(&h3, &format!("{prefix}.act2.alpha"),
-                                  &format!("{prefix}.act2.beta"), channels)?;
+    let h4 = snake_cl(codec, &h3, &format!("{prefix}.act2.alpha"),
+                      &format!("{prefix}.act2.beta"))?;
     lap("snake2", &mut tick);
-    let out = causal_conv(codec, &h4, &format!("{prefix}.conv2.conv.weight"),
-                          &format!("{prefix}.conv2.conv.bias"), channels, 1, 1)?;
+    let out = causal_conv_cl(codec, &h4, &format!("{prefix}.conv2.conv.weight"),
+                             &format!("{prefix}.conv2.conv.bias"), channels, 1, 1)?;
     lap("conv1", &mut tick);
 
     let mut sum = dev.zeros(x.shape())?;
@@ -136,6 +198,15 @@ fn decoder_block(codec: &Codec, x: &Tensor, prefix: &str, upsample_rate: usize) 
     }
     lap("transposed conv", &mut phase);
 
+    if let Device::Gpu(_) = dev {
+        // Convert once for the whole block instead of once per convolution.
+        let mut up_cl = to_channels_last(codec, &up)?;
+        for (unit, dilation) in [(2usize, 1usize), (3, 3), (4, 9)] {
+            up_cl = residual_unit(codec, &up_cl, &format!("{prefix}.block.{unit}"), dilation)?;
+            lap(&format!("residual unit (dilation {dilation})"), &mut phase);
+        }
+        return to_channels_first(codec, &up_cl);
+    }
     for (unit, dilation) in [(2usize, 1usize), (3, 3), (4, 9)] {
         up = residual_unit(codec, &up, &format!("{prefix}.block.{unit}"), dilation)?;
         lap(&format!("residual unit (dilation {dilation})"), &mut phase);
