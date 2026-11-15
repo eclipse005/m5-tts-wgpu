@@ -224,6 +224,16 @@ impl Pipeline {
         // The EOS frame stays all zero and is dropped below.
         let prompt_len = total_input - 1;
 
+        // The backbone's positional range: the reference's `max_seq_len` (2048),
+        // enforced there as `prompt tokens < max_seq_len - max_audio_frames`.
+        // Without this check a long text plus a long `max_audio_length_ms` walks
+        // past the end of the rope tables and produces silently wrong audio.
+        const MAX_SEQ_LEN: usize = 2048;
+        if prompt_len + args.max_audio_frames > MAX_SEQ_LEN {
+            let frames = args.max_audio_frames;
+            bail!("inputs too long: {prompt_len} prompt tokens + {frames} audio frames exceed the model's {MAX_SEQ_LEN}-token context; shorten the text or lower --max-audio-length-ms");
+        }
+
         let embedded = self.lm.embed_frames(&tokens[..prompt_len * (CODEBOOKS + 1)], prompt_len)?;
         let mut kv = KvCache::new(self.lm.device(), crate::lm::BACKBONE_LAYERS,
                                   prompt_len + args.max_audio_frames + 8)?;
