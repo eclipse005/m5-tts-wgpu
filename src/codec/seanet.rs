@@ -41,6 +41,23 @@ fn causal_conv(codec: &Codec, x: &Tensor, weight_name: &str, bias_name: &str,
     Ok(out)
 }
 
+/// `dst[dst_off .. dst_off+len] = src[src_off .. src_off+len]` on either device.
+fn copy_range(dev: &Device, src: &Tensor, src_off: usize, dst: &mut Tensor, dst_off: usize,
+              len: usize) -> Result<()> {
+    match dev {
+        Device::Gpu(gpu) => {
+            crate::gpu_ops::copy_range(gpu, src.gpu_buffer()?, src_off, dst.gpu_buffer()?, dst_off, len);
+            Ok(())
+        }
+        Device::Cpu => {
+            let from = src.cpu_slice()?;
+            let to = dst.cpu_slice_mut()?;
+            to[dst_off..dst_off + len].copy_from_slice(&from[src_off..src_off + len]);
+            Ok(())
+        }
+    }
+}
+
 /// One `DecoderResidualUnit`: snake -> conv7(dilated) -> snake -> conv1 -> add.
 fn residual_unit(codec: &Codec, x: &Tensor, prefix: &str, dilation: usize) -> Result<Tensor> {
     let dev: &Device = codec.device();
@@ -235,8 +252,46 @@ impl Codec {
         Ok(pcm)
     }
 
-    /// Codes -> PCM in `[-1, 1]`, `[1, frames * 1920]`.
+    /// Samples per latent frame: `prod(upsample_rates + upsampling_ratios)`, the
+    /// reference's `total_upsample` (1920 here = 24 kHz / 12.5 Hz).
+    fn samples_per_frame(&self) -> usize {
+        self.cfg.upsample_rates.iter().product::<usize>()
+            * self.cfg.upsampling_ratios.iter().product::<usize>()
+    }
+
+    /// Codes -> PCM in `[-1, 1]`, `[1, frames * samples_per_frame]`.
+    ///
+    /// Mirrors the reference's `chunked_decode`: 300-frame chunks with up to 25
+    /// frames of left context whose audio is dropped. A single-shot decode is
+    /// **not** equivalent - the decoder transformer's sliding attention window
+    /// restarts at every chunk - and the reference always takes this path, so any
+    /// utterance past 300 frames (24 s) only agreed with it up to that frame
+    /// (`clone_topk1` in `tests/parity_scenarios.rs` is the case that showed it).
+    /// Chunking also bounds peak memory: one 325-frame working set instead of the
+    /// whole utterance, which is what runs an 8 GB card out of memory at ~40 s.
     pub fn decoder(&self, codes: &[u32], frames: usize) -> Result<Tensor> {
+        const CHUNK: usize = 300;
+        const LEFT_CONTEXT: usize = 25;
+        const SLOTS: usize = 16; // codebooks per frame in `codes`
+        let dev = self.device();
+        let per_frame = self.samples_per_frame();
+        let mut out = dev.zeros([1, frames * per_frame])?;
+        let mut start = 0usize;
+        while start < frames {
+            let end = (start + CHUNK).min(frames);
+            let context = if start > LEFT_CONTEXT { LEFT_CONTEXT } else { start };
+            let slice = &codes[(start - context) * SLOTS..end * SLOTS];
+            let wav = self.decode_latent(slice, end - start + context)?;
+            // Drop the context's audio, as `wav_chunk[..., context*upsample:]` does.
+            copy_range(dev, &wav, context * per_frame, &mut out, start * per_frame,
+                       (end - start) * per_frame)?;
+            start = end;
+        }
+        Ok(out)
+    }
+
+    /// One chunk of the decoder graph: latent codes in, PCM out (already clamped).
+    fn decode_latent(&self, codes: &[u32], frames: usize) -> Result<Tensor> {
         let dev = self.device();
         let cfg = &self.cfg;
         let profile = std::env::var("M5_PROFILE").is_ok();

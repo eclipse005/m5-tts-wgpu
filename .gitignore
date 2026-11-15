@@ -1,3 +1,5 @@
 /target/
 /output/
 *.wav
+# Regenerable with scripts/dump_scenarios.py (175 MB: the sampler noise dominates).
+/goldens/scenarios/

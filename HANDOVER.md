@@ -159,6 +159,7 @@ examples/*.rs         ~35 个微基准/诊断程序，每个文件顶部都写�
 | `parity_codec` (3) | codec 解码逐阶段 + 编码器 + prepare_prompt | 阶段 ≤2e-4；PCM **SNR ≥ 60 dB**；codes **0 mismatch** |
 | `parity_lm` (4) | backbone 逐层、depth logits、采样回放、KV cache | h ≤1e-4；codes 完全相等 |
 | `parity_pipeline` (1) | 端到端（同一噪声流） | 帧数相同、**codes 0 mismatch**、**SNR ≥ 60 dB** |
+| `parity_scenarios` | 16 个功能场景 × 双后端（6.10 有全表） | codes 逐值相等 + SNR ≥ 60 dB |
 
 当前实测：PCM SNR 108~112 dB，生成 codes 与参考逐值相同。
 
@@ -638,6 +639,66 @@ CPU 路径仍然更快（4.6 s）；RTF 的意义在服务化/重复调用。** 
 其余是 dispatch 在位开销 + 每帧一次 token 回读的整队排空）与 codec 解码 0.77 s（剩下是计算：
 卷积 22 ms/块量级 + 4 个块 + pre_transformer/upsample）。要做深度的 2 倍提升，只能走
 vec4 宽 load + 8 值/线程（改归约顺序，需过 `parity_lm` + `parity_pipeline` 双门）。
+
+---
+
+## 6.10 2026-11 第四轮：功能面覆盖与对齐审计（6.10 全表）
+
+问题：**我们的测试覆盖了整个功能面没有？** 之前的端到端 parity 只有**一个场景**
+（中文零样本克隆，seed 1234）。这一轮把参考实现暴露的每个功能都跑了一遍，用参考自己的
+采样噪声回放（`scripts/dump_scenarios.py` → `tests/parity_scenarios.rs`），逐场景比
+codes（要求逐值相等）与 PCM（SNR ≥ 60 dB）：
+
+| 场景 | 帧数 | 音频 | codes | SNR cpu / gpu |
+|---|---|---|---|---|
+| 克隆·中文短句（"你好。"） | 7 | 0.46 s | 0 mismatch | 107.6 / 104.4 dB |
+| 克隆·中文中句 | 52 | 4.06 s | 0 | 103.9 / 102.5 |
+| 克隆·中文长段（4 句） | 216 | 17.18 s | 0 | 108.2 / 103.9 |
+| 克隆·英文 | 82 | 6.46 s | 0 | 106.6 / 108.7 |
+| 克隆·日文 | 37 | 2.86 s | 0 | 112.0 / 107.2 |
+| 克隆·德文 | 38 | 2.94 s | 0 | 109.7 / 104.1 |
+| 克隆·法文 | 28 | 2.14 s | 0 | 103.1 / 100.3 |
+| 克隆·韩文 | 31 | 2.38 s | 0 | 106.1 / 105.0 |
+| 克隆·accent=chuan | 48 | 3.74 s | 0 | 112.6 / 110.7 |
+| 克隆·caption | 29 | 2.22 s | 0 | 109.3 / 107.2 |
+| 克隆·topk=1（跑满 40 s 无 EOS） | 500 | 39.90 s | 0 | 109.1 / 108.5 |
+| 克隆·topk=50 | 33 | 2.54 s | 0 | 112.6 / 109.6 |
+| 克隆·temperature=0.5 | 31 | 2.38 s | 0 | 106.4 / 105.9 |
+| 预设音色 speaker 1（中文） | 35 | 2.70 s | 0 | 115.6 / 111.6 |
+| 预设音色 speaker 2（中文） | 35 | 2.70 s | 0 | 116.4 / 113.4 |
+| 预设音色 speaker 1（英文） | 28 | 2.14 s | 0 | 114.5 / 113.4 |
+
+即：**16 个场景、两套后端，codes 全部逐值相同，PCM SNR 100-116 dB**。
+命令：
+`M5_SCENARIO_DEVICE=cpu cargo test --release --test parity_scenarios`（全 16 个）+
+`M5_SCENARIO_DEVICE=gpu M5_SCENARIO_BUNDLE=clone|cargo test --release --test parity_scenarios`
+（GPU 分两个进程跑，因为一个 Pipeline 常驻约 1 GB，一块卡装不下两份）。goldens 目录
+（175 MB，采样噪声占大头，可再生）不入库。
+
+**审计过程中挖出两个真 bug（都已修）**：
+
+1. **`encode_batch` 用 `std::mem::forget(batch)` 泄漏 bind group** —— bind group 会
+   钉住它绑定的 buffer，所以同一个进程里做第二次合成就会 OOM。单次 CLI 调用看不出来
+   （进程退出即释放），但**服务化必然踩**。改成 `retired` 列表：阻塞等待（`sync` 或
+   in-flight 满）之后释放。修完 GPU 侧从"第 2 个场景 OOM"变成"13 个场景跑通"。
+   另加 `Gpu::release_scratch()`（全排空后清池），给多次合成的调用方用一个口子。
+2. **参考的 codec 解码是分块的**（`chunked_decode(chunk_size=300, left_context=25)`），
+   我们是一次性整段 → **超过 300 帧（24 s）的音频对不上**：`clone_topk1` 只有 31.3 dB，
+   而且差异集中在第 20~35 秒。按参考分块（含丢掉 left context 的写法）后 **109.1 dB**，
+   顺带把 40 s 音频的峰值显存从"爆 8 GB"降到"每块 325 帧"。
+
+**尚未覆盖 / 已知不对齐**（这一节就是"没测到"的清单）：
+
+* **非 24 kHz 参考音频**：参考用 `torchaudio.functional.resample` 重采样，我们**直接报错**
+  （`audio.rs` 里写明"resampling not implemented"）。真实素材大多是 44.1/48 kHz，
+  这是可用性硬缺口。要做严格对齐还得复刻它的 Kaiser 窗 sinc。
+* **accent=yue**：参考做 OpenCC s2hk 转换，我们报错（缺表，见第 7 节）。
+* `max_audio_length_ms`：我们内部固定 500 帧（= 40 s，与参考默认一致），CLI 没暴露。
+* **多段对话 / 多 speaker 的 Segment 序列**（参考 `Generator.generate` 支持 context 列表）：
+  我们只做单段克隆或单 speaker。
+* ONNX 路径（`infer_onnx.py`）不在范围内；Gradio `app.py` 只是包装。
+* 流式（边生成边出音频）参考没有，我们也没有。
+* `parity_tn` 覆盖 6 语言 21 例，但 1 条英文平局差异已登记；粤语未支持。
 
 ---
 

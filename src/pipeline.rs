@@ -119,6 +119,11 @@ impl Pipeline {
         Ok(Self { lm, codec, tn: Tn::bundled() })
     }
 
+    /// The device both models share (diagnostics, scratch release).
+    pub fn device(&self) -> &Device {
+        self.lm.device()
+    }
+
     pub fn describe(&self) -> String {
         format!("lm: {} | codec: {}", self.lm.device().describe(), self.codec.device().describe())
     }

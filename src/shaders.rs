@@ -614,6 +614,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 "#;
 
 /// `y = x`, used by [`crate::device::Device::copy`].
+/// `y[dst_off .. dst_off+len] = x[src_off .. src_off+len]` (chunk splicing).
+pub const COPY_RANGE_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 128u;
+    if (i >= p[0]) { return; }
+    y[p[2] + i] = x[p[1] + i];
+}
+"#;
+
 /// `y[0..len] = value`, 4 stores per thread.
 ///
 /// `Device::zeros` used to reach the device by uploading a host-side zero vec

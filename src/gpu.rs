@@ -237,6 +237,9 @@ pub struct Gpu {
     /// every weight resident: nothing executes, so the queue stays empty, which
     /// is what lets `write_buffer` stage at full speed.
     no_record: Cell<bool>,
+    /// Batches whose submits may still be in flight: their bind groups (and the
+    /// buffers those bind) must stay alive until a blocking wait.
+    retired: RefCell<Vec<Vec<Pending>>>,
 }
 
 /// A parameter block from the pool: bound whole, offset always 0.
@@ -256,6 +259,24 @@ pub struct Stats {
 }
 
 impl Gpu {
+    /// Give the scratch pool back to the driver.
+    ///
+    /// Safe only after a full drain. Useful between utterances when one process
+    /// serves many syntheses: each utterance wants pooled buffers of a different
+    /// size, and the pool otherwise keeps up to half a gigabyte of the last one.
+    pub fn release_scratch(&self) {
+        self.sync();
+        let mut pool = self.pool.borrow_mut();
+        pool.clear();
+        *self.pool_bytes.borrow_mut() = 0;
+        self.deferred_pool.borrow_mut().clear();
+    }
+
+    /// Drop every retired batch: safe once the queue has been waited on.
+    fn release_retired(&self) {
+        self.retired.borrow_mut().clear();
+    }
+
     /// Drop dispatches while a load-time graph walk makes weights resident.
     pub fn set_no_record(&self, on: bool) {
         self.no_record.set(on);
@@ -283,6 +304,7 @@ impl Gpu {
     pub fn sync(&self) {
         self.flush();
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
+        self.release_retired();
     }
 
     fn drain_deferred(&self) {
@@ -392,6 +414,7 @@ impl Gpu {
             arena_used: Cell::new(0),
             upload_host_nanos: Cell::new(0),
             no_record: Cell::new(false),
+            retired: RefCell::new(Vec::new()),
         })
     }
 
@@ -935,8 +958,12 @@ impl Gpu {
             }
         }
         self.stats.borrow_mut().submits += 1;
-        // Keeps the bind groups (and their buffers) alive until the GPU is done.
-        std::mem::forget(batch);
+        // Bind groups must outlive the submit that references them, but only
+        // until it completes: retry them until the next blocking wait. (The
+        // previous `std::mem::forget(batch)` here leaked every batch's bind
+        // groups for the life of the process - and a bind group pins the buffers
+        // it binds, so a second synthesis on the same device ran out of VRAM.)
+        self.retired.borrow_mut().push(batch);
         Some(encoder.finish())
     }
 
@@ -957,6 +984,7 @@ impl Gpu {
                 // block: the pipeline is deep enough
                 self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
                 self.in_flight.set(0);
+                self.release_retired();
             } else {
                 // non-blocking: let the driver start the batch while the CPU
                 // records the next one

@@ -164,6 +164,14 @@ pub fn fill(gpu: &Gpu, y: &Buffer, len: usize, value: f32) {
     gpu.dispatch_params("fill_f32", shaders::FILL_F32, "main", &[(0, y)], &params, grid(groups));
 }
 
+/// `y[dst_off .. dst_off+len] = x[src_off .. src_off+len]`.
+pub fn copy_range(gpu: &Gpu, x: &Buffer, src_off: usize, y: &Buffer, dst_off: usize, len: usize) {
+    // 4 words: the params pool binds whole 16-byte blocks.
+    let params = gpu.params_u32(&[len as u32, src_off as u32, dst_off as u32, 0]);
+    gpu.dispatch_params("copy_range_f32", shaders::COPY_RANGE_F32, "main",
+                        &[(0, x), (1, y)], &params, grid(len));
+}
+
 pub fn copy(gpu: &Gpu, x: &Buffer, y: &Buffer, len: usize) {
     let params = gpu.params_u32(&[len as u32]);
     gpu.dispatch_params("copy_f32", shaders::COPY_F32, "main", &[(0, x), (1, y)], &params, grid(len));
