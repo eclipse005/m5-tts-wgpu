@@ -26,6 +26,7 @@ pub mod cpu_ops;
 pub mod device;
 pub mod gpu;
 pub mod lm;
+pub mod long_audio;
 pub mod gpu_ops;
 pub mod opencc;
 pub mod ops;

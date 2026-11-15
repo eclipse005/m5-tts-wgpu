@@ -46,10 +46,11 @@ struct Cli {
     topk: usize,
     /// Longest utterance, in milliseconds (the reference's `max_audio_length_ms`),
     /// for callers that want its exact behaviour: the budget is used as given and
-    /// an utterance that cannot fit the model's context is an error. Omit it for
-    /// the default, which gives each pass the whole context (so a long script is
-    /// read to its end instead of being cut at 40 s) and splits text that cannot
-    /// fit one pass into sentences.
+    /// an utterance that cannot fit the model's context is an error. Omit it to
+    /// read a long text to its end instead: the text is cut at sentence and clause
+    /// boundaries into utterances of about this length (40 s by default) and the
+    /// pieces are joined with a uniform 150 ms pause. Same behaviour for preset
+    /// and cloned voices.
     #[arg(long)]
     max_audio_length_ms: Option<f64>,
     #[arg(long, default_value_t = 1234)]

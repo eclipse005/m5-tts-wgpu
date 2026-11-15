@@ -64,11 +64,12 @@ pub struct Args {
     pub temperature: f32,
     pub topk: usize,
     pub max_audio_frames: usize,
-    /// Automatic length: each pass gets the model's whole context, and text that
-    /// cannot fit one pass is split into sentences (see `plan_fragments`). The
-    /// default for the CLI; the reference's explicit `max_audio_length_ms`
-    /// semantics - budget exactly as given, error when it cannot fit - are what
-    /// `with_max_audio_length_ms` selects.
+    /// Automatic length, the CLI default: `max_audio_frames` is the utterance
+    /// budget a long text is cut into (see `synthesize_auto`), so a script of any
+    /// length is read to its end instead of being cut at the budget. The
+    /// reference's explicit `max_audio_length_ms` semantics - budget exactly as
+    /// given, error when it cannot fit - are what `with_max_audio_length_ms`
+    /// selects (`auto_length: false`).
     pub auto_length: bool,
 }
 
@@ -111,10 +112,26 @@ pub struct Synthesis {
     /// Number of frames in `codes`.
     pub frames: usize,
     pub prompt_frames: usize,
-    /// Generated codes only (frame-major), i.e. without the reference prefix.
+    /// Generated codes only (frame-major), i.e. without the reference prefix. For
+    /// a long text this is the concatenation of every fragment's own codes.
     pub generated: Vec<u32>,
     pub audio: Vec<f32>,
     pub sample_rate: usize,
+    /// Every pass ended on its own (EOS) rather than hitting the frame cap.
+    pub eos: bool,
+}
+
+/// Make a fragment end with exactly `ms` of silence.
+///
+/// The model's own trailing pause varies from almost nothing to over a second, so
+/// without this every seam would sound different. The last fragment is left alone
+/// (the reference's 0.1 s tail trim already shapes it).
+fn normalize_seam(audio: &mut Vec<f32>, sample_rate: usize, ms: f64) {
+    const QUIET: f32 = 0.01;
+    let hold = (sample_rate as f64 * ms / 1000.0) as usize;
+    let speech_end = audio.iter().rposition(|v| v.abs() > QUIET).map(|i| i + 1).unwrap_or(0);
+    audio.truncate(speech_end);
+    audio.resize(speech_end + hold, 0.0);
 }
 
 pub struct Pipeline {
@@ -177,145 +194,158 @@ impl Pipeline {
         Ok(codes)
     }
 
-    /// Tokens the conditioning costs before any target text (control tokens plus
-    /// the reference transcript), i.e. what every fragment pays once.
-    fn fixed_prompt_tokens(&self, args: &Args) -> Result<usize> {
+    /// Tokens the conditioned prompt costs with `fragment` in it.
+    fn conditioned_tokens(&self, args: &Args, fragment: &str) -> Result<usize> {
         let cloning = args.prompt_wav.is_some();
         let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
-        let spoken = args.prompt_text.clone().unwrap_or_default();
+        let spoken = match (cloning, args.prompt_text.as_deref()) {
+            (true, Some(prompt_text)) => format!("{prompt_text}{fragment}"),
+            _ => fragment.to_string(),
+        };
         let conditioned = format_conditioned_text(&spoken, Some(&speaker), args.accent.as_deref(),
                                                   Some(&args.lang), args.caption.as_deref())?;
         Ok(self.lm.tok.encode(&conditioned)?.len())
     }
 
-    /// Split the target text into fragments that each fit one pass.
+    /// Long audio: read `text` as a sequence of utterances, one pass each.
     ///
-    /// Only the automatic path calls this. Sentences first, then clauses, then a
-    /// plain character cut for a run with no punctuation at all; every boundary is
-    /// checked by encoding the conditioned text, so a fragment is guaranteed to
-    /// leave room for at least one generated frame.
-    fn plan_fragments(&self, args: &Args, text: &str, budget: usize) -> Result<Vec<String>> {
-        let cloning = args.prompt_wav.is_some();
-        let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
-        let fits = |fragment: &str| -> Result<bool> {
-            let spoken = match (cloning, args.prompt_text.as_deref()) {
-                (true, Some(prompt_text)) => format!("{prompt_text}{fragment}"),
-                _ => fragment.to_string(),
-            };
-            let conditioned = format_conditioned_text(&spoken, Some(&speaker),
-                                                      args.accent.as_deref(),
-                                                      Some(&args.lang), args.caption.as_deref())?;
-            Ok(self.lm.tok.encode(&conditioned)?.len() <= budget)
-        };
+    /// Where the cuts go is decided on the text alone (`crate::long_audio::cut`), never by
+    /// predicting how long the audio will be, so the same text always splits the
+    /// same way. Two bounds shape the fragment size, and both come from the model's
+    /// own contract:
+    ///
+    /// * the reference's utterance budget (`max_audio_frames`, 40 s by default).
+    ///   That is the length the model is trained on and the reference is exercised
+    ///   at; well past it the model loses the thread - measured on one 278-character
+    ///   script, four sampling seeds gave 95.7 s, 21.0 s, 99.3 s and 76.9 s of
+    ///   audio for identical text, and the slow ones are degenerate (a hum with no
+    ///   zero crossings, not speech).
+    /// * the model's context, as the ceiling: a fragment whose text leaves no room
+    ///   for its audio would be cut mid-word by the frame cap.
+    ///
+    /// Every fragment is an ordinary single pass with the same voice conditioning,
+    /// so preset and cloned voices take the same path. A text that fits one pass is
+    /// cut into a single fragment whose text is the input unchanged, and produces
+    /// identical audio to the explicit single-pass path. A fragment that still hits
+    /// its cap (a slow reading of a small fragment, or a caller-supplied long
+    /// budget) is halved and redone - truncated audio is never emitted, and only
+    /// that fragment is re-run.
+    ///
+    /// Seams: each fragment ends with its own natural pause trimmed to
+    /// `SEAM_SILENCE_MS`, because the model's trailing silence ranges from nothing
+    /// to over a second.
+    fn synthesize_auto(&self, args: &Args, text: &str, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
+        const SEAM_SILENCE_MS: f64 = 150.0;
+        /// Faster than this, the fragment cannot be speech: the model skipped text.
+        const MAX_UNITS_PER_SECOND: f64 = 8.0;
 
-        // Sentence, then clause boundaries; the delimiter stays with its piece.
-        let pieces = |text: &str, delimiters: &[char]| -> Vec<String> {
-            let mut out = Vec::new();
-            let mut current = String::new();
-            for ch in text.chars() {
-                current.push(ch);
-                if delimiters.contains(&ch) {
-                    out.push(std::mem::take(&mut current));
-                }
-            }
-            if !current.trim().is_empty() {
-                out.push(current);
-            }
-            out
+        let sample_rate = self.codec.sample_rate;
+        let per_frame = (self.codec.sample_rate as f64 / self.codec.frame_rate).round() as usize;
+        let prompt_frames = match &args.prompt_wav {
+            Some(path) => prepare_prompt(path, self.codec.sample_rate)?.len().div_ceil(per_frame),
+            None => 0,
         };
+        // Context room for a fragment with no text at all: the largest any fragment
+        // can be. Bounds the text budget when the caller asks for long utterances.
+        let fixed = self.conditioned_tokens(args, "")?;
+        let ceiling = crate::lm::MAX_CONTEXT.saturating_sub(fixed + prompt_frames + 1);
+        let budget = crate::long_audio::semantic_budget(args.max_audio_frames)
+            .min(crate::long_audio::semantic_budget(ceiling));
 
-        let mut fragments: Vec<String> = Vec::new();
-        let mut current = String::new();
-        let mut flush = |current: &mut String, fragments: &mut Vec<String>| {
-            if !current.trim().is_empty() {
-                fragments.push(std::mem::take(current));
+        let mut queue: std::collections::VecDeque<String> = crate::long_audio::cut(text, budget).into();
+        let mut audio: Vec<f32> = Vec::new();
+        let mut generated: Vec<u32> = Vec::new();
+        let mut eos_all = true;
+        let mut index = 0usize;
+        let mut passes = 0usize;
+        let mut cut_off: Option<String> = None;
+        let mut unreadable: Option<String> = None;
+
+        while let Some(fragment) = queue.pop_front() {
+            passes += 1;
+            if let Some(prefix) = std::env::var_os("M5_DUMP_FRAGMENTS") {
+                std::fs::write(format!("{}.{passes}.txt", prefix.to_string_lossy()), &fragment)?;
             }
-        };
-        for sentence in pieces(text, &['。', '！', '？', '；', '\n', '!', '?', ';']) {
-            let candidate = format!("{current}{sentence}");
-            if fits(&candidate)? {
-                current = candidate;
-                continue;
-            }
-            flush(&mut current, &mut fragments);
-            if fits(&sentence)? {
-                current = sentence;
-                continue;
-            }
-            // One sentence that does not fit: try its clauses, then cut characters.
-            let mut clause_run = String::new();
-            for clause in pieces(&sentence, &['，', '、', '：', ',', ':']) {
-                let candidate = format!("{clause_run}{clause}");
-                if fits(&candidate)? {
-                    clause_run = candidate;
-                    continue;
-                }
-                flush(&mut clause_run, &mut fragments);
-                if fits(&clause)? {
-                    clause_run = clause;
-                    continue;
-                }
-                let mut run = String::new();
-                for ch in clause.chars() {
-                    let candidate = format!("{run}{ch}");
-                    if fits(&candidate)? {
-                        run = candidate;
-                    } else {
-                        flush(&mut run, &mut fragments);
-                        run.push(ch);
+            // Every pass may use the whole context: the fragment size above already
+            // keeps the audio inside it, so this only decides what gets cut.
+            let conditioned = self.conditioned_tokens(args, &fragment)?;
+            let cap = crate::lm::MAX_CONTEXT.saturating_sub(conditioned + prompt_frames + 1).max(1);
+            let out = self.synthesize_pass(
+                &Args { max_audio_frames: cap, ..args.clone() }, &fragment, noise)?;
+            let produced = out.generated.len() / CODEBOOKS;
+
+            // Too fast to be speech: 146 characters in 10.4 s is 14 units per second,
+            // roughly twice anything a person can read, so the model skipped text.
+            // Splitting makes the pieces smaller and the model reads those to the end.
+            let units = crate::long_audio::semantic_length(&fragment);
+            let seconds = out.audio.len() as f64 / sample_rate as f64;
+            let skipped = seconds > 0.0
+                && units as f64 / seconds > MAX_UNITS_PER_SECOND
+                && units > crate::long_audio::MIN_TAIL_LENGTH;
+
+            if (!out.eos && produced >= cap) || skipped {
+                if units > 1 {
+                    // Halve this fragment (at the strongest boundary available) and
+                    // put both halves back at the head of the queue.
+                    let halves = crate::long_audio::cut(&fragment, units.div_ceil(2).max(1));
+                    if halves.len() > 1 {
+                        for half in halves.into_iter().rev() {
+                            queue.push_front(half);
+                        }
+                        continue;
                     }
                 }
-                clause_run = run;
+                // Nothing left to cut: keep it, and say which way it went wrong.
+                if skipped {
+                    unreadable.get_or_insert_with(|| fragment.clone());
+                } else {
+                    cut_off.get_or_insert_with(|| fragment.clone());
+                }
             }
-            current = clause_run;
-        }
-        flush(&mut current, &mut fragments);
-        if fragments.is_empty() {
-            bail!("text produced no synthesizable fragments");
-        }
-        Ok(fragments)
-    }
 
-    /// Synthesize each fragment with the same prompt and concatenate the audio.
-    ///
-    /// Each fragment takes the ordinary single-pass path (so it is byte-identical
-    /// to a standalone call with that text) and keeps its own 0.1 s tail trim; the
-    /// seams are plain concatenation, which is what the model's own trim leaves
-    /// room for. `codes` here are the *generated* codes only - a prompt prefix
-    /// repeated per fragment would be a lie about the frame count.
-    fn synthesize_fragments(&self, args: &Args, fragments: Vec<String>, prompt_frames: usize,
-                            noise: &mut dyn NoiseSource) -> Result<Synthesis> {
-        let mut audio = Vec::new();
-        let mut generated = Vec::new();
-        let mut frames = prompt_frames;
-        let total = fragments.len();
-        for (index, fragment) in fragments.into_iter().enumerate() {
-            let out = self.synthesize(&Args { text: fragment, auto_length: true,
-                                              ..args.clone() }, noise)?;
-            let produced = out.generated.len() / CODEBOOKS;
-            eprintln!("  fragment {}/{total}: {produced} frames, {:.1}s",
-                      index + 1, out.audio.len() as f64 / out.sample_rate as f64);
-            audio.extend_from_slice(&out.audio);
+            index += 1;
+            let chars = fragment.chars().count();
+            eprintln!(
+                "  fragment {index}: {chars} chars ({units} units), {produced} frames -> \
+                 {seconds:.1}s ({:.1} units/s){}",
+                units as f64 / seconds.max(1e-9),
+                if out.eos { "" } else { ", cut at the frame cap" },
+            );
+            let mut piece = out.audio;
+            if !queue.is_empty() {
+                normalize_seam(&mut piece, sample_rate, SEAM_SILENCE_MS);
+            }
+            eos_all &= out.eos;
+            audio.extend_from_slice(&piece);
             generated.extend_from_slice(&out.generated);
-            frames += produced;
         }
+        if let Some(fragment) = cut_off {
+            eprintln!("warning: {fragment:?} cannot be cut any further and still hit the frame cap");
+        }
+        if let Some(fragment) = unreadable {
+            eprintln!("warning: {fragment:?} is read faster than speech even as one unit");
+        }
+
         Ok(Synthesis {
             codes: generated.clone(),
-            frames,
+            frames: prompt_frames + generated.len() / CODEBOOKS,
             prompt_frames,
             generated,
             audio,
-            sample_rate: self.codec.sample_rate,
+            sample_rate,
+            eos: eos_all,
         })
     }
 
     /// Full synthesis. `noise` supplies one `Exp(1)` draw per codebook per frame.
+    ///
+    /// With `auto_length` the text is spoken in as few passes as the model's
+    /// context allows (`synthesize_auto`); a text that fits one pass takes exactly
+    /// the same path and produces the same audio as an explicit single pass.
     pub fn synthesize(&self, args: &Args, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         if args.text.trim().is_empty() {
             bail!("text must be nonempty");
         }
-        let text = self.tn.normalize(&args.text, &args.lang, args.accent.as_deref())?;
-
         let cloning = args.prompt_wav.is_some();
         if cloning && args.prompt_text.as_deref().map(str::trim).unwrap_or("").is_empty() {
             bail!("cloning requires both prompt_wav and its transcript");
@@ -323,10 +353,21 @@ impl Pipeline {
         if !cloning && args.prompt_text.is_some() {
             bail!("prompt_text requires prompt_wav");
         }
+        let text = self.tn.normalize(&args.text, &args.lang, args.accent.as_deref())?;
+        if args.auto_length {
+            return self.synthesize_auto(args, &text, noise);
+        }
+        self.synthesize_pass(args, &text, noise)
+    }
+
+    /// One pass: prompt conditioning, prefill, frame-by-frame generation, decode.
+    /// `text` is already normalised.
+    fn synthesize_pass(&self, args: &Args, text: &str, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
+        let cloning = args.prompt_wav.is_some();
         let spoken = if cloning {
             format!("{}{}", args.prompt_text.as_deref().unwrap(), text)
         } else {
-            text.clone()
+            text.to_string()
         };
         let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
         let conditioned = format_conditioned_text(
@@ -370,34 +411,7 @@ impl Pipeline {
         // into sentences and synthesized fragment by fragment (the same prompt
         // every time), so the result is the whole text - something the reference
         // cannot do at any setting.
-        let max_frames = if args.auto_length {
-            crate::lm::MAX_CONTEXT.saturating_sub(prompt_len + 1)
-        } else {
-            args.max_audio_frames
-        };
-        // How much audio the text needs. Calibrated on the scenarios: 473 text
-        // tokens spoke for 1104 frames (2.4 frames per token), i.e. ~6.2 characters
-        // a second at 80 ms a frame. Splitting on the estimate - rather than on
-        // "does not fit at all" - is what keeps a long script from being squeezed
-        // into the handful of frames a nearly-full context would leave.
-        const FRAMES_PER_TOKEN: f64 = 2.4;
-        if args.auto_length {
-            let estimate = (text_tokens.len() as f64 * FRAMES_PER_TOKEN * 1.2).ceil() as usize;
-            if estimate > max_frames || max_frames < 1 {
-                // A fragment of T tokens needs ~FRAMES_PER_TOKEN*T frames, and both
-                // share the context, so T ~ context / (1 + FRAMES_PER_TOKEN). (Using
-                // the *whole text's* remaining frames here instead made fragments of
-                // a hundred characters each.)
-                let fixed = self.fixed_prompt_tokens(args)?;
-                let room = crate::lm::MAX_CONTEXT
-                    .saturating_sub(fixed + prompt_frames + 2);
-                let budget = ((room as f64 / (1.0 + FRAMES_PER_TOKEN * 1.2)) as usize).max(1);
-                let fragments = self.plan_fragments(args, &text, budget)?;
-                eprintln!("long text: {} tokens need ~{} frames, one pass allows {} -> {} fragments of <= {} tokens",
-                          text_tokens.len(), estimate, max_frames, fragments.len(), budget);
-                return self.synthesize_fragments(args, fragments, prompt_frames, noise);
-            }
-        }
+        let max_frames = args.max_audio_frames;
         // The backbone's positional range (the reference's `max_seq_len`). The
         // rope tables and the attention kernels' score staging are both sized to
         // it, so this is the one place the limit is enforced.
@@ -417,6 +431,7 @@ impl Pipeline {
         if profile { eprintln!("  backbone prefill: {:.3}s", phase.elapsed().as_secs_f64()); }
         phase = std::time::Instant::now();
         let mut generated: Vec<u32> = Vec::new();
+        let mut eos = false;
         let mut position = prompt_len;
         let (mut t_noise, mut t_depth, mut t_step) = (0.0f64, 0.0f64, 0.0f64);
         for frame in 0..args.max_audio_frames {
@@ -454,7 +469,8 @@ impl Pipeline {
             if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_depth += lap.elapsed().as_secs_f64();
             if sampled.iter().all(|token| *token == 0) {
-                break; // EOS
+                eos = true;
+                break;
             }
             for token in &sampled {
                 generated.push(token.saturating_sub(1));
@@ -529,6 +545,7 @@ impl Pipeline {
             generated,
             audio,
             sample_rate: self.codec.sample_rate,
+            eos,
         })
     }
 }
