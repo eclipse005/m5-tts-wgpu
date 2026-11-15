@@ -803,10 +803,35 @@ rope 全表、两个 kernel 的 score 暂存、`synthesize` 的越界检查全�
 | top-k | 1 / 7 / 10 / 50 | 0 mismatch |
 | 文本长度 | 1 字（8 帧）、常规、**250 字（app 上限，284 帧）**、无标点、571 字（1125 帧） | 0 mismatch |
 | 音频时长 | 0.54 s → **89.90 s** | 0 mismatch |
-| 参考音频 | 24 kHz 3.4 s、**44.1 kHz**、**立体声**、**13.36 s（>10 s，触发 0.02 静音阈值）** | 前三者 0 mismatch，**13.36 s 不过** |
+| 参考音频 | 24 kHz 3.4 s、**44.1 kHz**、**立体声**、**13.36 s（>10 s，触发 0.02 静音阈值）** | 0 mismatch（13.36 s 已修，见下） |
 | 生成预算 | 1.6 s / 40 s / 90 s（含"跑满不出 EOS"的截断场景） | 0 mismatch |
 
-**唯一没对齐的一项**：13.36 s 的参考录音（`clone_prompt_long10s`）。
+**当前 31/31 全部逐 code 对齐**（2026-11 第七轮修掉最后一项后）。
+
+### 6.13.1 最后那一项：编码器两个 bug（已修）
+
+13.36 s 参考录音原先 prompts codes 差 17/2032，导致 LM 从第 0 帧分叉、时长都不同
+（参考 1.82 s、我们 5.34 s）。逐阶段 dump 后定位到**编码器**，两处：
+
+1. **编码器 transformer 的注意力窗口**（`src/codec/encoder.rs`）：我们按
+   `encoder_config.sliding_window = 250` 做了窗口截断，但参考的 `MimiTransformerModel`
+   在这里建的是**纯因果 mask**——用 hook 抓它的 attention_mask 实测：query 0/1/250/252
+   分别保留 1/2/251/253 个 key，且 `first allowed key` 恒为 0。所以 253 帧的序列从第
+   250 帧开始分叉（transformer 输出差 0.16 / 0.11 / **0.50**），再被 downsample 放大到 12.9。
+   改成全因果后 transformer 阶段 max|diff| 4.0e-4（尺度 20），最后一帧 1.1e-4。
+2. **downsample 的 `pad_mode="replicate"` 右端**：它的滑动窗口在输入长度为奇数时越过信号
+   末尾一个样本，HF 用**最后一个样本复制**填充，我们填了 0 → 末帧 latent 差 13。
+   补上右端复制后 downsample 阶段 max|diff| 5.3e-4（尺度 26.8）。
+
+修完：编码器 codes **0/2032**，`clone_prompt_long10s` 端到端 **24/24 帧、0/384 codes、
+SNR 110.8 dB（CPU）/ 110.6 dB（GPU）**，本次 `M5_SCENARIO_REPEAT=1` 下也逐位可复现。
+
+**方法学**：这一轮靠的是"逐阶段 dump + 与参考对齐"（`examples/prompt_probe` 存
+`seanet / transformer / downsample / downsampled` 四个阶段的 f32，Python 侧用 forward hook
+落同样的张量），而不是猜。README/HANDOVER 之前记的"编码器 CL 绕行变慢已回退"之外，
+这一条是编码器真正的对齐缺口。
+
+（历史记录，修好前的症状：）
 
 * `prepare_prompt` 对它**逐样本相同**（242326 样本，max|diff| = 0），所以不是前端问题；
 * 但**编码器的 prompt codes 在最后约 2 帧（共 127 帧）不同**：第二末帧差 1 个 code，

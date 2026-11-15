@@ -124,8 +124,15 @@ impl Codec {
             ops::rope(dev, &mut k, enc.num_attention_heads, enc.head_dim, theta)?;
 
             let mut attended = dev.zeros([frames, q_dim])?;
+            // Full causal attention, *not* the config's `sliding_window: 250`.
+            // The reference's `MimiTransformerModel` builds a plain causal mask
+            // here (measured: query 0/1/250/252 keep 1/2/251/253 keys, always
+            // from key 0), so a 250-key window - what the config field suggests -
+            // diverges from frame 250 on. That was the encoder tail bug: a 10 s
+            // reference recording got 17/2032 prompt codes wrong and the LM
+            // started off on the wrong foot.
             ops::attention(dev, &q, &k, &v, &mut attended, enc.num_attention_heads, enc.head_dim,
-                           enc.sliding_window)?;
+                           frames)?;
             let mut projected = dev.zeros([frames, hidden])?;
             ops::linear(dev, &attended, &o_w, None, &mut projected)?;
             let attn_scale = self.vector(&format!("{p}.self_attn_layer_scale.scale"), hidden)?;
@@ -168,7 +175,12 @@ impl Codec {
         const STRIDE: usize = 2;
         let pad = KS - STRIDE;
         let host = dev.read(x)?;
-        let padded_len = t_in + pad;
+        // `pad_mode="replicate"` pads *both* ends. The left copy only shifts the
+        // first frame, but the right one decides the last frame whenever the
+        // input length is odd: its window reaches one sample past the signal, and
+        // HF replicates the final sample there instead of reading a zero.
+        let tail = KS;
+        let padded_len = t_in + pad + tail;
         let mut padded = vec![0.0f32; channels * padded_len];
         for channel in 0..channels {
             let src = &host[channel * t_in..(channel + 1) * t_in];
@@ -176,7 +188,10 @@ impl Codec {
             for slot in dst.iter_mut().take(pad) {
                 *slot = src[0]; // replicate the first frame
             }
-            dst[pad..].copy_from_slice(src);
+            dst[pad..pad + t_in].copy_from_slice(src);
+            for slot in dst[pad + t_in..].iter_mut() {
+                *slot = src[t_in - 1]; // replicate the last frame
+            }
         }
         let padded = dev.tensor([channels, padded_len], &padded)?;
 

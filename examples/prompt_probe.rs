@@ -34,7 +34,20 @@ fn main() -> anyhow::Result<()> {
     let transformed = codec.encoder_transformer(&time_major)?;
     let mut channels = dev.zeros([transformed.shape()[1], transformed.shape()[0]])?;
     m5_tts_wgpu::ops::transpose(dev, &transformed, &mut channels)?;
-    let downsampled = codec.encoder_downsample(&channels)?;
+    let channels_major = &channels;
+    let downsampled = codec.encoder_downsample(channels_major)?;
+    // Stage dumps in the reference's layouts, for stage-by-stage diffing.
+    for (name, t) in [("seanet", &seanet), ("transformer", &transformed),
+                      ("downsample", &channels_major)] {
+        let host = dev.read(t)?;
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{out}.{name}.f32"), bytes)?;
+        println!("{name}: {:?}", t.shape());
+    }
+    let host = dev.read(&downsampled)?;
+    let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(format!("{out}.downsampled.f32"), bytes)?;
+    println!("downsampled: {:?}", downsampled.shape());
     let codes = codec.encode_codes(&downsampled)?;
     println!("codes: {} frames x {}", codes.len() / 16, 16);
     let text: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
