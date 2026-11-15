@@ -905,6 +905,42 @@ kernel 单独测是 92 µs/步，而真实帧里每步要 190 µs——**每个"
 
 ---
 
+## 6.15 2026-11 第九轮：depth 0.54 → **0.47**，以及"persistent kernel 为什么不做"
+
+**收益来源**（都是先量再改，全部过 31 场景门）：
+
+| 改动 | 效果 |
+|---|---|
+| GEMV 类 kernel 全部 16 字节宽 load（`array<vec4<u32>>`/`vec4<f32>`）+ 4 累加器 | 一层步 163 → 92 µs；norm_gateup 82 → 20-28 µs |
+| `norm_gateup` 每 WG 行数 64 → 32（= 64 → 128 个 WG） | depth 21.2 → 18.9 ms/帧（**注意：512 个 WG 反而更慢**，见 6.14） |
+| rms 融进 qkv 投影（`NORM_GEMV_BF16_F32`） | 层步 6 → 5 dispatch |
+| **每帧 2-token prefill 换掉 16×16 tile GEMM**：新增 `LINEAR_ROW_F32`（m ≤ 8 时用，一行一线程，**保持同一累加顺序**所以数值逐位相同） | prefill 5.8 → 2.8 ms/帧，depth 17.7 → 15.0 ms，RTF **0.54 → 0.47-0.48** |
+
+**踩到的两个坑**（都回滚了，别重蹈）：
+
+1. **把 2-token prefill 拆成两次融合 decode 步**（数学等价）：快 4 ms，但 **GPU 侧所有场景的 codes 都变了**
+   （每次多生成一帧、噪声用尽）。CPU 矩阵全过是因为 CPU 不走融合路径——这说明"只在 GPU 上改结构"
+   必须用 GPU 矩阵验证，`parity_pipeline` 一个场景不够。
+2. **norm 融进 audio_head GEMV**（`NORM_GEMV_F32`）：也快 0.8 ms，但 GPU 侧同样整体偏移。已把 norm
+   的归约改成与独立 kernel 一样的 64 lanes/64 partial（更接近了），仍然不一致；可疑点是 bind group
+   按 codebook 缓存时 `logits` 必须是常驻 buffer（这一点已修），但复测仍不过 → **暂时保留独立
+   rms + 通用 head 这条（已验证）路径**，把融合留作待查项。源码里已删掉这条死路径。
+
+**为什么不做 persistent kernel（一个 dispatch 跑完整个 codebook 步）**
+
+数学上它把 654 dispatch/帧降到 ~45，但硬件上不成立：depth 每帧要流 **570 MB 权重**，而一个
+workgroup 只能用 **1 个 SM**，P104 单 SM 的 DRAM 带宽约 30-50 GB/s（全卡 190）。570 MB / 40 GB/s
+= **14 ms/帧**，比现在（15 ms）还差。要跑满带宽必须同时有几百个 workgroup，而层与层之间是
+grid-wide 依赖、wgpu 没有 grid sync——所以"每层一次 dispatch"这条路线（现在 5 个/层步）就是
+这张卡上的结构性下限；再往下只能减少**每帧的层步数**（模型决定的 15×5=75）。
+
+**当前分解**（RTF 0.47，synthesis 2.07 s / 4.30 s 音频）：depth 16.2 ms/帧（654 dispatch）>
+codec 解码 0.68 s > encode 0.29 s。depth 里：层步 ~10 ms（350 dispatch）、head+sample ~4.5 ms、
+prefill ~2.8 ms。**下一个看得见的目标是 codec（0.68 s）**，以及 depth 的 `sample_topk`
+（16 次/帧，实测 ~175 µs 一次，1 个工作组的 4 趟基数选择）。
+
+---
+
 ## 7. 优化建议（**仅供参考**，按性价比排序）
 
 1. **大权重首次上传**（6.8⑦）：codec 一次 run 传 ~457 MB、encoder ~225 MB，实测在真流程里只有

@@ -64,6 +64,44 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 "#;
 
+/// `y[m,n] = x[m,k] · w[n,k]^T + bias[n]` for a *small* m, one thread per output.
+///
+/// The 16x16 tiled kernel above computes sixteen rows whether or not they exist,
+/// and the two-token depth prefill re-runs every frame - eight times the useful
+/// work, 5.8 ms of a 17.9 ms frame. This variant keeps the accumulation order
+/// (a single running sum over ascending k, four products per 16-byte load, so the
+/// result is bit-identical to the tile) and only touches the rows asked for.
+pub const LINEAR_ROW_F32: &str = r#"
+// 0=m 1=n 2=k 3=has_bias
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;   // [m * k/4]
+@group(0) @binding(1) var<storage, read> w: array<vec4<f32>>;   // [n * k/4]
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let idx = gid.x + gid.y * nwg.x * 128u;
+    if (idx >= p[0] * p[1]) { return; }
+    let row = idx / p[1];
+    let col = idx % p[1];
+    let groups = p[2] / 4u;
+    var acc = 0.0;
+    let xbase = row * groups;
+    let wbase = col * groups;
+    for (var g = 0u; g < groups; g = g + 1u) {
+        let xv = x[xbase + g];
+        let wv = w[wbase + g];
+        acc = acc + wv.x * xv.x;
+        acc = acc + wv.y * xv.y;
+        acc = acc + wv.z * xv.z;
+        acc = acc + wv.w * xv.w;
+    }
+    if (p[3] == 1u) { acc = acc + b[col]; }
+    y[row * p[1] + col] = acc;
+}
+"#;
+
 /// Causal conv1d in `[channels, time]` layout, one thread per output element.
 ///
 /// `x[ci, t*stride + k*dilation - pad]`, out-of-range taps read 0. This is the
@@ -1955,6 +1993,91 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         }
         workgroupBarrier();
     }
+    }
+}
+"#;
+
+/// RMSNorm fused into an f32 GEMV (the per-codebook audio head).
+///
+/// `out = (rms_norm(x) @ w^T)`: rows per workgroup 32, the norm recomputed per
+/// workgroup in the same order the standalone kernel uses. The depth decode runs
+/// this once per codebook (15 a frame) on a 2051x512 head, where the separate
+/// norm + row copy used to cost two extra dispatches each.
+pub const NORM_GEMV_F32: &str = r#"
+// 0=n 1=k 2=eps_bits
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<vec4<f32>>;   // [n * k/4]
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> p: array<u32, 3>;
+var<workgroup> normed: array<vec4<f32>, 128>;
+/// 64 partials, summed in lane 0: the same reduction the standalone RMS_NORM_F32
+/// uses (64 lanes, stride 64). A 256-lane reduction gives a different f32 sum in
+/// the last bits, which is enough to move sampling tokens.
+var<workgroup> nred: array<f32, 64>;
+var<workgroup> wred: array<array<f32, 32>, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let k = p[1];
+    let warp = lid.x / 32u;
+    let lane = lid.x % 32u;
+
+    if (lid.x < 64u) {
+        var acc = 0.0;
+        var c = lid.x;
+        loop {
+            if (c >= k) { break; }
+            let v = x[c];
+            acc = acc + v * v;
+            c = c + 64u;
+        }
+        nred[lid.x] = acc;
+    }
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var total = 0.0;
+        for (var i = 0u; i < 64u; i = i + 1u) { total = total + nred[i]; }
+        nred[0u] = inverseSqrt(total / f32(k) + bitcast<f32>(p[2]));
+    }
+    workgroupBarrier();
+    let inv = nred[0u];
+    let quads = k / 4u;
+    for (var q = lid.x; q < quads; q = q + 256u) {
+        let i = q * 4u;
+        normed[q] = vec4<f32>(x[i] * inv * norm_w[i],
+                              x[i + 1u] * inv * norm_w[i + 1u],
+                              x[i + 2u] * inv * norm_w[i + 2u],
+                              x[i + 3u] * inv * norm_w[i + 3u]);
+    }
+    workgroupBarrier();
+
+    let groups = k / 4u;
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        let row = wid.x * 32u + warp + 8u * r;
+        if (row < p[0]) {
+            let base = row * groups;
+            var a0 = 0.0;
+            var a1 = 0.0;
+            var a2 = 0.0;
+            var a3 = 0.0;
+            for (var g = lane; g < groups; g = g + 32u) {
+                let wv = w[base + g];
+                let nv = normed[g];
+                a0 = a0 + wv.x * nv.x;
+                a1 = a1 + wv.y * nv.y;
+                a2 = a2 + wv.z * nv.z;
+                a3 = a3 + wv.w * nv.w;
+            }
+            wred[warp][lane] = (a0 + a1) + (a2 + a3);
+            workgroupBarrier();
+            if (lane == 0u) {
+                var sum = 0.0;
+                for (var j = 0u; j < 32u; j = j + 1u) { sum = sum + wred[warp][j]; }
+                y[row] = sum;
+            }
+            workgroupBarrier();
+        }
     }
 }
 "#;

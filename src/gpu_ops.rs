@@ -34,6 +34,14 @@ pub fn linear(gpu: &Gpu, x: &Buffer, w: &Buffer, bias: Option<&Buffer>, y: &Buff
         gpu.dispatch_params("gemv_f32", shaders::GEMV_F32, "main", &[(0, x), (1, w), (2, b), (3, y)], &params, (n.div_ceil(8) as u32, 1, 1));
         return;
     }
+    if m <= 8 {
+        // A few rows (the depth decoder's two-token prefill): the 16x16 tile would
+        // compute 16 rows' worth of FMAs every frame. Same accumulation order.
+        gpu.dispatch_params("linear_row_f32", shaders::LINEAR_ROW_F32, "main",
+                            &[(0, x), (1, w), (2, b), (3, y)], &params,
+                            grid(m * n));
+        return;
+    }
     gpu.dispatch_params("linear_f32", shaders::LINEAR_F32, "main", &[(0, x), (1, w), (2, b), (3, y)], &params, (m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1));
 }
 
@@ -345,6 +353,13 @@ pub fn f_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffe
 }
 
 #[allow(clippy::too_many_arguments)]
+/// rms-norm + GEMV in one dispatch (f32 weights), 32 rows per workgroup.
+pub fn f_norm_gemv_f32(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
+                       w: &Buffer, y: &Buffer, n: usize, kk: usize, eps: f32) {
+    k.run_params(gpu, key, &[n as u32, kk as u32, eps.to_bits()], &[x, norm_w, w, y],
+                 ((n as u32).div_ceil(32).max(1), 1, 1));
+}
+
 /// rms-norm + GEMV in one dispatch (bf16 weights): rows per workgroup is 32.
 pub fn f_norm_gemv(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer, norm_w: &Buffer,
                    w: &Buffer, y: &Buffer, n: usize, kk: usize, eps: f32) {

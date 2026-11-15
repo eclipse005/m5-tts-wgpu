@@ -338,6 +338,12 @@ impl Lm {
                            HIDDEN, 0, 1, AUDIO_VOCAB);
         let mut e0_proj = dev.zeros([1, HIDDEN])?;
         ops::linear(dev, &e0, &projection, None, &mut e0_proj)?;
+        // Two-token prefill into the persistent KV cache (generic path: m=2).
+        let mut e0 = dev.zeros([1, HIDDEN])?;
+        gpu_ops::embed_sum(gpu, table.gpu_buffer()?, &token_buffer, e0.gpu_buffer()?,
+                           HIDDEN, 0, 1, AUDIO_VOCAB);
+        let mut e0_proj = dev.zeros([1, HIDDEN])?;
+        ops::linear(dev, &e0, &projection, None, &mut e0_proj)?;
         let mut frame = dev.zeros([2, HIDDEN])?;
         gpu_ops::write_rows(gpu, frame.gpu_buffer()?, projected.gpu_buffer()?, HIDDEN, 0, 1);
         gpu_ops::write_rows(gpu, frame.gpu_buffer()?, e0_proj.gpu_buffer()?, HIDDEN, 1, 1);
