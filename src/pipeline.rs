@@ -121,17 +121,25 @@ pub struct Synthesis {
     pub eos: bool,
 }
 
+/// Below this sample the audio is silence (a fragment's own trailing pause).
+const QUIET: f32 = 0.01;
+
+/// Index just past the last audible sample: the length of the speech itself,
+/// without the model's trailing pause.
+fn speech_end(audio: &[f32]) -> usize {
+    audio.iter().rposition(|v| v.abs() > QUIET).map_or(0, |i| i + 1)
+}
+
 /// Make a fragment end with exactly `ms` of silence.
 ///
 /// The model's own trailing pause varies from almost nothing to over a second, so
 /// without this every seam would sound different. The last fragment is left alone
 /// (the reference's 0.1 s tail trim already shapes it).
 fn normalize_seam(audio: &mut Vec<f32>, sample_rate: usize, ms: f64) {
-    const QUIET: f32 = 0.01;
     let hold = (sample_rate as f64 * ms / 1000.0) as usize;
-    let speech_end = audio.iter().rposition(|v| v.abs() > QUIET).map(|i| i + 1).unwrap_or(0);
-    audio.truncate(speech_end);
-    audio.resize(speech_end + hold, 0.0);
+    let end = speech_end(audio);
+    audio.truncate(end);
+    audio.resize(end + hold, 0.0);
 }
 
 pub struct Pipeline {
@@ -236,8 +244,17 @@ impl Pipeline {
     /// to over a second.
     fn synthesize_auto(&self, args: &Args, text: &str, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         const SEAM_SILENCE_MS: f64 = 150.0;
-        /// Faster than this, the fragment cannot be speech: the model skipped text.
+        /// Plausible reading speed, semantic units per second of *speech* (the
+        /// fragment's own trailing pause excluded). Outside this band the model did
+        /// not read the text: above 8 it skips it (146 characters in 10.4 s was
+        /// measured), below 3 it stretches into babble that stops sounding like the
+        /// language at all (146 characters in 58.6 s; 2.1 units/s is the case a
+        /// listener reported as "not Chinese, sounds like Cantonese").
+        const MIN_UNITS_PER_SECOND: f64 = 3.0;
         const MAX_UNITS_PER_SECOND: f64 = 8.0;
+        /// Shorter fragments are dominated by their own pauses, so the band is only
+        /// applied where it means something.
+        const BAND_MIN_UNITS: usize = 20;
 
         let sample_rate = self.codec.sample_rate;
         let per_frame = (self.codec.sample_rate as f64 / self.codec.frame_rate).round() as usize;
@@ -274,16 +291,16 @@ impl Pipeline {
                 &Args { max_audio_frames: cap, ..args.clone() }, &fragment, noise)?;
             let produced = out.generated.len() / CODEBOOKS;
 
-            // Too fast to be speech: 146 characters in 10.4 s is 14 units per second,
-            // roughly twice anything a person can read, so the model skipped text.
-            // Splitting makes the pieces smaller and the model reads those to the end.
             let units = crate::long_audio::semantic_length(&fragment);
             let seconds = out.audio.len() as f64 / sample_rate as f64;
-            let skipped = seconds > 0.0
-                && units as f64 / seconds > MAX_UNITS_PER_SECOND
-                && units > crate::long_audio::MIN_TAIL_LENGTH;
+            // The speech itself, without the model's trailing pause: that pause ranges
+            // from nothing to over a second and would otherwise decide the verdict.
+            let spoken = speech_end(&out.audio) as f64 / sample_rate as f64;
+            let rate = if spoken > 0.0 { units as f64 / spoken } else { 0.0 };
+            let off_band = units >= BAND_MIN_UNITS
+                && (rate < MIN_UNITS_PER_SECOND || rate > MAX_UNITS_PER_SECOND);
 
-            if (!out.eos && produced >= cap) || skipped {
+            if (!out.eos && produced >= cap) || off_band {
                 if units > 1 {
                     // Halve this fragment (at the strongest boundary available) and
                     // put both halves back at the head of the queue.
@@ -296,7 +313,7 @@ impl Pipeline {
                     }
                 }
                 // Nothing left to cut: keep it, and say which way it went wrong.
-                if skipped {
+                if off_band {
                     unreadable.get_or_insert_with(|| fragment.clone());
                 } else {
                     cut_off.get_or_insert_with(|| fragment.clone());
