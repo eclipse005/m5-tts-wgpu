@@ -100,7 +100,7 @@ fn to_channels_first(codec: &Codec, x_cl: &Tensor) -> Result<Tensor> {
         bail!("to_channels_first is GPU-only");
     };
     let [t, c] = x_cl.shape();
-    let mut out = codec.device().zeros([c, t])?;
+    let out = codec.device().zeros([c, t])?;
     crate::gpu_ops::transpose(gpu, x_cl.gpu_buffer()?, out.gpu_buffer()?, t, c);
     Ok(out)
 }
@@ -111,7 +111,7 @@ fn to_channels_last(codec: &Codec, x: &Tensor) -> Result<Tensor> {
         bail!("to_channels_last is GPU-only");
     };
     let [c, t] = x.shape();
-    let mut out = codec.device().zeros([t, c])?;
+    let out = codec.device().zeros([t, c])?;
     crate::gpu_ops::transpose(gpu, x.gpu_buffer()?, out.gpu_buffer()?, c, t);
     Ok(out)
 }
@@ -305,7 +305,7 @@ impl Codec {
             let beta = self.vector("decoder.decoder.5.beta", channels)?;
             ops::snake_beta(self.device(), &h, &alpha, &beta)?
         };
-        if let Some(t) = trace.as_deref_mut() {
+        if let Some(t) = trace {
             t.push(("snake".to_string(), self.device().copy(&h)?));
         }
         if profile { if let crate::device::Device::Gpu(gpu) = self.device() { gpu.sync(); } eprintln!("      final snake: {:.3}s", phase.elapsed().as_secs_f64()); phase = std::time::Instant::now(); }

@@ -148,21 +148,7 @@ impl Weights {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn bf16_widens_losslessly() {
-        // 0x3f80 bf16 == 1.0f32
-        let entry = TensorEntry {
-            shape: vec![2],
-            dtype: DType::Bf16,
-            data: vec![0x80, 0x3f, 0x00, 0xc0],
-        };
-        assert_eq!(entry.to_f32().unwrap(), vec![1.0, -2.0]);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Bundle contract
@@ -237,4 +223,20 @@ pub fn validate(w: &Weights, specs: &[TensorSpec]) -> Result<u64> {
         bail!("bundle contract failed:\n  {}", errors.join("\n  "));
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bf16_widens_losslessly() {
+        // 0x3f80 bf16 == 1.0f32
+        let entry = TensorEntry {
+            shape: vec![2],
+            dtype: DType::Bf16,
+            data: vec![0x80, 0x3f, 0x00, 0xc0],
+        };
+        assert_eq!(entry.to_f32().unwrap(), vec![1.0, -2.0]);
+    }
 }

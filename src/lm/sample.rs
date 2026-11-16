@@ -13,7 +13,7 @@ pub fn sample_topk(logits: &[f32], temperature: f32, topk: usize, need_finish: b
     if logits.len() != noise.len() {
         bail!("sample_topk: {} logits vs {} noise values", logits.len(), noise.len());
     }
-    if !(temperature > 0.0) || !temperature.is_finite() {
+    if !temperature.is_finite() || temperature <= 0.0 {
         bail!("sample_topk: bad temperature {temperature}");
     }
     if topk == 0 || topk > logits.len() {

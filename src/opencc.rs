@@ -292,10 +292,8 @@ mod tests {
             let Some((input, expected)) = line.split_once('\t') else { continue };
             let got = cc.convert(input);
             checked += 1;
-            if got != expected {
-                if failures.len() < 10 {
-                    failures.push(format!("{input:?}: want {expected:?}, got {got:?}"));
-                }
+            if got != expected && failures.len() < 10 {
+                failures.push(format!("{input:?}: want {expected:?}, got {got:?}"));
             }
         }
         assert!(checked > 10_000, "corpus too small: {checked}");

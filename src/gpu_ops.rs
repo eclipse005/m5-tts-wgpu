@@ -290,50 +290,6 @@ pub fn a_silu_mul(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate: &Buffer, up
     k.run_params(gpu, key, &[len as u32], &[gate, up, y], (1u32, 1u32, 1u32));
 }
 
-// ---- uniform-arena fused decode launchers (ming nn.rs pattern) ----
-// Each takes a cached-bind-group ArenaKernel; params ride the shared uniform
-// arena (fresh slot per dispatch), so a layer's key can repeat within a batch.
-
-pub fn af_rms(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
-              y: &Buffer, rows: usize, cols: usize, eps: f32) {
-    k.run(gpu, key, &[rows as u32, cols as u32, eps.to_bits(), 0], &[x, w, y],
-          (rows as u32, 1, 1));
-}
-
-pub fn af_gemv(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
-               bias: &Buffer, y: &Buffer, n: usize, kk: usize) {
-    k.run(gpu, key, &[1, n as u32, kk as u32, 0], &[x, w, bias, y],
-          ((n as u32).div_ceil(8).max(1), 1, 1));
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn af_qkv_attend(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, qkv: &Buffer,
-                     cache_k: &Buffer, cache_v: &Buffer, attended: &Buffer,
-                     cos: &Buffer, sin: &Buffer, position: usize, heads: usize,
-                     q_rows: usize, kv_rows: usize) {
-    k.run(gpu, key, &[q_rows as u32, kv_rows as u32, 64, position as u32, heads as u32, 0, 0, 0],
-          &[qkv, cache_k, cache_v, attended, cos, sin], (heads as u32, 1, 1));
-}
-
-pub fn af_gemv_add(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer, w: &Buffer,
-                   res: &Buffer, y: &Buffer, n: usize, kk: usize) {
-    k.run(gpu, key, &[n as u32, kk as u32, 0, 0], &[x, w, res, y],
-          ((n as u32).div_ceil(8).max(1), 1, 1));
-}
-
-pub fn af_norm_gateup(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, x: &Buffer,
-                      norm_w: &Buffer, gate_w: &Buffer, up_w: &Buffer, y: &Buffer,
-                      inter: usize, hidden: usize, eps: f32) {
-    k.run(gpu, key, &[inter as u32, hidden as u32, eps.to_bits(), 0],
-          &[x, norm_w, gate_w, up_w, y], (((2 * inter) as u32).div_ceil(64).max(1), 1, 1));
-}
-
-pub fn af_silu_down(k: &crate::gpu::ArenaKernel, gpu: &Gpu, key: u64, gate_up: &Buffer,
-                    down_w: &Buffer, x1: &Buffer, y: &Buffer, inter: usize, hidden: usize) {
-    k.run(gpu, key, &[inter as u32, hidden as u32, 0, 0], &[gate_up, down_w, x1, y],
-          ((hidden as u32).div_ceil(8).max(1), 1, 1));
-}
-
 // ---- fused decode launchers on cached-bind-group storage-params kernels ----
 // Same fused shaders as the regular path, but dispatched through a Kernel whose
 // bind group is cached per key. The caller must give each dispatch a key that is
@@ -387,11 +343,10 @@ pub fn f_norm_gateup(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, x: &Buffer,
     // Rows per workgroup is a latency lever here, not a bandwidth one: the depth
     // decode is a dependent dispatch chain, so a 512-workgroup grid finishes
     // later than a 128-workgroup one even though it streams faster in isolation.
-    let rows_per_group = std::env::var("M5_GATEUP_ROWS").ok()
-        .and_then(|v| v.parse::<u32>().ok()).unwrap_or(32);
+    const ROWS_PER_GROUP: u32 = 32;
     k.run_params(gpu, key, &[inter as u32, hidden as u32, eps.to_bits()],
                  &[x, norm_w, gate_w, up_w, y],
-                 (((2 * inter) as u32).div_ceil(rows_per_group).max(1), 1, 1));
+                 (((2 * inter) as u32).div_ceil(ROWS_PER_GROUP).max(1), 1, 1));
 }
 
 pub fn f_silu_down(k: &crate::gpu::Kernel, gpu: &Gpu, key: u64, gate_up: &Buffer,

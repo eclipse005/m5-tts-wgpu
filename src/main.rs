@@ -1,141 +1,208 @@
-//! `m5-tts` CLI — thin wrapper over the library.
+//! `m5-tts` — M5-TTS 50M in Rust (wgpu GPU + hand-written CPU).
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use m5_tts_wgpu::conditioning::format_conditioned_text;
+use anyhow::{bail, Result};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use m5_tts_wgpu::config::{ConditioningMeta, ModelConfig};
-use m5_tts_wgpu::pipeline::{Args, NoiseSource, Pipeline, PrngNoise};
+use m5_tts_wgpu::pipeline::{Args, Pipeline};
 use m5_tts_wgpu::tok::Tok;
+use m5_tts_wgpu::weights::{lm_specs, validate, Weights};
+use m5_tts_wgpu::audio;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
-/// M5-TTS 50M in Rust (wgpu + hand-written CPU).
+/// M5-TTS 50M speech synthesis — wgpu GPU and hand-written CPU inference.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version, about, long_about = None)]
 struct Cli {
-    /// Checkpoint bundle (config.json, conditioning.json, tokenizer/, model.safetensors)
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // one variant per invocation, never stored
+enum Command {
+    /// Synthesise speech: zero-shot cloning from a prompt, or a preset speaker.
+    Synth(Synth),
+    /// Check a checkpoint bundle against this port's tensor and vocabulary contract.
+    Inspect(Inspect),
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DeviceChoice {
+    /// GPU when one is usable, otherwise the CPU backend (default).
+    Auto,
+    /// Hand-written CPU backend, no wgpu.
+    Cpu,
+    /// wgpu GPU (Vulkan / Metal / GL); fails when no adapter is usable.
+    #[value(alias = "cuda")]
+    Gpu,
+}
+
+impl DeviceChoice {
+    fn spec(self) -> &'static str {
+        match self {
+            DeviceChoice::Auto => "auto",
+            DeviceChoice::Cpu => "cpu",
+            DeviceChoice::Gpu => "gpu",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+struct Bundle {
+    /// M5 bundle: config.json, conditioning.json, tokenizer/, model.safetensors.
     #[arg(long)]
     model: PathBuf,
-    /// Audio tokenizer bundle
+    /// Audio tokenizer bundle: config.json and its safetensors.
     #[arg(long)]
     codec: PathBuf,
-    /// cpu | gpu
-    #[arg(long, default_value = "gpu")]
-    device: String,
+}
 
-    /// Text to synthesise.
+#[derive(ClapArgs, Debug)]
+struct Synth {
+    #[command(flatten)]
+    bundle: Bundle,
+    /// Text to speak; `-` reads it from standard input.
     #[arg(long)]
-    text: Option<String>,
-    /// Reference audio for zero-shot cloning (needs --prompt-text).
+    text: String,
+    /// Reference recording for zero-shot cloning (needs --prompt-text).
     #[arg(long)]
     prompt_wav: Option<PathBuf>,
-    /// Exact transcript of the reference audio.
+    /// Exact transcript of the reference recording.
     #[arg(long)]
     prompt_text: Option<String>,
-    /// Preset speaker id (CustomVoice checkpoints).
+    /// Preset speaker id (CustomVoice checkpoints only).
     #[arg(long, default_value_t = 1)]
     speaker_id: u32,
+    /// Language of the text: Chinese, English, German, French, Japanese, Korean.
     #[arg(long, default_value = "Chinese")]
     lang: String,
+    /// Dialect: `chuan` (Sichuanese) or `yue` (Cantonese, also converts the text).
     #[arg(long)]
     accent: Option<String>,
+    /// Style caption, e.g. `happy`.
     #[arg(long)]
     caption: Option<String>,
     #[arg(long, default_value_t = 0.9)]
     temperature: f32,
     #[arg(long, default_value_t = 10)]
     topk: usize,
-    /// Longest utterance, in milliseconds (the reference's `max_audio_length_ms`),
-    /// for callers that want its exact behaviour: the budget is used as given and
-    /// an utterance that cannot fit the model's context is an error. Omit it to
-    /// read a long text to its end instead: the text is cut at sentence and clause
-    /// boundaries into utterances of about this length (40 s by default) and the
-    /// pieces are joined with a uniform 150 ms pause. Same behaviour for preset
-    /// and cloned voices.
-    #[arg(long)]
-    max_audio_length_ms: Option<f64>,
+    /// Sampler seed: the same seed and text reproduce the same audio, including how
+    /// a long text was split.
     #[arg(long, default_value_t = 1234)]
     seed: u64,
+    /// Reference semantics: one utterance of at most this long, truncated with a
+    /// warning when it does not fit. Omit it and a long text is read to its end as
+    /// several ~40 s utterances joined by a 150 ms pause.
+    #[arg(long)]
+    max_audio_length_ms: Option<f64>,
+    /// WAV file to write; `-` streams 24 kHz mono PCM16 to standard output.
     #[arg(long, default_value = "output.wav")]
-    output: PathBuf,
+    output: String,
+    #[arg(long, value_enum, default_value_t = DeviceChoice::Auto)]
+    device: DeviceChoice,
+}
 
-    /// Print the conditioned prompt and token ids, then exit.
-    #[arg(long)]
-    tokenize: Option<String>,
-    /// Validate the checkpoint against the port's tensor contract and exit.
-    #[arg(long)]
-    inspect: bool,
+#[derive(ClapArgs, Debug)]
+struct Inspect {
+    #[command(flatten)]
+    bundle: Bundle,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    if cli.inspect {
-        use m5_tts_wgpu::weights::{lm_specs, validate, Weights};
-        let _cfg = ModelConfig::load(&cli.model.join("config.json"))?;
-        let meta = ConditioningMeta::load(&cli.model.join("conditioning.json"))?;
-        let tok = Tok::load(&cli.model, &meta)?;
-        let weights = Weights::load(&cli.model.join("model.safetensors"))?;
-        let params = validate(&weights, &lm_specs(tok.vocab_size(), 2051, 16))?;
-        println!("tensors: {} | LM params: {:.1}M", weights.len(), params as f64 / 1e6);
-        return Ok(());
+    match Cli::parse().command {
+        Command::Synth(a) => synth(a),
+        Command::Inspect(a) => inspect(a),
     }
+}
 
-    if let Some(text) = cli.tokenize {
-        let meta = ConditioningMeta::load(&cli.model.join("conditioning.json"))?;
-        let tok = Tok::load(&cli.model, &meta)?;
-        let speaker = cli.speaker_id.to_string();
-        let prompt = format_conditioned_text(&text, Some(&speaker), cli.accent.as_deref(),
-                                             Some(&cli.lang), cli.caption.as_deref())?;
-        println!("{prompt}");
-        println!("{} token ids", tok.encode(&prompt)?.len());
-        return Ok(());
-    }
+fn synth(a: Synth) -> Result<()> {
+    let text = if a.text == "-" {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        a.text
+    };
 
-    let text = cli.text.clone().context("--text is required")?;
-    let load_start = std::time::Instant::now();
-    let pipeline = Pipeline::load(&cli.model, &cli.codec, &cli.device)?;
-    eprintln!("device: {} (weights resident in {:.2}s)", pipeline.describe(),
-              load_start.elapsed().as_secs_f64());
+    let started = Instant::now();
+    let pipeline = Pipeline::load(&a.bundle.model, &a.bundle.codec, a.device.spec())?;
+    eprintln!(
+        "device: {} (weights resident in {:.2}s)",
+        pipeline.describe(),
+        started.elapsed().as_secs_f64()
+    );
 
-    let args = Args {
+    let mut args = Args {
         text,
-        prompt_wav: cli.prompt_wav,
-        prompt_text: cli.prompt_text,
-        speaker_id: cli.speaker_id,
-        lang: cli.lang,
-        accent: cli.accent,
-        caption: cli.caption,
-        temperature: cli.temperature,
-        topk: cli.topk,
-        max_audio_frames: 500,
-        auto_length: cli.max_audio_length_ms.is_none(),
+        prompt_wav: a.prompt_wav,
+        prompt_text: a.prompt_text,
+        speaker_id: a.speaker_id,
+        lang: a.lang,
+        accent: a.accent,
+        caption: a.caption,
+        temperature: a.temperature,
+        topk: a.topk,
+        seed: a.seed,
+        ..Args::default()
     };
-    let args = match cli.max_audio_length_ms {
-        Some(ms) => args.with_max_audio_length_ms(ms)?,
-        None => args,
-    };
-    let mut noise = PrngNoise::new(cli.seed);
-    let started = std::time::Instant::now();
-    let out = pipeline.synthesize(&args, &mut noise as &mut dyn NoiseSource)?;
+    if let Some(ms) = a.max_audio_length_ms {
+        args = args.with_max_audio_length_ms(ms)?;
+    }
+
+    let started = Instant::now();
+    let out = pipeline.synthesize(&args)?;
     let elapsed = started.elapsed().as_secs_f64();
     let audio_s = out.audio.len() as f64 / out.sample_rate as f64;
 
-    if let Some(parent) = cli.output.parent() {
-        std::fs::create_dir_all(parent)?;
+    if a.output == "-" {
+        // Raw PCM16 on stdout, log lines on stderr: `m5-tts synth … --output - |
+        // ffplay -f s16le -ar 24000 -ch_layout mono -`.
+        let mut stdout = std::io::stdout().lock();
+        let mut write = |bytes: &[u8]| -> Result<()> {
+            match stdout.write_all(bytes) {
+                Ok(()) => Ok(()),
+                // A reader that stops early (`| head -c …`) is not an error.
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(err) => Err(err.into()),
+            }
+        };
+        for sample in &out.audio {
+            write(&((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())?;
+        }
+        let _ = stdout.flush();
+    } else {
+        audio::write_wav(a.output.as_ref(), &out.audio, out.sample_rate)?;
     }
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: out.sample_rate as u32,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(&cli.output, spec)?;
-    for sample in &out.audio {
-        let value = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-        writer.write_sample(value)?;
+    eprintln!(
+        "{:.2}s audio in {:.2}s (RTF {:.2}) from {} frames",
+        audio_s,
+        elapsed,
+        elapsed / audio_s,
+        out.frames
+    );
+    Ok(())
+}
+
+fn inspect(a: Inspect) -> Result<()> {
+    let config = ModelConfig::load(&a.bundle.model.join("config.json"))?;
+    let meta = ConditioningMeta::load(&a.bundle.model.join("conditioning.json"))?;
+    let tok = Tok::load(&a.bundle.model, &meta)?;
+    let weights = Weights::load(&a.bundle.model.join("model.safetensors"))?;
+    let params = validate(&weights, &lm_specs(tok.vocab_size(), 2051, 16))?;
+
+    if !a.bundle.codec.join("config.json").is_file() {
+        bail!("{} has no config.json", a.bundle.codec.display());
     }
-    writer.finalize()?;
-    println!("{} -> {} ({} frames, {:.2}s audio in {:.2}s, RTF {:.2})",
-             out.prompt_frames, cli.output.display(), out.frames, audio_s, elapsed, elapsed / audio_s);
+    println!("language model: {} backbone, {} decoder", config.backbone_flavor, config.decoder_flavor);
+    println!("tokenizer: {} tokens, conditioning format {:?}", tok.vocab_size(), meta.format);
+    println!(
+        "tensors: {} | parameters: {:.1}M (the 50M figure counts backbone + decoder)",
+        weights.len(),
+        params as f64 / 1e6
+    );
+    println!("codec: {}", a.bundle.codec.display());
+    println!("bundle ok");
     Ok(())
 }

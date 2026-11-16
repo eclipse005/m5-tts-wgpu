@@ -21,7 +21,7 @@ pub fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
             reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>()?
         }
     };
-    if channels == 0 || samples.len() % channels != 0 {
+    if channels == 0 || !samples.len().is_multiple_of(channels) {
         bail!("{}: {} samples is not a multiple of {} channels", path.display(), samples.len(), channels);
     }
     let mono = if channels == 1 {
@@ -137,7 +137,7 @@ pub fn prepare_prompt_samples(samples: &[f32], rate: u32, sample_rate: usize) ->
     let mut starts = vec![speech[0]];
     let mut ends = Vec::new();
     for pair in speech.windows(2) {
-        if pair[1] - pair[0] - 1 >= gap {
+        if pair[1] - pair[0] > gap {
             ends.push(pair[0] + 1);
             starts.push(pair[1]);
         }
@@ -153,4 +153,27 @@ pub fn prepare_prompt_samples(samples: &[f32], rate: u32, sample_rate: usize) ->
         out.extend_from_slice(&normalized[from..to]);
     }
     Ok(out)
+}
+
+/// Write mono PCM16, creating the parent directory (`M5TTS.save`).
+pub fn write_wav(path: &Path, samples: &[f32], sample_rate: usize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: sample_rate as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("create {}", path.display()))?;
+    for sample in samples {
+        writer.write_sample((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
+    }
+    writer.finalize()?;
+    Ok(())
 }

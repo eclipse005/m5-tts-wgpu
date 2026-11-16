@@ -1,0 +1,36 @@
+name: build
+
+# Build and run the in-source unit tests on a clean machine: no checkpoint, no GPU.
+# A red run therefore means "this platform does not build", which is the only claim
+# the README makes about Windows, macOS and Linux.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Clippy
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --release --locked

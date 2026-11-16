@@ -113,7 +113,6 @@ pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
         // (~60 GFLOP/s in situ versus 212 standalone).
         const CO: usize = 4;
         if vectorised && cout % CO == 0 {
-            let bias = bias;
             y.par_chunks_mut(t_out * CO).enumerate().for_each(|(block, out_block)| {
                 let co0 = block * CO;
                 let mut acc = vec![0.0f32; CO * tn];
@@ -148,8 +147,7 @@ pub fn conv1d(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
                     // Slice-paired loop: equal-length `zip` is what lets the compiler
                     // vectorise on every target (x86 baseline SSE2, ARM NEON), not
                     // just where the hand-written AVX2 path is available.
-                    for k in 0..ks {
-                        let wv = wrow[k];
+                    for (k, &wv) in wrow.iter().enumerate().take(ks) {
                         let off = k * dilation;
                         if stride == 1 {
                             let src = &window[base + off..base + off + tn];
@@ -210,7 +208,7 @@ pub fn snake_beta(x: &mut [f32], alpha: &[f32], beta: &[f32], channels: usize, t
         let b = beta[c].exp() + 1e-9;
         for v in row.iter_mut() {
             let s = (*v * a).sin();
-            *v = *v + s * s / b;
+            *v += s * s / b;
         }
     });
 }
@@ -332,7 +330,7 @@ pub fn scale_cols(x: &mut [f32], scale: &[f32], cols: usize) {
 
 /// `y = a + scale[c] * b`.
 pub fn add_scaled(a: &[f32], b: &[f32], scale: &[f32], y: &mut [f32], cols: usize) {
-    let mut body = |(r, out): (usize, &mut [f32])| {
+    let body = |(r, out): (usize, &mut [f32])| {
         let a = &a[r * cols..(r + 1) * cols];
         let b = &b[r * cols..(r + 1) * cols];
         for c in 0..cols {
@@ -378,7 +376,7 @@ pub fn attention(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
     let stride = heads * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
     out.par_chunks_mut(stride).enumerate().take(frames).for_each(|(t, row)| {
-        let start = if t + 1 > window { t + 1 - window } else { 0 };
+        let start = (t + 1).saturating_sub(window);
         let span = t + 1 - start;
         let mut scores = vec![0.0f32; span];
         for (h, head) in (0..heads).enumerate() {
@@ -484,7 +482,7 @@ pub fn conv_transpose1d(x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
             }
         }
     };
-    if cout % CO == 0 {
+    if cout.is_multiple_of(CO) {
         y.par_chunks_mut(t_out * CO)
             .enumerate()
             .for_each(|(block, out)| body(block * CO, CO, out));
@@ -936,10 +934,10 @@ unsafe fn conv_block4_avx2(window: &[f32], w: &[&[f32]; 4], acc: &mut [f32], tn:
         j += 8;
     }
     while j < tn {
-        for r in 0..4 {
+        for (r, wr) in w.iter().enumerate().take(4) {
             let mut sum = *acc_ptr.add(r * tn + j);
             for k in 0..ks {
-                sum += *win.add(k * dilation + j) * *w[r].get_unchecked(k);
+                sum += *win.add(k * dilation + j) * *wr.get_unchecked(k);
             }
             *acc_ptr.add(r * tn + j) = sum;
         }
@@ -1028,23 +1026,7 @@ pub fn silu_gemv(gate: &[f32], up: &[f32], w: &[f32], residual: &[f32], y: &mut 
     y.par_iter_mut().enumerate().with_min_len(16).for_each(|(r, slot)| *slot = dot(r));
 }
 
-#[cfg(test)]
-mod perf_tests {
-    #[test]
-    fn fused_kernels_have_sane_throughput() {
-        // 4096 x 512 = 2.1M MAC; anything above a millisecond is a scheduling bug.
-        let (hidden, inter) = (512usize, 2048usize);
-        let x = vec![0.1f32; hidden];
-        let norm_w = vec![1.0f32; hidden];
-        let w = vec![0.01f32; 2 * inter * hidden];
-        let mut out = vec![0.0f32; 2 * inter];
-        let start = std::time::Instant::now();
-        super::rms_norm_gemv(&x, &norm_w, &w, None, &mut out, hidden, 2 * inter, 1e-5);
-        let elapsed = start.elapsed().as_secs_f64() * 1e3;
-        eprintln!("rms_norm_gemv 4096x512: {elapsed:.3} ms");
-        assert!(elapsed < 5.0, "fused gemv took {elapsed:.1} ms");
-    }
-}
+
 
 // ---------------------------------------------------------------------------
 // Channels-last convolution (the general design, not a per-layer patch)
@@ -1130,7 +1112,7 @@ pub fn conv1d_channels_last(x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
     debug_assert_eq!(w.len(), ks * cin * cout);
     debug_assert_eq!(y.len(), t_out * cout);
     let blocks = cout / 8;
-    let vectorised = avx2_available() && cout % 8 == 0;
+    let vectorised = avx2_available() && cout.is_multiple_of(8);
     if vectorised {
         // One task per timestep; inside, the eight-channel blocks are independent.
         y.par_chunks_mut(cout).enumerate().take(t_out).for_each(|(t, row)| {
@@ -1222,7 +1204,7 @@ pub fn conv_transpose1d_channels_last(x: &[f32], w: &[f32], bias: &[f32], y: &mu
     debug_assert_eq!(w.len(), ks * cin * cout);
     let t_out = t_in * stride;
     debug_assert_eq!(y.len(), t_out * cout);
-    if avx2_available() && cout % 8 == 0 {
+    if avx2_available() && cout.is_multiple_of(8) {
         y.par_chunks_mut(cout).enumerate().take(t_out).for_each(|(j, row)| {
             // SAFETY: guarded by `avx2_available()`.
             unsafe { transpose_row_avx2(x, w, bias, row, cin, cout, ks, stride, t_in, j) };
@@ -1366,7 +1348,7 @@ fn dot_bf16_scalar(x: &[f32], bytes: &[u8], k: usize) -> f32 {
 /// bf16 twin of [`rms_norm_gemv`]: norm, then project from bf16 weights.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_gemv_bf16(x: &[f32], norm_w: &[f32], w: &[u8], bias: Option<&[f32]>, y: &mut [f32],
-                          cols: usize, rows: usize, eps: f32) {
+                          cols: usize, _rows: usize, eps: f32) {
     let mut normed = vec![0.0f32; cols];
     let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / cols as f32;
     let inv = 1.0 / (mean_sq + eps).sqrt();
@@ -1381,7 +1363,7 @@ pub fn rms_norm_gemv_bf16(x: &[f32], norm_w: &[f32], w: &[u8], bias: Option<&[f3
 }
 
 /// bf16 twin of [`gemv_add`].
-pub fn gemv_add_bf16(x: &[f32], w: &[u8], residual: &[f32], y: &mut [f32], k: usize, n: usize) {
+pub fn gemv_add_bf16(x: &[f32], w: &[u8], residual: &[f32], y: &mut [f32], k: usize, _n: usize) {
     let dot = |r: usize| -> f32 {
         let row = &w[r * k * 2..(r + 1) * k * 2];
         dot_bf16(x, row, k) + residual[r]
@@ -1391,7 +1373,7 @@ pub fn gemv_add_bf16(x: &[f32], w: &[u8], residual: &[f32], y: &mut [f32], k: us
 
 /// bf16 twin of [`silu_gemv`].
 pub fn silu_gemv_bf16(gate: &[f32], up: &[f32], w: &[u8], residual: &[f32], y: &mut [f32],
-                      inter: usize, n: usize) {
+                      inter: usize, _n: usize) {
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
         let g = gate[i];
@@ -1517,53 +1499,20 @@ pub fn snake_conv1d(x: &[f32], alpha: &[f32], beta: &[f32], w: &[f32], bias: &[f
     }
 }
 
-/// Eight-row stride-1 conv block: one window load feeds eight FMAs.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn conv_block8_avx2(window: &[f32], w: &[&[f32]; 8], acc: &mut [f32], tn: usize,
-                           ks: usize, dilation: usize) {
-    use std::arch::x86_64::*;
-    let win = window.as_ptr();
-    let acc_ptr = acc.as_mut_ptr();
-    let mut j = 0usize;
-    while j + 8 <= tn {
-        let mut a0 = _mm256_loadu_ps(acc_ptr.add(j));
-        let mut a1 = _mm256_loadu_ps(acc_ptr.add(tn + j));
-        let mut a2 = _mm256_loadu_ps(acc_ptr.add(2 * tn + j));
-        let mut a3 = _mm256_loadu_ps(acc_ptr.add(3 * tn + j));
-        let mut a4 = _mm256_loadu_ps(acc_ptr.add(4 * tn + j));
-        let mut a5 = _mm256_loadu_ps(acc_ptr.add(5 * tn + j));
-        let mut a6 = _mm256_loadu_ps(acc_ptr.add(6 * tn + j));
-        let mut a7 = _mm256_loadu_ps(acc_ptr.add(7 * tn + j));
-        for k in 0..ks {
-            let x = _mm256_loadu_ps(win.add(k * dilation + j));
-            a0 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[0].get_unchecked(k)), a0);
-            a1 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[1].get_unchecked(k)), a1);
-            a2 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[2].get_unchecked(k)), a2);
-            a3 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[3].get_unchecked(k)), a3);
-            a4 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[4].get_unchecked(k)), a4);
-            a5 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[5].get_unchecked(k)), a5);
-            a6 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[6].get_unchecked(k)), a6);
-            a7 = _mm256_fmadd_ps(x, _mm256_set1_ps(*w[7].get_unchecked(k)), a7);
-        }
-        _mm256_storeu_ps(acc_ptr.add(j), a0);
-        _mm256_storeu_ps(acc_ptr.add(tn + j), a1);
-        _mm256_storeu_ps(acc_ptr.add(2 * tn + j), a2);
-        _mm256_storeu_ps(acc_ptr.add(3 * tn + j), a3);
-        _mm256_storeu_ps(acc_ptr.add(4 * tn + j), a4);
-        _mm256_storeu_ps(acc_ptr.add(5 * tn + j), a5);
-        _mm256_storeu_ps(acc_ptr.add(6 * tn + j), a6);
-        _mm256_storeu_ps(acc_ptr.add(7 * tn + j), a7);
-        j += 8;
-    }
-    while j < tn {
-        for r in 0..8 {
-            let mut sum = *acc_ptr.add(r * tn + j);
-            for k in 0..ks {
-                sum += *win.add(k * dilation + j) * *w[r].get_unchecked(k);
-            }
-            *acc_ptr.add(r * tn + j) = sum;
-        }
-        j += 1;
+#[cfg(test)]
+mod perf_tests {
+    #[test]
+    fn fused_kernels_have_sane_throughput() {
+        // 4096 x 512 = 2.1M MAC; anything above a millisecond is a scheduling bug.
+        let (hidden, inter) = (512usize, 2048usize);
+        let x = vec![0.1f32; hidden];
+        let norm_w = vec![1.0f32; hidden];
+        let w = vec![0.01f32; 2 * inter * hidden];
+        let mut out = vec![0.0f32; 2 * inter];
+        let start = std::time::Instant::now();
+        super::rms_norm_gemv(&x, &norm_w, &w, None, &mut out, hidden, 2 * inter, 1e-5);
+        let elapsed = start.elapsed().as_secs_f64() * 1e3;
+        eprintln!("rms_norm_gemv 4096x512: {elapsed:.3} ms");
+        assert!(elapsed < 5.0, "fused gemv took {elapsed:.1} ms");
     }
 }

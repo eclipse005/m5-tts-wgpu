@@ -24,31 +24,11 @@ use crate::lm::backbone::KvCache;
 use crate::lm::{AUDIO_VOCAB, CODEBOOKS, HIDDEN, Lm};
 use crate::tn::Tn;
 
-/// Where sampler noise comes from.
-pub trait NoiseSource {
-    /// `len` samples from `Exp(1)`, the distribution `torch.exponential_(1)` draws.
+/// Where sampler noise comes from: `len` draws from `Exp(1)`, the distribution
+/// `torch.exponential_(1)` supplies to the sampler. Private to the crate - callers
+/// pick a `seed` on [`Args`] instead.
+pub(crate) trait NoiseSource {
     fn draw(&mut self, len: usize) -> Vec<f32>;
-}
-
-/// Replays recorded draws: the parity tests feed the reference's own noise.
-pub struct RecordedNoise {
-    values: Vec<f32>,
-    cursor: usize,
-}
-
-impl RecordedNoise {
-    pub fn new(values: Vec<f32>) -> Self {
-        Self { values, cursor: 0 }
-    }
-}
-
-impl NoiseSource for RecordedNoise {
-    fn draw(&mut self, len: usize) -> Vec<f32> {
-        let end = (self.cursor + len).min(self.values.len());
-        let out = self.values[self.cursor..end].to_vec();
-        self.cursor = end;
-        out
-    }
 }
 
 /// Synthesis request.
@@ -64,13 +44,15 @@ pub struct Args {
     pub temperature: f32,
     pub topk: usize,
     pub max_audio_frames: usize,
-    /// Automatic length, the CLI default: `max_audio_frames` is the utterance
-    /// budget a long text is cut into (see `synthesize_auto`), so a script of any
-    /// length is read to its end instead of being cut at the budget. The
-    /// reference's explicit `max_audio_length_ms` semantics - budget exactly as
-    /// given, error when it cannot fit - are what `with_max_audio_length_ms`
-    /// selects (`auto_length: false`).
+    /// Automatic length (the default): `max_audio_frames` is the utterance budget
+    /// a long text is cut into (see `synthesize_auto`), so a script of any length is
+    /// read to its end instead of being cut at the budget. `with_max_audio_length_ms`
+    /// selects the reference's explicit semantics instead - budget exactly as given,
+    /// truncation with a warning when it does not fit.
     pub auto_length: bool,
+    /// Sampler seed. The same seed and text reproduce the same audio, including how
+    /// a long text was split and re-cut.
+    pub seed: u64,
 }
 
 impl Args {
@@ -100,16 +82,15 @@ impl Default for Args {
             temperature: 0.9,
             topk: 10,
             max_audio_frames: 500,
-            auto_length: false,
+            auto_length: true,
+            seed: 1234,
         }
     }
 }
 
 /// What one synthesis produced, for tests and the CLI alike.
 pub struct Synthesis {
-    /// Frame-major codes, reference prefix included when cloning.
-    pub codes: Vec<u32>,
-    /// Number of frames in `codes`.
+    /// Frames of audio in the result, reference prefix included when cloning.
     pub frames: usize,
     pub prompt_frames: usize,
     /// Generated codes only (frame-major), i.e. without the reference prefix. For
@@ -282,15 +263,10 @@ impl Pipeline {
         let mut generated: Vec<u32> = Vec::new();
         let mut eos_all = true;
         let mut index = 0usize;
-        let mut passes = 0usize;
         let mut cut_off: Option<String> = None;
         let mut unreadable: Option<String> = None;
 
         while let Some(fragment) = queue.pop_front() {
-            passes += 1;
-            if let Some(prefix) = std::env::var_os("M5_DUMP_FRAGMENTS") {
-                std::fs::write(format!("{}.{passes}.txt", prefix.to_string_lossy()), &fragment)?;
-            }
             // Every pass may use the whole context: the fragment size above already
             // keeps the audio inside it, so this only decides what gets cut.
             let conditioned = self.conditioned_tokens(args, &fragment)?;
@@ -352,7 +328,6 @@ impl Pipeline {
         }
 
         Ok(Synthesis {
-            codes: generated.clone(),
             frames: prompt_frames + generated.len() / CODEBOOKS,
             prompt_frames,
             generated,
@@ -367,7 +342,12 @@ impl Pipeline {
     /// With `auto_length` the text is spoken in as few passes as the model's
     /// context allows (`synthesize_auto`); a text that fits one pass takes exactly
     /// the same path and produces the same audio as an explicit single pass.
-    pub fn synthesize(&self, args: &Args, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
+    pub fn synthesize(&self, args: &Args) -> Result<Synthesis> {
+        let mut noise = PrngNoise::new(args.seed);
+        self.synthesize_with_noise(args, &mut noise)
+    }
+
+    fn synthesize_with_noise(&self, args: &Args, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         if args.text.trim().is_empty() {
             bail!("text must be nonempty");
         }
@@ -394,9 +374,9 @@ impl Pipeline {
         // The reference conditions on `prompt_text.strip() + text.strip()`.
         let text = text.trim();
         if args.auto_length {
-            return self.synthesize_auto(args, &text, noise);
+            return self.synthesize_auto(args, text, noise);
         }
-        self.synthesize_pass(args, &text, noise)
+        self.synthesize_pass(args, text, noise)
     }
 
     /// One pass: prompt conditioning, prefill, frame-by-frame generation, decode.
@@ -474,9 +454,8 @@ impl Pipeline {
         phase = std::time::Instant::now();
         let mut generated: Vec<u32> = Vec::new();
         let mut eos = false;
-        let mut position = prompt_len;
         let (mut t_noise, mut t_depth, mut t_step) = (0.0f64, 0.0f64, 0.0f64);
-        for frame in 0..args.max_audio_frames {
+        for (frame, position) in (prompt_len..prompt_len + args.max_audio_frames).enumerate() {
             let lap = Instant::now();
             let mut frame_noise = Vec::with_capacity(CODEBOOKS);
             for _ in 0..CODEBOOKS {
@@ -521,10 +500,9 @@ impl Pipeline {
                 break;
             }
             let lap = Instant::now();
-            let codes: Vec<u32> = sampled.iter().map(|t| *t).collect();
+            let codes: Vec<u32> = sampled.to_vec();
             let next = self.lm.embed_generated(&codes)?;
             last = self.lm.backbone_step(&next, &mut kv, position)?;
-            position += 1;
             if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }
             t_step += lap.elapsed().as_secs_f64();
         }
@@ -589,7 +567,6 @@ impl Pipeline {
             }
         }
         Ok(Synthesis {
-            codes: all_codes,
             frames,
             prompt_frames,
             generated,
@@ -612,7 +589,7 @@ fn last_row(dev: &Device, h: &crate::device::Tensor, frames: usize) -> Result<cr
 /// Note: this is *not* torch's stream. Reproducing a reference run bit for bit
 /// needs `torch.manual_seed`'s MT19937 (a separate task); with this source a run
 /// is reproducible from `--seed` but statistically, not bit-wise, comparable.
-pub struct PrngNoise {
+pub(crate) struct PrngNoise {
     state: [u64; 4],
 }
 

@@ -106,7 +106,7 @@ pub fn snake_beta(dev: &Device, x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Re
     expect("snake beta", beta.shape(), [channels, 1])?;
     match dev {
         Device::Gpu(gpu) => {
-            let mut out = dev.copy(x)?;
+            let out = dev.copy(x)?;
             gpu_ops::snake_beta(gpu, out.gpu_buffer()?, alpha.gpu_buffer()?, beta.gpu_buffer()?, channels, time);
             Ok(out)
         }

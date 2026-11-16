@@ -115,6 +115,9 @@ impl Codec {
         }
 
         let mut codes = vec![vec![0u32; layers]; frames];
+        // `codes` is laid out frame-major (frame, layer), so the inner loop writes
+        // `codes[frame][layer]` and cannot borrow a row; the index is the layout.
+        #[allow(clippy::needless_range_loop)]
         for layer in 0..layers {
             let table = self.codebook_table(&format!("{prefix}.layers.{layer}.codebook"), dim)?;
             let mut indices = vec![0u32; frames];

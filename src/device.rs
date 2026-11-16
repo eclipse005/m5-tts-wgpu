@@ -20,13 +20,24 @@ pub enum Device {
 }
 
 impl Device {
-    /// `--device gpu|cpu|cuda` (`cuda` is accepted as an alias for the GPU path
-    /// because that is what the reference calls it).
+    /// `auto` (the default), `cpu` or `gpu`.
+    ///
+    /// `auto` takes the GPU when one is usable and falls back to the hand-written
+    /// CPU backend otherwise, saying why: a machine without a working adapter should
+    /// still synthesise, only slower. `cuda` is accepted as an alias for `gpu`
+    /// because that is what the reference implementation calls its devices.
     pub fn open(spec: &str) -> Result<Self> {
         match spec {
             "cpu" => Ok(Device::Cpu),
-            "gpu" | "cuda" | "vulkan" | "default" => Ok(Device::Gpu(Rc::new(Gpu::new(None)?))),
-            other => bail!("unknown device {other:?}; use cpu or gpu"),
+            "gpu" | "cuda" => Ok(Device::Gpu(Rc::new(Gpu::new(None)?))),
+            "auto" => match Gpu::new(None) {
+                Ok(gpu) => Ok(Device::Gpu(Rc::new(gpu))),
+                Err(err) => {
+                    eprintln!("no usable GPU ({err:#}); falling back to the CPU backend");
+                    Ok(Device::Cpu)
+                }
+            },
+            other => bail!("unknown device {other:?}; use auto, cpu or gpu"),
         }
     }
 

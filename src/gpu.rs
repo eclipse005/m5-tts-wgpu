@@ -19,7 +19,7 @@ pub use wgpu::Buffer as WgpuBuffer;
 /// wgpu does not keep a bind group's buffers alive for a *recorded* command
 /// buffer, so dropping them before the submit lets Vulkan free them underneath
 /// ("Cannot get non-existent resource"). They are held here until after submit.
-
+///
 /// Parameter-block pool: 1024 small buffers bound whole (offset 0).
 struct ParamsPool {
     buffers: Vec<Buffer>,
@@ -30,7 +30,6 @@ struct ParamsPool {
 pub struct Kernel {
     pub bgl: wgpu::BindGroupLayout,
     pub pipe: wgpu::ComputePipeline,
-    kinds: Vec<bool>,
     name: String,
     /// key -> (bind group, its own params buffer). The params buffer is bound
     /// whole at offset 0 - no arena slots, no dynamic offsets, no cross-pass
@@ -109,57 +108,6 @@ impl Kernel {
     }
 }
 
-/// A uniform-arena kernel (ming nn.rs `Kernel`): binding 0 is the shared uniform
-/// arena selected by a dynamic offset, bindings 1.. are the storage buffers.
-/// The bind group is cached per key (the arena and the storage buffers are
-/// stable for the model's lifetime); each dispatch reserves a fresh 256 B arena
-/// slot for its params, so a key may repeat inside one batch without its params
-/// being overwritten. Recording costs one host memcpy + a push, no buffer
-/// creation and no per-dispatch `write_buffer`.
-pub struct ArenaKernel {
-    pub bgl: wgpu::BindGroupLayout,
-    pub pipe: wgpu::ComputePipeline,
-    cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
-}
-
-impl ArenaKernel {
-    /// `bufs` are the storage bindings in order (binding 1..); `uni` is the
-    /// parameter block copied into a fresh arena slot.
-    pub fn run(&self, gpu: &Gpu, key: u64, uni: &[u32], bufs: &[&Buffer],
-               workgroups: (u32, u32, u32)) {
-        let hit = self.cache.borrow().get(&key).cloned();
-        let bind = if let Some(b) = hit {
-            b
-        } else {
-            let mut entries = Vec::with_capacity(bufs.len() + 1);
-            entries.push(wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: gpu.arena_buffer(),
-                    offset: 0,
-                    size: wgpu::BufferSize::new(UNIFORM_SLOT as u64),
-                }),
-            });
-            for (i, b) in bufs.iter().enumerate() {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: (i + 1) as u32,
-                    resource: b.as_entire_binding(),
-                });
-            }
-            gpu.bind_groups_created.set(gpu.bind_groups_created.get() + 1);
-            gpu.bind_groups_created.set(gpu.bind_groups_created.get() + 1);
-            let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("arena-kernel"),
-                layout: &self.bgl,
-                entries: &entries,
-            });
-            self.cache.borrow_mut().insert(key, bind.clone());
-            bind
-        };
-        let offset = gpu.alloc_uniform(bytemuck::cast_slice(uni));
-        gpu.record_dyn_off(&self.pipe, &bind, offset, workgroups);
-    }
-}
 
 /// One recorded dispatch, replayed into a single compute pass at flush time./// One recorded dispatch, replayed into a single compute pass at flush time.
 ///
@@ -174,7 +122,6 @@ struct Pending {
     /// params). None: no dynamic bindings.
     dyn_offset: Option<u32>,
     workgroups: (u32, u32, u32),
-    label: String,
 }
 
 /// Submits kept in flight before a blocking wait (ming-3.0-tts: 4 overlaps
@@ -297,11 +244,6 @@ impl Gpu {
         &self.device
     }
 
-    /// The uniform arena buffer (bound whole by arena kernels).
-    pub fn arena_buffer(&self) -> &Buffer {
-        &self.arena
-    }
-
 
     /// Block until everything queued so far has executed. `flush` alone only
     /// submits — profiling laps need the wait too, or elapsed measures command
@@ -371,28 +313,17 @@ impl Gpu {
         // Windows resets the device (TDR) if a single submit runs longer than
         // ~2 s, and one SEANet block is already hundreds of dispatches on a slow
         // kernel. 8 keeps the worst-case submit well inside the watchdog;
-        // `M5_MAX_PENDING` overrides for experiments.
-        // 64: large enough that submit overhead amortises, small enough that a
-        // pass ends before pooled activations are read-then-written inside it
-        // (wgpu forbids RO->RW on one buffer within a pass) and before VRAM
-        // fills with deferred recycling.
-        let max_pending = std::env::var("M5_MAX_PENDING")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // 256 (ming-3.0-tts, same card): >=1024-record submits lose the
-            // device to TDR during lazy pipeline compilation; 256 amortises
-            // submit overhead without that.
-            .unwrap_or(64);
+        // 64 dispatches per submit: large enough that submit overhead amortises,
+        // small enough that a pass ends before pooled activations are
+        // read-then-written inside it (wgpu forbids RO->RW on one buffer within a
+        // pass) and before VRAM fills with deferred recycling. 256 (ming-3.0-tts on
+        // the same card) loses the device to TDR during lazy pipeline compilation
+        // once a submit holds >=1024 records.
+        const MAX_PENDING: usize = 64;
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform-arena"),
             size: (ARENA_SLOTS * UNIFORM_SLOT) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let params_arena = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params-arena"),
-            size: (ARENA_SLOTS * UNIFORM_SLOT) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         Ok(Self {
@@ -400,7 +331,7 @@ impl Gpu {
             queue,
             adapter_name: info.name.clone(),
             backend: backend_name(info.backend),
-            max_pending,
+            max_pending: MAX_PENDING,
             pending: RefCell::new(Vec::new()),
             pipelines: RefCell::new(HashMap::new()),
             unprimed: RefCell::new(HashMap::new()),
@@ -440,7 +371,7 @@ impl Gpu {
         // new RW binding against its stale RO one. Fresh small buffers cost
         // ~2 us; the codec's multi-MB buffers keep pooling (their flow is
         // write->read only).
-        if len <= 4096 || std::env::var_os("M5_NO_POOL_REUSE").is_some() {
+        if len <= 4096 {
             let n = self.pool_counter.get();
             self.pool_counter.set(n + 1);
             return self.empty(&format!("fresh.{n}.{len}"), len);
@@ -468,7 +399,6 @@ impl Gpu {
     /// Recycle on tensor drop: a buffer recorded in the open submit batch is
     /// deferred to after the flush (rewrites before submit would corrupt it).
     pub fn recycle_on_drop(&self, len: usize, buf: Buffer) {
-        if std::env::var_os("M5_NO_POOL").is_some() { return; }
         if self.pending.borrow().is_empty() {
             self.recycle(len, buf);
         } else {
@@ -679,14 +609,6 @@ impl Gpu {
     /// Drain now if the given pipeline has never been through a submit: its
     /// first dispatch triggers the driver's lazy compilation, which must not
     /// pile up with other new pipelines in one batch on the P104.
-    fn prime_if_needed(&self, key: &str) {
-        if self.unprimed.borrow_mut().remove(key).is_some() {
-            self.flush();
-            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("prime poll");
-            self.in_flight.set(0);
-        }
-    }
-
     /// dispatch_params with a pre-built pipeline + layout: probe variant.
     pub fn reuse_with_slice(&self, _key: &str, pipeline: &wgpu::ComputePipeline,
                             layout: &wgpu::BindGroupLayout, bindings: &[(u32, &Buffer)],
@@ -723,7 +645,7 @@ impl Gpu {
     fn maybe_flush(&self) {
         let n = self.pending.borrow().len();
         let s = self.submit_count.get();
-        let ramp = [FIRST_SUBMIT_MAX as usize, 16, 32, 64, 128];
+        let ramp = [FIRST_SUBMIT_MAX, 16, 32, 64, 128];
         let cap = if s < ramp.len() { ramp[s] } else { self.max_pending };
         if !self.primed.get() {
             if n >= cap {
@@ -747,7 +669,6 @@ impl Gpu {
             group: group.clone(),
             dyn_offset: None,
             workgroups,
-            label: _key.to_string(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
@@ -829,11 +750,9 @@ impl Gpu {
     /// set. Dispatches against a cached key cost one host memcpy + record.
     pub fn kernel(&self, key: &str, shader: &str, kinds: &str) -> Kernel {
         let (bgl, pipe) = self.arena_layout(key, shader, kinds);
-        let kinds = kinds.split(',').map(|k| k.trim() == "ro").collect();
         Kernel {
             bgl,
             pipe,
-            kinds,
             name: key.to_string(),
             cache: RefCell::new(HashMap::new()),
             params: RefCell::new(HashMap::new()),
@@ -850,23 +769,13 @@ impl Gpu {
         // whole at offset 0 (one per cached key). It must be in the layout too.
         let kinds_full = format!("{kinds},ro");
         let (bgl, pipe) = self.arena_layout_plain(key, shader, &kinds_full);
-        let kinds = kinds.split(',').map(|k| k.trim() == "ro").collect();
         Kernel {
             bgl,
             pipe,
-            kinds,
             name: key.to_string(),
             cache: RefCell::new(HashMap::new()),
             params: RefCell::new(HashMap::new()),
         }
-    }
-
-    /// Build a uniform-arena kernel: `kinds` describes the storage bindings
-    /// (binding 1..), e.g. "ro,ro,rw". The shader must declare a uniform `p` at
-    /// binding 0. Params ride the shared arena via a dynamic offset.
-    pub fn arena_kernel(&self, key: &str, shader: &str, kinds: &str) -> ArenaKernel {
-        let (bgl, pipe) = self.arena_layout(key, shader, kinds);
-        ArenaKernel { bgl, pipe, cache: RefCell::new(HashMap::new()) }
     }
 
     /// Record a dispatch (no dynamic offsets) into the current batch.
@@ -878,7 +787,6 @@ impl Gpu {
             group: group.clone(),
             dyn_offset: None,
             workgroups,
-            label: String::new(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
@@ -892,21 +800,19 @@ impl Gpu {
             group: group.clone(),
             dyn_offset: Some(offset),
             workgroups,
-            label: String::new(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
     }
 
     /// Record a dispatch with a dynamic uniform offset into the current batch.
-    pub fn record_dyn(&self, label: &str, pipeline: &wgpu::ComputePipeline,
+    pub fn record_dyn(&self, _label: &str, pipeline: &wgpu::ComputePipeline,
                       group: &wgpu::BindGroup, offset: u32, workgroups: (u32, u32, u32)) {
         self.pending.borrow_mut().push(Pending {
             pipeline: pipeline.clone(),
             group: group.clone(),
             dyn_offset: Some(offset),
             workgroups,
-            label: label.to_string(),
         });
         self.stats.borrow_mut().dispatches += 1;
         self.maybe_flush();
@@ -932,7 +838,7 @@ impl Gpu {
         });
         self.stats.borrow_mut().dispatches += 1;
         if self.no_record.get() { return; }
-        self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups, label: key.to_string() });
+        self.pending.borrow_mut().push(Pending { pipeline, group, dyn_offset: None, workgroups });
         self.maybe_flush();
     }
 
@@ -945,10 +851,6 @@ impl Gpu {
         }
         let n = self.submit_count.get();
         self.submit_count.set(n + 1);
-        if std::env::var_os("M5_DISPATCH_TRACE").is_some() {
-            let comps: Vec<&str> = batch.iter().map(|p| p.label.as_str()).collect();
-            eprintln!("[batch.{n}] {} dispatches: {}", batch.len(), comps.join(", "));
-        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
