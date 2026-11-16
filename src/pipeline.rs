@@ -265,7 +265,9 @@ impl Pipeline {
         // Context room for a fragment with no text at all: the largest any fragment
         // can be. Bounds the text budget when the caller asks for long utterances.
         let fixed = self.conditioned_tokens(args, "")?;
-        let ceiling = crate::lm::MAX_CONTEXT.saturating_sub(fixed + prompt_frames + 1);
+        // One position of margin: the reference refuses `prompt + frames` that reach
+        // the context, so the fragment cap stays one below (see `synthesize_pass`).
+        let ceiling = crate::lm::MAX_CONTEXT.saturating_sub(fixed + prompt_frames + 2);
         let budget = crate::long_audio::semantic_budget(args.max_audio_frames)
             .min(crate::long_audio::semantic_budget(ceiling));
 
@@ -292,7 +294,7 @@ impl Pipeline {
             // Every pass may use the whole context: the fragment size above already
             // keeps the audio inside it, so this only decides what gets cut.
             let conditioned = self.conditioned_tokens(args, &fragment)?;
-            let cap = crate::lm::MAX_CONTEXT.saturating_sub(conditioned + prompt_frames + 1).max(1);
+            let cap = crate::lm::MAX_CONTEXT.saturating_sub(conditioned + prompt_frames + 2).max(1);
             let out = self.synthesize_pass(
                 &Args { max_audio_frames: cap, ..args.clone() }, &fragment, noise)?;
             let produced = out.generated.len() / CODEBOOKS;
@@ -376,6 +378,18 @@ impl Pipeline {
         if !cloning && args.prompt_text.is_some() {
             bail!("prompt_text requires prompt_wav");
         }
+        // The reference validates arguments before touching the model; get the same
+        // failures at the same place a caller would expect them.
+        if !args.temperature.is_finite() || args.temperature <= 0.0 {
+            bail!("invalid temperature {} (must be finite and above 0)", args.temperature);
+        }
+        if args.topk == 0 || args.topk > AUDIO_VOCAB {
+            bail!("invalid topk {} (must be 1..={AUDIO_VOCAB})", args.topk);
+        }
+        if !cloning && args.speaker_id == 0 {
+            // 0 is the "no trained speaker" slot the cloning path uses.
+            bail!("speaker_id must be a positive id from the trained checkpoint");
+        }
         let text = self.tn.normalize(&args.text, &args.lang, args.accent.as_deref())?;
         // The reference conditions on `prompt_text.strip() + text.strip()`.
         let text = text.trim();
@@ -440,9 +454,12 @@ impl Pipeline {
         // The backbone's positional range (the reference's `max_seq_len`). The
         // rope tables and the attention kernels' score staging are both sized to
         // it, so this is the one place the limit is enforced.
-        if prompt_len + max_frames > crate::lm::MAX_CONTEXT {
+        // The reference's guard is `curr_tokens.size(1) >= max_seq_len - max_audio_frames`:
+        // it refuses when prompt + frames reach 2048, one short of the context. Match
+        // that boundary rather than using the extra position ourselves.
+        if total_input + max_frames > crate::lm::MAX_CONTEXT - 1 {
             let frames = args.max_audio_frames;
-            bail!("inputs too long: {prompt_len} prompt tokens + {frames} audio frames exceed the model's {} -token context; shorten the text or lower --max-audio-length-ms",
+            bail!("inputs too long: {total_input} prompt tokens + {frames} audio frames must stay below the model's {} -token context (the reference's `max_seq_len`); shorten the text or lower --max-audio-length-ms",
                   crate::lm::MAX_CONTEXT);
         }
         let args = &Args { max_audio_frames: max_frames, ..args.clone() };
@@ -543,6 +560,9 @@ impl Pipeline {
             bail!("decoded audio ({} samples) is shorter than the trim", host.len());
         }
         let audio = host[trim_front..host.len() - trim_back].to_vec();
+        if audio.is_empty() || !audio.iter().all(|value| value.is_finite()) {
+            bail!("the model returned invalid or empty audio");
+        }
 
         if profile {
             if let Device::Gpu(gpu) = self.lm.device() { gpu.sync(); }

@@ -1034,6 +1034,33 @@ prefill ~2.8 ms。**下一个看得见的目标是 codec（0.68 s）**，以及 
 
 ---
 
+## 6.17 API 对齐审计（2026-11，逐项对 `D:\M5-TTS` 的 `M5TTS` / `Generator`）
+
+参考实现的公开面只有三处：`M5TTS.from_pretrained(...)`、`M5TTS.infer(...)`、`M5TTS.save(...)`，
+加 `Generator.generate(...)`（内部）和两个 CLI 包装（`infer_clone.py` / `infer_speaker.py`）。
+**参考实现没有流式**：`generate` 是"跑满帧数→一次性 codec 解码→返回整段 tensor"，没有 yield/chunk 回调。
+
+| 参考面 | 我们的对应 | 状态 |
+|---|---|---|
+| `infer(text, prompt_wav, prompt_text, speaker_id, lang, accent, caption, temperature, topk, max_audio_length_ms)` | `Pipeline::synthesize(&Args, &mut dyn NoiseSource)` | ✅ 同参同义（`max_audio_length_ms` → `max_audio_frames`，另有 `with_max_audio_length_ms`） |
+| 参数校验：text 非空 / temperature 有限 >0 / `1 ≤ topk ≤ 2051` / `max_audio_length_ms ≥ 800` / cloning 必须给 prompt_text / 给 prompt_text 必须给 prompt_wav / `speaker_id ≥ 1` | 同 | ✅（本轮补齐 speaker_id=0 与 temperature/topk 入口校验） |
+| 解码后校验 `audio` 非空且有限 | 同 | ✅（本轮补） |
+| `Generator.generate` 的 `max_seq_len` 守卫：`prompt_tokens >= 2048 - max_audio_frames` 报错 | `total_input + max_frames > 2047` 报错 | ✅（本轮修正，之前宽松 2 个位置） |
+| `min_tokens=6`（第 7 帧起才允许 EOS） | `allow_eos = frame > 6` | ✅ |
+| EOS = 16 个 codebook 全 0；撞上限告警；无帧报错 | 同（`Synthesis.eos`、`bail!`） | ✅ |
+| `prepare_prompt`：按峰值归一、阈值 0.02/0.015、0.15 s 静音合并、0.05 s 边距、非空/有限/非静音校验 | `audio::prepare_prompt_samples` | ✅（逐句对照，含 <10 s / >10 s 两个阈值分支） |
+| `save`：PCM_16、自动建父目录 | `main` 写 wav（`hound`，clamp 到 ±1） | ✅ |
+| `from_pretrained` 的 bundle 校验：必需文件、`audio_vocab_size=2051`、16 codebooks、`text_vocab_size == len(tokenizer)` | `ModelConfig::validate` + `ConditioningMeta` + `--inspect` | ⚠️ 前两条 ✅；`text_vocab_size` 未读该字段，靠 `--inspect` 的 tensor 契约校验覆盖 |
+| Hugging Face repo id / `revision` / `cache_dir` / `local_files_only` / `attention=flash_attention_2\|sdpa` | 只接受本地目录；GPU 由 wgpu 选（vulkan/cpu），无 attention 开关 | ⚠️ **有意差异**：不联网、不依赖 flash-attn；本地目录语义等价 |
+| `--device cuda` 必需（无 CUDA 直接报错） | `--device cpu\|gpu`，两个后端都自研 | ⚠️ **有意差异**（本项目的存在理由） |
+| — | `--seed --tokenize --inspect --max-audio-length-ms` 可选（自动长音频）、`Args.auto_length` | ➕ 超集 |
+| — | `Synthesis { codes, frames, prompt_frames, generated, audio, sample_rate, eos }` | ➕ 比参考多返回 codes/帧数/eos |
+
+**结论**：参考 API 的参数、校验、EOS/上限语义、prompt 预处理、保存格式都对标（本轮补齐 3 处）；两处有意差异
+（不联 HF、device 语义）与超集（自动长音频、seed、codes 返回）已在 §6.16/本节写明。
+
+---
+
 ## 7. 优化建议（**仅供参考**，按性价比排序）
 
 1. **大权重首次上传**（6.8⑦）：codec 一次 run 传 ~457 MB、encoder ~225 MB，实测在真流程里只有
