@@ -24,8 +24,11 @@
 /// result still fits, instead of becoming a fragment of their own.
 pub const MIN_TAIL_LENGTH: usize = 5;
 
-/// Characters that end a sentence.
-const SENTENCE_END: [char; 3] = ['。', '！', '？'];
+/// Characters that end a sentence. A line break ends one too: it is not speech, and
+/// it must never reach the model inside a fragment - a newline in the conditioned
+/// text makes the 50M model babble instead of reading (measured: a fragment that
+/// started on a paragraph break came out as unintelligible syllables).
+const SENTENCE_END: [char; 6] = ['。', '！', '？', '!', '?', '\n'];
 
 /// Clauses inside a sentence.
 const CLAUSE_END: [char; 4] = ['，', ',', '；', ';'];
@@ -75,6 +78,29 @@ fn is_cjk(ch: char) -> bool {
     matches!(ch, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
 }
 
+/// Collapse every run of whitespace to one space and trim.
+///
+/// A line break is layout, not speech, and the model has never seen one inside the
+/// text it reads: a fragment that started on a paragraph break came out as
+/// unintelligible syllables. The single-pass path leaves the text alone (that is
+/// what the reference does), so the cleaning belongs to the long-audio split.
+pub fn clean(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Cut `text` into fragments of at most `max_units` semantic units, at the
 /// strongest boundary available.
 ///
@@ -85,7 +111,7 @@ pub fn cut(text: &str, max_units: usize) -> Vec<String> {
     if text.trim().is_empty() {
         return Vec::new();
     }
-    if semantic_length(text) <= max_units {
+    if text.trim() == text && semantic_length(text) <= max_units {
         return vec![text.to_string()];
     }
 
@@ -211,9 +237,13 @@ fn char_windows(text: &str, max_units: usize) -> Vec<String> {
 
 /// Add `piece` to the last fragment when both fit, otherwise start a new one.
 fn append(fragments: &mut Vec<String>, piece: String, max_units: usize) {
-    if piece.trim().is_empty() {
+    // Fragments never carry leading or trailing whitespace: the reference strips the
+    // text it conditions on, and a fragment boundary can fall inside a run of blanks.
+    let piece = piece.trim();
+    if piece.is_empty() {
         return;
     }
+    let piece = piece.to_string();
     let Some(last) = fragments.last_mut() else {
         fragments.push(piece);
         return;
@@ -249,14 +279,29 @@ mod tests {
     }
 
     #[test]
+    fn clean_collapses_layout() {
+        assert_eq!(clean("  你好  \n\n世界\t！ "), "你好 世界 ！");
+        assert_eq!(clean("干净文本"), "干净文本");
+        assert_eq!(clean("\n\n"), "");
+    }
+
+    #[test]
     fn concat_is_lossless() {
-        let text = "第一句话。第二句话，还有分句；第三句！英文 too, ok? 结束。\
-                    这是一个很长很长的句子，长到必须从句子的分句处切开，然后继续切，\
-                    直到每一段都不超过预算为止，而拼接回来必须和原文一模一样。";
+        let text = clean(concat!(
+            "第一句话。第二句话，还有分句；第三句！英文 too, ok? 结束。",
+            "\n\n",
+            "这是一个很长很长的句子，长到必须从句子的分句处切开，然后继续切，",
+            "直到每一段都不超过预算为止，而拼接回来必须和原文一模一样。"
+        ));
         for budget in [5, 8, 12, 20, 40, 200] {
-            let pieces = cut(text, budget);
-            assert_eq!(pieces.concat(), text, "budget {budget}");
+            let pieces = cut(&text, budget);
+            // Nothing is lost or reordered; blanks at a cut join up again, because a
+            // fragment never keeps leading or trailing whitespace.
+            let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            assert_eq!(squeeze(&pieces.concat()), squeeze(&text), "budget {budget}");
             for piece in &pieces {
+                assert_eq!(piece.trim(), piece, "budget {budget}: {piece:?} has blank edges");
+                assert!(!piece.contains('\n'), "budget {budget}: {piece:?} keeps a line break");
                 // Only a single unbreakable unit may exceed the budget.
                 assert!(
                     semantic_length(piece) <= budget || !has_delimiter(piece),

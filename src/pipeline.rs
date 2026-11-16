@@ -207,7 +207,7 @@ impl Pipeline {
         let cloning = args.prompt_wav.is_some();
         let speaker = if cloning { "0".to_string() } else { args.speaker_id.to_string() };
         let spoken = match (cloning, args.prompt_text.as_deref()) {
-            (true, Some(prompt_text)) => format!("{prompt_text}{fragment}"),
+            (true, Some(prompt_text)) => format!("{}{fragment}", prompt_text.trim()),
             _ => fragment.to_string(),
         };
         let conditioned = format_conditioned_text(&spoken, Some(&speaker), args.accent.as_deref(),
@@ -269,7 +269,13 @@ impl Pipeline {
         let budget = crate::long_audio::semantic_budget(args.max_audio_frames)
             .min(crate::long_audio::semantic_budget(ceiling));
 
-        let mut queue: std::collections::VecDeque<String> = crate::long_audio::cut(text, budget).into();
+        // Layout is not speech, and the model was never trained on a line break inside
+        // the text it reads: a fragment that began on a paragraph break came out as
+        // unintelligible syllables. The single-pass path keeps the text as the
+        // reference does; the split works on cleaned text.
+        let text = crate::long_audio::clean(text);
+        let mut queue: std::collections::VecDeque<String> =
+            crate::long_audio::cut(&text, budget).into();
         let mut audio: Vec<f32> = Vec::new();
         let mut generated: Vec<u32> = Vec::new();
         let mut eos_all = true;
@@ -371,6 +377,8 @@ impl Pipeline {
             bail!("prompt_text requires prompt_wav");
         }
         let text = self.tn.normalize(&args.text, &args.lang, args.accent.as_deref())?;
+        // The reference conditions on `prompt_text.strip() + text.strip()`.
+        let text = text.trim();
         if args.auto_length {
             return self.synthesize_auto(args, &text, noise);
         }
@@ -382,7 +390,7 @@ impl Pipeline {
     fn synthesize_pass(&self, args: &Args, text: &str, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         let cloning = args.prompt_wav.is_some();
         let spoken = if cloning {
-            format!("{}{}", args.prompt_text.as_deref().unwrap(), text)
+            format!("{}{}", args.prompt_text.as_deref().unwrap().trim(), text)
         } else {
             text.to_string()
         };
