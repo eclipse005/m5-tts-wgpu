@@ -36,10 +36,12 @@ const CLAUSE_END: [char; 4] = ['，', ',', '；', ';'];
 /// Longest fragment, in semantic units, for an utterance budget of `frames`.
 ///
 /// The reference implementation's default utterance is 40 s (`max_audio_length_ms`,
-/// 500 frames); at the slow end of the narrators measured here (3 units per second,
-/// against 3.1-7.7 characters per second observed) that is 120 units. Deliberately
-/// conservative: a fragment that overruns its budget is cut mid-word by the model's
-/// frame cap, which is the one failure this feature must not produce.
+/// 500 frames). At the slow end of the narrators measured here (3 units per second,
+/// against the 4.2-7.7 that clean readings show) that is `frames * 3 / 12` = 125
+/// units for 500 frames; the divisor is 12 rather than 12.5 so the result rounds
+/// down. Deliberately conservative: a fragment that overruns its budget is cut
+/// mid-word by the model's frame cap, which is the one failure this feature must
+/// not produce.
 pub fn semantic_budget(frames: usize) -> usize {
     const UNITS_PER_SECOND: usize = 3;
     (frames * UNITS_PER_SECOND / 12).max(MIN_TAIL_LENGTH * 4)

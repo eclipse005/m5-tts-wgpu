@@ -386,7 +386,7 @@ impl Pipeline {
     }
 
     /// One pass: prompt conditioning, prefill, frame-by-frame generation, decode.
-    /// `text` is already normalised.
+    /// `text` is already normalised and stripped, as the reference conditions on it.
     fn synthesize_pass(&self, args: &Args, text: &str, noise: &mut dyn NoiseSource) -> Result<Synthesis> {
         let cloning = args.prompt_wav.is_some();
         let spoken = if cloning {
