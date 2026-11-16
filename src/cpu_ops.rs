@@ -897,6 +897,7 @@ unsafe fn conv_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
 unsafe fn transpose_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
                              cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize,
                              j: usize) {
+    let _ = t_in;
     let q = j / stride;
     let r = j % stride;
     for co in (0..cout).step_by(8) {
