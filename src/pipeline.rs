@@ -529,6 +529,11 @@ impl Pipeline {
             t_step += lap.elapsed().as_secs_f64();
         }
         let generated_frames = generated.len() / CODEBOOKS;
+        if !eos && !args.auto_length {
+            // The reference's RuntimeWarning on the explicit-budget path. The
+            // automatic path re-splits such a fragment instead, and says so itself.
+            eprintln!("warning: generation reached max_audio_length_ms without EOS; output may be truncated");
+        }
         if profile {
             let total = phase.elapsed().as_secs_f64();
             let per_frame = total / generated_frames.max(1) as f64;
