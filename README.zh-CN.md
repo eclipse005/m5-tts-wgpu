@@ -19,7 +19,7 @@
 * 🦀 纯 Rust —— 一个二进制，不用装别的东西
 * 🎮 通过 wgpu 用 GPU（Vulkan / Metal / GL），各家显卡同一条代码路径
 * 🖥️ Windows / macOS / Linux
-* ⚡ 手写 CPU 后端：不依赖任何神经网络框架，只有 rayon 和分块 SIMD kernel
+* ⚡ 手写 CPU 后端：不依赖任何神经网络框架，只有 rayon 和 AVX2 kernel（其它架构走便携回退）
 * 🎙️ 零样本克隆（参考音频 + 转写），或 CustomVoice bundle 的固定音色
 * 🌏 中文、英文、德文、法文、日文、韩文；粤语（`yue`）与四川话（`chuan`）用 `--accent` 选择
 * 🔤 参考实现同款文本正则：它编译好的 pynini FST 链（六种语言），粤语额外走 OpenCC `s2hk` 转繁体
@@ -219,6 +219,9 @@ src/
 本移植不绑定 CUDA 或任何厂商运行时，而用 **wgpu** 作为 GPU 抽象层，因此同一个 Rust 二进制能跑在
 NVIDIA、AMD、Intel、Apple 以及软件适配器上。对离散/集成显卡瓶颈不同的 kernel，按 dispatch 形态
 而不是按厂商来选参；`--device cpu` 时退回的是**同一条流水线的手写宿主实现**，不是另一个模型。
+
+手写 SIMD kernel 是 x86-64 的 AVX2。Apple Silicon 及其它 ARM 主机上 CPU 后端回退到便携实现——那边请用
+`--device gpu`（Metal）；上面的数字都是 x86 上测的。
 
 和同作者的 [ming-3.0-tts-wgpu](https://github.com/eclipse005/ming-3.0-tts-wgpu) 一样，DX12 被故意
 编译掉：wgpu 30 默认的 `dx12` 后端会拉 `windows = 0.62`，在锁 `windows = 0.61` 的宿主里与

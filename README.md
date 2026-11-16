@@ -21,7 +21,7 @@ no CUDA toolkit at runtime.
 * 🦀 Pure Rust — one binary, nothing else to install
 * 🎮 GPU acceleration through wgpu (Vulkan / Metal / GL), one code path for every vendor
 * 🖥️ Windows / macOS / Linux
-* ⚡ Hand-written CPU backend: no NN framework, just rayon and blocked SIMD kernels
+* ⚡ Hand-written CPU backend: no NN framework, just rayon and AVX2 kernels (portable fallback elsewhere)
 * 🎙️ Zero-shot voice cloning from a prompt recording, or a preset speaker from the CustomVoice bundle
 * 🌏 Chinese, English, German, French, Japanese, Korean; Cantonese (`yue`) and Sichuanese (`chuan`) through `--accent`
 * 🔤 The reference text normaliser: its compiled pynini FST chain (six languages) plus the OpenCC `s2hk` pass for Cantonese
@@ -248,6 +248,10 @@ Apple and software adapters. Where a kernel is bound by different things on
 discrete and integrated GPUs, the tuning is chosen per dispatch shape rather than
 per vendor — and on `--device cpu` the port falls back to a hand-written host
 implementation of the same pipeline, not to a different model.
+
+The hand-written SIMD kernels are AVX2 on x86-64. On Apple Silicon and other ARM
+hosts the CPU backend falls back to portable code — build with `--device gpu`
+(Metal) there; the numbers above are x86.
 
 DX12 is compiled out on purpose, as in the sibling
 [ming-3.0-tts-wgpu](https://github.com/eclipse005/ming-3.0-tts-wgpu) port: wgpu
