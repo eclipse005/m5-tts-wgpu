@@ -823,6 +823,106 @@ pub fn elu(x: &mut [f32]) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Portable stand-ins for the AVX2 helpers.
+//
+// `avx2_available()` is always false on targets without AVX2, so these are never
+// executed there; they exist so the call sites compile on every architecture
+// (Apple Silicon, ARM Linux) and stay correct if one of them ever is reached.
+// ---------------------------------------------------------------------------
+
+/// 8-lane FMA dot product, horizontally reduced at the end.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+unsafe fn dot_avx2(a: &[f32], b: &[f32], k: usize) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..k {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+unsafe fn conv_block_avx2(window: &[f32], w: &[f32], acc: &mut [f32], tn: usize, ks: usize,
+                          dilation: usize) {
+    for t in 0..tn {
+        for k in 0..ks {
+            acc[t] += window[t + k * dilation] * w[k];
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+unsafe fn conv_block4_avx2(window: &[f32], w: &[&[f32]; 4], acc: &mut [f32], tn: usize,
+                           ks: usize, dilation: usize) {
+    for (r, row) in w.iter().enumerate() {
+        for t in 0..tn {
+            for k in 0..ks {
+                acc[r * tn + t] += window[t + k * dilation] * row[k];
+            }
+        }
+    }
+}
+
+/// One timestep of [`conv1d_channels_last`], eight output channels per FMA.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
+                        cin: usize, cout: usize, blocks: usize, ks: usize, dilation: usize,
+                        stride: usize, pad: usize, t_in: usize, t: usize) {
+    for block in 0..blocks {
+        let co = block * 8;
+        let mut acc = [0.0f32; 8];
+        if !bias.is_empty() {
+            acc.copy_from_slice(&bias[co..co + 8]);
+        }
+        for tap in 0..ks {
+            let src = (t * stride + tap * dilation) as isize - pad as isize;
+            if src < 0 || src as usize >= t_in {
+                continue;
+            }
+            let xrow = src as usize * cin;
+            for ci in 0..cin {
+                let a = x[xrow + ci];
+                for (lane, slot) in acc.iter_mut().enumerate() {
+                    *slot += a * w[(tap * cin + ci) * cout + co + lane];
+                }
+            }
+        }
+        row[co..co + 8].copy_from_slice(&acc);
+    }
+}
+
+/// One output timestep of [`conv_transpose1d_channels_last`], eight channels per FMA.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+unsafe fn transpose_row_avx2(x: &[f32], w: &[f32], bias: &[f32], row: &mut [f32],
+                             cin: usize, cout: usize, ks: usize, stride: usize, t_in: usize,
+                             j: usize) {
+    let q = j / stride;
+    let r = j % stride;
+    for co in (0..cout).step_by(8) {
+        let mut acc = [0.0f32; 8];
+        if !bias.is_empty() {
+            acc.copy_from_slice(&bias[co..co + 8]);
+        }
+        let mut tap = 0usize;
+        let mut k = r;
+        while k < ks {
+            if q >= tap {
+                let xrow = (q - tap) * cin;
+                for ci in 0..cin {
+                    let a = x[xrow + ci];
+                    for (lane, slot) in acc.iter_mut().enumerate() {
+                        *slot += a * w[(k * cin + ci) * cout + co + lane];
+                    }
+                }
+            }
+            tap += 1;
+            k += stride;
+        }
+        row[co..co + 8].copy_from_slice(&acc);
+    }
+}
+
 /// 8-lane FMA dot product, horizontally reduced at the end.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2,fma")]
